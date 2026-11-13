@@ -244,7 +244,13 @@ Layout follows Cadastrus:
   - Self-supporting / Lashed (one or neither)
   - Tags (multi-select): N/A, Carrier label, Grounding, No ground, No fiber,
     Damaged cable
-- **Client query · reference** panel for query points (§6.2).
+- **Client query · reference** panel for query points (§6.2). The reference
+  comes from the query PDF. Cadastrus also stored it on its own server,
+  which is why it showed "unavailable (401)" once an old job was cleared.
+- **Use existing photos** (query points): pick photos already taken in this
+  job for another point. The server delivers its copy into the query
+  point's folder too (if past the server's retention, use Pick from gallery).
+  Reused photos count toward the "≥1 photo" rule.
 - Comment (free text).
 - **Take photo** (opens the phone camera) and **Pick from gallery**.
 - Photo strip: thumbnails with per-photo status (§6.6).
@@ -335,6 +341,27 @@ proceeding.
 The Field Notes link is checked when entered (can we list the folder?) and
 the job shows a red banner if delivery to it starts failing.
 
+**Safety net if the share-link route fails or breaks later:** the admin can
+download any job's photos as a ZIP already laid out in the Field Notes folder
+structure, ready to drag into OneDrive. Photos stay on the server until
+confirmed, so nothing is lost while the route is down. The rest of the app is
+built in parallel with the upload spike; only the OneDrive uploader waits on it.
+
+**Location in photos:** if a photo's EXIF has no GPS (common with gallery
+picks on Android 10+ and iPhone Safari), the app writes its own GPS fix and
+time into the EXIF of the upload copy. Visible stamping on the image is
+pending the owner's answer (§9).
+
+**Deleting a photo:** a tech can delete a photo that hasn't reached OneDrive
+yet. Once delivered, it stays in OneDrive (remove it there by hand if
+needed); the app hides it from the point and records who removed it and
+when, so a removed photo is never mistaken for a lost one.
+
+**Server disk:** server copies are deleted 7 days after confirmation. If the
+disk passes 80%, the oldest *confirmed* copies are purged first;
+unconfirmed photos are never purged. Admin sees disk usage and an alert
+above 80%.
+
 ### 6.7 Live crew positions
 - While the app is open, the phone sends its position when it moves > 5 m or
   every 15 s, whichever comes first (with accuracy).
@@ -352,6 +379,10 @@ the job shows a red banner if delivery to it starts failing.
   field; photos are additive and never conflict.
 - Live updates arrive over a WebSocket; on reconnect the app re-syncs
   everything changed since it last heard from the server.
+- **Map imagery offline:** tiles you've already viewed are kept on the
+  phone; there is no "download this area" in v1 (Esri's terms restrict bulk
+  downloading World Imagery). With no signal and no cached imagery, points,
+  your GPS dot and all point screens still work on a plain background.
 
 ### 6.9 Admin
 - **Users**: create, reset password, disable, promote.
@@ -441,19 +472,43 @@ screens.
   per-tech quality picker.
 - Reference pages = rendered PDF pages linked to each point.
 - Pole data exported as xlsx/csv and written to Field Notes on finish.
-- Job data kept indefinitely; server photo copies purged 14 days after
-  confirmation; phone copies 3 days after.
+- Job data kept indefinitely; server photo copies purged 7 days after
+  confirmation (sooner, oldest-confirmed-first, if disk > 80%); phone copies
+  3 days after.
+- ZIP download of a job's photos in Field Notes layout as the safety net
+  for the share-link uploader; rest of the app built in parallel with the
+  upload spike.
+- Missing EXIF GPS filled in from the app's own fix.
+- Techs can delete photos only before delivery; delivered photos are hidden
+  with an audit record, not deleted from OneDrive.
+- Query "use existing photos" = reuse photos from other points in the job.
+- No offline map download in v1; viewed tiles are cached.
+- Switchover: jobs already in progress finish in Cadastrus; new jobs start
+  in Fieldmaxx. Fieldmaxx never overwrites files in OneDrive, so sharing a
+  folder with Cadastrus can't destroy anything. Cadastrus's code is assumed
+  unavailable (someone else's custom app).
 - English only.
 - Stack and hosting in §7.
 
-## 9. Open items
+## 9. Open items (asked of the owner)
+- **Folder filing rule.** In the F2_A05K51V screenshot, `POLE/` holds only
+  the added "b" poles (`POLE_10B`, `POLE_14b`…); no `POLE_1`, `POLE_10`
+  etc., which would sort just before them. So the PDF's own poles were filed
+  somewhere else (maybe `Aerial Fielding/`). Need the rule for every point
+  type → category folder, whether categories like Street images get a
+  subfolder per point, the query point folder name, and photo file names.
+  All of it sits behind one naming function; must be settled before the
+  first real job.
+- **Test upload**: permission to create (and afterwards delete) a throwaway
+  test folder inside a real job's Field Notes folder, which is the only test
+  that proves the route under EES's real sharing rules. Also: does the owner
+  have their own EES Microsoft login (relevant only to approach 2 later)?
+- **Photo stamping**: does AT&T/EES need anything stamped visibly on the
+  photos (time, coordinates, point name)? Did Cadastrus's photos have it?
+- **Job assignment**: does the admin assign techs to jobs (techs see only
+  their jobs), or does everyone see every active job?
 - **Query PDF sample**: needed to confirm label format and how reference
   images map to query items. Importer design already tolerates variation.
-- **Query point folder name** in OneDrive (e.g. `QUERY 1/Query 1-43`?).
-- **Photo file naming** inside point folders: should it match what
-  Cadastrus produced?
-- **Test Field Notes folder link** for the upload spike (a throwaway folder
-  shared the same way as real jobs).
 - **House-number source**: builder's call (e.g. OpenStreetMap addresses for
   the visible area at high zoom); not essential to v1.
 
