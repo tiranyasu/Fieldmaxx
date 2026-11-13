@@ -8,6 +8,7 @@ class GeoTest {
     @Test fun decimalPairNoSpace() { val m = findCoordinatePairs("39.63609452036168,-119.69104360818118").single(); assertEquals(39.63609452036168, m.lat); assertEquals(-119.69104360818118, m.lon); assertEquals(CoordFormat.DECIMAL, m.format) }
     @Test fun spaceAfterComma() = assertEquals(-119.675338878, findCoordinatePairs("39.6361531972, -119.675338878").single().lon)
     @Test fun splitAfterMinusAcrossLineBreak() = assertEquals(-119.68173217216633, findCoordinatePairs(normalizeText("39.63612682461489,-\r119.68173217216633")).single().lon)
+    @Test fun labelDashIsNotJoinedToNextLine() = assertEquals(39.1234, findCoordinatePairs(normalizeText("POLE 1 -\n39.1234,-119.1234")).single().lat)
     @Test fun labelTabCr() = assertEquals("POLE 1 =\n39.6,-119.6", normalizeText("POLE 1 = \t\r39.6,-119.6"))
     @Test fun dms() { val m = findCoordinatePairs("39°38'09.9\"N 119°41'27.8\"W").single(); assertEquals(39.636083, m.lat, 1e-5); assertEquals(-119.691056, m.lon, 1e-5); assertEquals(CoordFormat.DMS, m.format) }
     @Test fun swapped() { val m = findCoordinatePairs("-119.69104,39.63609").single(); assertEquals(39.63609, m.lat); assertEquals(-119.69104, m.lon); assertTrue(m.swapped) }

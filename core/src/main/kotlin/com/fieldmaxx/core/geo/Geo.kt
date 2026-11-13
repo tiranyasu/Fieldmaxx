@@ -24,12 +24,14 @@ private const val EARTH_RADIUS_M = 6371008.8
 private const val FEET_PER_METER = 3.280839895
 
 private val MULTI_SPACE = Regex(" {2,}")
+private val SPLIT_MINUS = Regex(""",\s*-$""")
 
 /**
  * Cleans text extracted from PDFs/DOCX: maps U+2212 (minus sign) to `-` and non-breaking spaces
  * (U+00A0, U+202F) to spaces (the en dash U+2013 is left alone: it is a separator), unifies line breaks, turns tabs into spaces, collapses
  * runs of spaces, trims each line, and re-joins a number split across lines (a line ending in
- * `-` or `,` followed by a line starting with a digit or `-`).
+ * `,` or in `,-` followed by a line starting with a digit or `-`; a bare trailing `-` such as a label
+ * dash is not joined).
  */
 fun normalizeText(raw: String): String {
     val lines = raw.replace('\u2212', '-').replace('\u00A0', ' ').replace('\u202F', ' ')
@@ -40,7 +42,7 @@ fun normalizeText(raw: String): String {
     for (line in lines) {
         val prev = out.lastOrNull()
         val first = line.firstOrNull()
-        if (prev != null && (prev.endsWith("-") || prev.endsWith(",")) && first != null && (first.isDigit() || first == '-')) {
+        if (prev != null && (SPLIT_MINUS.containsMatchIn(prev) || prev.endsWith(",")) && first != null && (first.isDigit() || first == '-')) {
             out[out.lastIndex] = prev + line
         } else {
             out.add(line)
