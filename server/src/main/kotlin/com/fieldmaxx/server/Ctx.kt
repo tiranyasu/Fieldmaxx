@@ -5,6 +5,7 @@ import com.fieldmaxx.core.model.Job
 import com.fieldmaxx.core.model.PhotoInfo
 import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.sharepoint.DestinationFactory
+import com.fieldmaxx.server.sync.Hub
 import java.time.Clock
 
 interface ChangeRecorder {
@@ -36,4 +37,5 @@ class Ctx(
     val destinations: DestinationFactory,
     var changes: ChangeRecorder,
     var delivery: DeliveryKick,
+    val hub: Hub = Hub(),
 )

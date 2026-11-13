@@ -29,6 +29,7 @@ dependencies {
     runtimeOnly("ch.qos.logback:logback-classic:1.5.18")
 
     testImplementation(libs.ktor.server.test.host)
+    testImplementation(libs.ktor.client.websockets)
     testImplementation(testFixtures(project(":importer")))
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)

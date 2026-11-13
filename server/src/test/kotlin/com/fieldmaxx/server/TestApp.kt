@@ -2,6 +2,7 @@ package com.fieldmaxx.server
 
 import com.fieldmaxx.sharepoint.FakeDestination
 import com.fieldmaxx.core.model.Role
+import com.fieldmaxx.server.sync.ChangeLog
 import com.fieldmaxx.server.users.createUser
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
@@ -46,6 +47,7 @@ class TestApp(
             else "jdbc:sqlite:file:test${counter.incrementAndGet()}?mode=memory&cache=shared",
         )
         ctx = Ctx(config, db, clock, { _ -> destination }, NoopChangeRecorder, NoopDeliveryKick)
+        ctx.changes = ChangeLog(db, clock, ctx.hub)
     }
 
     fun run(block: suspend ApplicationTestBuilder.(TestApp) -> Unit) {

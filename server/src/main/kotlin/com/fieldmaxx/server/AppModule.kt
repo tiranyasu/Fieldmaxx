@@ -3,6 +3,7 @@ package com.fieldmaxx.server
 import com.fieldmaxx.core.FmxJson
 import com.fieldmaxx.server.auth.authRoutes
 import com.fieldmaxx.server.auth.installAuth
+import com.fieldmaxx.server.sync.syncRoutes
 import com.fieldmaxx.server.users.userRoutes
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
@@ -42,6 +43,7 @@ fun Application.fieldmaxx(ctx: Ctx) {
         route("/api") {
             authRoutes(ctx)
             userRoutes(ctx)
+            syncRoutes(ctx)
             get("/version") { call.respond(VersionBody(ctx.config.buildId)) }
         }
     }
