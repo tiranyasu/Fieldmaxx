@@ -5,6 +5,7 @@ import com.fieldmaxx.core.model.CantShootReason
 import com.fieldmaxx.core.model.Change
 import com.fieldmaxx.core.model.Op
 import com.fieldmaxx.core.model.OpResult
+import com.fieldmaxx.core.model.PhotoInfo
 import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.model.PoleData
 import com.fieldmaxx.core.model.Role
@@ -12,16 +13,23 @@ import com.fieldmaxx.core.model.User
 import com.fieldmaxx.core.naming.pointLabel
 import com.fieldmaxx.server.Ctx
 import com.fieldmaxx.server.jobs.toPoint
+import com.fieldmaxx.server.photos.applyPhotoOp
 import java.sql.Connection
 import java.sql.Types
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
 /** A refusal that leaves the database untouched; its code is the op's `error`. */
-private class OpFail(val code: String) : RuntimeException(code, null, false, false)
+internal class OpFail(val code: String) : RuntimeException(code, null, false, false)
 
-/** What an op did: the point it changed (null when nothing changed) and the event kind to log. */
-private class Applied(val point: Point?, val kind: String)
+/**
+ * What an op did: the point or photo it changed (both null when nothing changed) and the event kind to log. [afterCommit]
+ * (file clean-up) runs only once the transaction committed; [kickDelivery] wakes the delivery worker then.
+ */
+internal class Applied(
+    val point: Point?, val kind: String, val photo: PhotoInfo? = null,
+    val afterCommit: (() -> Unit)? = null, val kickDelivery: Boolean = false,
+)
 
 /**
  * Applies [ops] in order. Each op is its own transaction: it is checked against `ops_done` first (a replay returns the
@@ -31,19 +39,15 @@ private class Applied(val point: Point?, val kind: String)
 fun applyOps(ctx: Ctx, user: User, ops: List<Op>): List<OpResult> = ops.map { applyOp(ctx, user, it) }
 
 private fun applyOp(ctx: Ctx, user: User, op: Op): OpResult {
-    // Photo ops arrive with Task 16; until then nothing is stored so a later retry can succeed.
-    if (op is Op.PhotoReuse || op is Op.PhotoRemove || op is Op.PhotoConfirmed || op is Op.PhotoFailed) {
-        return OpResult(op.opId, false, "unsupported")
-    }
+    var applied: Applied? = null
     val (result, change) = ctx.db.tx {
         storedOp(op.opId)?.let { (owner, stored) ->
             // An opId belongs to whoever first used it; another user's replay must not read or reuse the result.
             return@tx (if (owner == user.id) stored else OpResult(op.opId, false, "op_id_conflict")) to null
         }
         val now = ctx.clock.millis()
-        var applied: Applied? = null
         val r = try {
-            applied = apply(user, op, now)
+            applied = apply(ctx, user, op, now)
             OpResult(op.opId, true)
         } catch (e: OpFail) {
             OpResult(op.opId, false, e.code)
@@ -52,20 +56,26 @@ private fun applyOp(ctx: Ctx, user: User, op: Op): OpResult {
             it.setString(1, op.opId); it.setString(2, user.id); it.setLong(3, now)
             it.setString(4, FmxJson.encodeToString(OpResult.serializer(), r)); it.executeUpdate()
         }
-        val p = applied?.point
-        var change: Change? = null
-        if (p != null) {
+        val a = applied
+        val p = a?.point
+        val photo = a?.photo
+        val jobId = p?.jobId ?: photo?.jobId
+        if (a != null && jobId != null) {
             prepareStatement("INSERT INTO events(job_id, user_id, kind, data_json, at) VALUES (?,?,?,?,?)").use {
-                it.setString(1, p.jobId); it.setString(2, user.id); it.setString(3, applied!!.kind)
-                it.setString(4, buildJsonObject { put("opId", op.opId); put("pointId", p.id) }.toString())
+                it.setString(1, jobId); it.setString(2, user.id); it.setString(3, a.kind)
+                it.setString(4, buildJsonObject { put("opId", op.opId); if (p != null) put("pointId", p.id); if (photo != null) put("photoId", photo.id) }.toString())
                 it.setLong(5, now); it.executeUpdate()
             }
-            // Same transaction as the write: change order equals commit order and the snapshot is never stale.
-            change = ctx.changes.recordInTx(this, p.jobId, "point", p.id, point = p)
         }
+        // Same transaction as the write: change order equals commit order and the snapshot is never stale.
+        var change: Change? = null
+        if (p != null) change = ctx.changes.recordInTx(this, p.jobId, "point", p.id, point = p)
+        else if (photo != null) change = ctx.changes.recordInTx(this, photo.jobId, "photo", photo.id, photo = photo)
         r to change
     }
     change?.let(ctx.changes::publish)
+    applied?.afterCommit?.invoke()
+    if (applied?.kickDelivery == true && result.ok) ctx.delivery.kick()
     return result
 }
 
@@ -105,7 +115,7 @@ private fun Connection.exec(sql: String, vararg args: Any?) {
 }
 
 /** An existing point of a live job; [allowDeleted] lets restore (and a repeated delete) see a deleted point. */
-private fun Connection.livePoint(pointId: String, allowDeleted: Boolean = false): Point {
+internal fun Connection.livePoint(pointId: String, allowDeleted: Boolean = false): Point {
     val p = findPoint(pointId) ?: throw OpFail("not_found")
     if (jobDeleted(p.jobId) == true) throw OpFail("job_deleted")
     if (p.deletedAt != null && !allowDeleted) throw OpFail("point_deleted")
@@ -119,7 +129,7 @@ private fun Connection.touch(pointId: String, user: User, now: Long, kind: Strin
     return Applied(findPoint(pointId), kind)
 }
 
-private fun Connection.apply(user: User, op: Op, now: Long): Applied {
+private fun Connection.apply(ctx: Ctx, user: User, op: Op, now: Long): Applied {
     return when (op) {
         is Op.PointUpdate -> {
             livePoint(op.pointId)
@@ -180,11 +190,11 @@ private fun Connection.apply(user: User, op: Op, now: Long): Applied {
             livePoint(op.pointId)
             touch(op.pointId, user, now, "point.setFolder", "folder_path" to op.folderPath, "folder_candidates_json" to null)
         }
-        is Op.PhotoReuse, is Op.PhotoRemove, is Op.PhotoConfirmed, is Op.PhotoFailed -> throw OpFail("unsupported")
+        is Op.PhotoReuse, is Op.PhotoRemove, is Op.PhotoConfirmed, is Op.PhotoFailed -> applyPhotoOp(ctx, user, op, now)
     }
 }
 
 private fun Connection.hasConfirmedPhoto(pointId: String): Boolean =
-    prepareStatement("SELECT 1 FROM photos WHERE point_id = ? AND status = 'confirmed' LIMIT 1").use { ps ->
+    prepareStatement("SELECT 1 FROM photos WHERE point_id = ? AND (status = 'confirmed' OR confirmed_at IS NOT NULL) LIMIT 1").use { ps ->
         ps.setString(1, pointId); ps.executeQuery().use { it.next() }
     }

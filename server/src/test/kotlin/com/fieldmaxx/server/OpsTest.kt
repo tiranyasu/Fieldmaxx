@@ -246,10 +246,10 @@ class OpsTest {
         assertEquals("y", point(app).comment)
     }
 
-    @Test fun photoOpsUnsupportedForNow() = TestApp().run { app ->
+    @Test fun photoOpOnUnknownPhotoIsNotFound() = TestApp().run { app ->
         seed(app)
         val t = tokenFor("ann")
-        assertEquals("unsupported", send(t, Op.PhotoRemove("p1", "ph")).single().error)
+        assertEquals("not_found", send(t, Op.PhotoRemove("p1", "ph")).single().error)
     }
 
     @Test fun opIdFromAnotherUserIsAConflict() = TestApp().run { app ->

@@ -7,6 +7,7 @@ import com.fieldmaxx.server.jobs.importRoutes
 import com.fieldmaxx.server.jobs.jobRoutes
 import com.fieldmaxx.server.links.linkRoutes
 import com.fieldmaxx.server.ops.opsRoutes
+import com.fieldmaxx.server.photos.photoRoutes
 import com.fieldmaxx.server.sync.syncRoutes
 import com.fieldmaxx.server.users.userRoutes
 import io.ktor.http.HttpStatusCode
@@ -52,6 +53,7 @@ fun Application.fieldmaxx(ctx: Ctx) {
             jobRoutes(ctx)
             linkRoutes(ctx)
             opsRoutes(ctx)
+            photoRoutes(ctx)
             get("/version") { call.respond(VersionBody(ctx.config.buildId)) }
         }
     }
