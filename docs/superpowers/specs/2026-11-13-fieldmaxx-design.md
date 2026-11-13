@@ -1,7 +1,9 @@
 # Fieldmaxx: Field Survey App for Android (design)
 
 Date: 2026-11-13
-Status: v2 draft (native Android), awaiting owner approval. v1 (web app) was
+Status: v2 draft (native Android), awaiting owner approval (includes the
+owner's answers to the v2 review: server backup ≥ 3 days, photo reuse on
+queries, test folder coming). v1 (web app) was
 approved earlier the same day; the owner then switched to a native Android
 app because a friend is building a web clone of Cadastrus. Everything the
 owner decided in v1 carries over unless §8 says otherwise.
@@ -58,13 +60,16 @@ separate from the friend's web clone: no shared data.
    data capture, comment, photos, close point; query points show the client's
    reference.
 4. **Photo delivery that can't silently lose photos, and is fast**: phone →
-   OneDrive Field Notes folder directly; the phone keeps its copy until it has
-   verified the photo in OneDrive; visible status per photo.
-5. **Built-in camera** with the stamp and a live compass on screen.
-6. **Crew**: admin-issued accounts, shared live progress, live GPS
+   OneDrive Field Notes folder directly, plus a **backup copy on our server
+   kept at least 3 days**; the phone keeps its copy until both are done;
+   visible status per photo.
+5. **Reuse photos already taken** to answer client queries (engineers often
+   query info the crew already provided).
+6. **Built-in camera** with the stamp and a live compass on screen.
+7. **Crew**: admin-issued accounts, shared live progress, live GPS
    (foreground only).
-7. **Pole data export** as a spreadsheet for the OCALC work.
-8. **Easy install and updates** without Google Play.
+8. **Pole data export** as a spreadsheet for the OCALC work.
+9. **Easy install and updates** without Google Play.
 
 ### Non-goals (later, not in v1)
 My pay, Markup for the client, Coordinates from photos, Smart route, "On my
@@ -92,10 +97,12 @@ categories below go.
    in-app camera with live compass, no IT approval. Trade-off: uploading
    through an "anyone with the link" share isn't an official Microsoft API,
    so Microsoft can change it (mitigated by the phone keeping every photo
-   until verified, and an export-to-OneDrive-app safety net, §6.6).
-2. **Same, but photos relayed through our server** (v1's design). Adds a hop,
-   needs a fast, larger server, and gives no extra safety once the phone holds
-   photos until they are verified. Rejected.
+   until verified, the server backup copy, and an export-to-OneDrive-app
+   safety net, §6.6).
+2. **Photos relayed through our server to OneDrive** (v1's design). Adds a
+   hop before OneDrive and makes speed depend on our server. Rejected as the
+   main route; but every photo *also* goes to our server as a backup (owner),
+   and the server delivers it itself if the phone hasn't within 30 min.
 3. **Upload via official Microsoft sign-in (Graph API).** Most durable, but
    needs EES's IT to approve an app registration. Not the owner's call. The
    uploader sits behind a `PhotoDestination` interface so this can be swapped
@@ -321,7 +328,8 @@ Layout follows Cadastrus:
 - **Progress strip**: "Progress: 152/159 (96%)", **"Left: 7"** (remaining
   points sorted by distance from you), sunset countdown ("☀️ 5h 40m until
   sunset"), progress bar, per-type counts.
-- **Map**: Esri World Imagery base + toggleable street-name overlay (Aa);
+- **Map**: Esri World Imagery base (source/key supplied by the server) +
+  toggleable street-name overlay (Aa);
   house-number overlay (123, OpenStreetMap addresses at high zoom); "center on
   me"; zoom. Markers are circles with a short type code (P, MH, HH, PED, BU,
   Q…) coloured by type; shot points turn grey, faded and struck-through; a
@@ -351,8 +359,8 @@ Layout follows Cadastrus:
   (multi-select): N/A, Carrier label, Grounding, No ground, No fiber, Damaged
   cable.
 - **Client query · reference** panel for query points.
-- **Use existing photos** (query points): pick photos already taken in this
-  job for another point; the phone uploads a copy into this point's folder.
+- **Use existing photos** (query points, owner: "engineers skip over things
+  and query us on info we already provided"): see §6.6.2.
 - Comment (free text).
 - **Take photo** (built-in camera, §6.6) and **Pick from gallery** (Android
   photo picker).
@@ -432,8 +440,28 @@ crash, a dead battery or a force-stop never loses a photo):
 5. **Confirmed**: the phone reads the file back from OneDrive (exists, byte
    size matches), then reports "confirmed" (destination path, timings) to our
    server, which tells the crew.
-6. The phone's own copies are deleted 3 days after confirmation (the gallery
-   copy stays, if enabled).
+6. **Backed up** (owner requirement): every stamped photo is also uploaded
+   to our server, in resumable chunks, alongside the OneDrive upload (OneDrive
+   gets bandwidth priority). This runs even when OneDrive is failing, so a
+   photo reaches safety as soon as there's any signal.
+7. The phone's own copies are deleted 3 days after the photo is both
+   confirmed in OneDrive and backed up on the server (the gallery copy stays,
+   if enabled).
+
+**On the server:**
+- Keeps every backup copy **at least 3 days** after it arrives, and never
+  deletes one that isn't confirmed in OneDrive. Admin setting "Keep backups
+  for N days" (default 3, minimum 3). Above 80% disk it warns the admin;
+  it never deletes early to make room.
+- Keeps a small thumbnail (~320 px) of every photo permanently, with its
+  point, location, time and OneDrive path, for reuse (§6.6.2).
+- **Server takes over delivery** if a photo it holds isn't confirmed in
+  OneDrive within 30 min of arriving (phone lost, broken, out of signal): the
+  server uploads it to the same folder with the same name, using the same
+  rules (§6.6.1). Whichever of phone or server gets there first wins; the
+  other sees a same-name, same-size file and treats it as done.
+- Admin can download any job's backed-up photos as a ZIP laid out like Field
+  Notes.
 
 Failures retry with backoff (15 s doubling to 30 min). After 6 failed
 attempts the photo is **stuck**: the reason shows on the photo and is
@@ -458,12 +486,29 @@ goes to poles in Field Notes and makes a POLE_33 folder"):
   must not create duplicates); same name, different size → ask the server for
   a new counter.
 
+**6.6.2 Reusing photos already taken** (owner requirement). On any point,
+mainly query points, **Use existing photos** opens a picker of photos already
+taken, newest first, with thumbnail, point label, job and date:
+- **Nearby**: photos taken within 150 m of this point, from **any job** (the
+  same pole is often in an earlier job), with the distance shown;
+- **This job**: all photos in the current job, grouped by point;
+- search by point label.
+Picking photos copies them into this point's folder in this job's Field
+Notes, with a new file name (same pattern, the original photo's coordinates),
+and the original stamp unchanged (it records when and where it was really
+taken). The full image comes from, in order: the phone, the server backup,
+or, for older photos, downloaded from OneDrive through the original job's
+Field Notes link (the link allows viewing). Reused photos count toward the
+"≥1 photo" rule and show "reused from POLE 5 · A05J9XE · 11/05/26".
+
 **What people see.** Each thumbnail: ⏳ on phone → ⬆ uploading → ✓ in OneDrive,
-or ⚠ stuck (tap for reason + Retry now). Top-bar pill counts photos not yet in
+or ⚠ stuck (tap for reason + Retry now); a small shield shows once the server
+backup is in place. Top-bar pill counts photos not yet in
 OneDrive. Menu → **Where the photos went**: per point, each photo's OneDrive
 path and status, plus a button to open the Field Notes folder.
 
-**Speed.** One hop, starting the moment the photo is stamped, 3 in parallel.
+**Speed.** One hop to OneDrive, starting the moment the photo is stamped, 3
+in parallel; the server backup shares the connection at lower priority.
 Each photo records time from shutter to confirmed and upload time; admin's
 Delivery health shows typical times. **Target**: on a decent LTE signal, a
 photo is confirmed in OneDrive within ~30 s of being taken. (Android may slow
@@ -475,11 +520,11 @@ delivery for a job starts failing for everyone (link expired, needs sign-in,
 no upload permission), the server marks the job and every phone shows the red
 banner; photos wait on the phones.
 
-**Safety net if the share-link route breaks:** menu → **Export photos to
-OneDrive app**: the phone bundles the job's photos that aren't confirmed yet
-into a ZIP laid out like Field Notes and hands it to Android's share sheet
-(the official OneDrive app, Drive, email…). Nothing is lost while the route
-is down because the phone keeps every unconfirmed photo.
+**Safety net if the share-link route breaks:** the server backup holds every
+photo until OneDrive confirms it, and the admin can download a job's photos
+as a Field-Notes-shaped ZIP. On the phone, menu → **Export photos to OneDrive
+app** bundles the job's unconfirmed photos the same way and hands them to
+Android's share sheet (the official OneDrive app, Drive, email…).
 
 **Deleting a photo:** a tech can delete their own photo before it reaches
 OneDrive. Once delivered, it stays in OneDrive (the link has no delete
@@ -579,15 +624,19 @@ label, lat/lon, original lat/lon, description, status, cant reason/text, pole
 fields, comment, folder_path, folder_candidates, flags, added_by, updated
 at/by, deleted at/by), `photos` (point, tech, file_name, size, status:
 registered/uploading/confirmed/stuck/removed, dest_path, last_error,
-taken_at, confirmed_at, upload_ms, reused_from), `ops_done`, `changes`
+taken_at, confirmed_at, upload_ms, reused_from, lat/lon, backup file +
+received_at + purged_at, thumbnail), `ops_done`, `changes`
 (sync feed), `positions`, `events`, `settings`, `counters`, `app_releases`.
 Phone: the same jobs/points/photo info as a local cache, plus local photo
 files and their pipeline state, and the outbox of pending changes.
 
 ### 7.3 Hosting
-Photos don't pass through the server, so it's small: a basic VPS with 2 GB
-RAM in a US region (e.g. DigitalOcean or Hetzner, ~$6–12/month), Docker
-Compose with the app container + Caddy for automatic HTTPS. Works with a
+The server holds photo backups (≥ 3 days) and permanent thumbnails, so it
+needs disk and decent bandwidth: a VPS in a US-West region with 2–4 GB RAM,
+≥ 80 GB disk (or an attached volume), ≥ 1 Gbps port and ≥ 2 TB/month
+transfer (e.g. DigitalOcean, Hetzner, Vultr; roughly $12–24/month). Rough
+sizing: 4 techs × 300 photos/day × 4 MB ≈ 5 GB/day, so 3 days ≈ 15 GB plus
+headroom. Docker Compose with the app container + Caddy for automatic HTTPS. Works with a
 bought domain or a free `<ip>.sslip.io` name. One-command setup script creates
 the first admin. Nightly backup of the SQLite file. The owner provides the
 server; the build includes setup instructions.
@@ -595,6 +644,9 @@ server; the build includes setup instructions.
 ## 8. Decisions log
 
 **Owner decided:**
+- **v2 review:** every photo is also kept on our server for **at least 3
+  days** as a backup; techs must be able to **reuse photos** on queries;
+  the owner is creating a test folder for development.
 - Replace Cadastrus because it's unreliable; do it better.
 - Job input is PDFs (poles; queries) and Word .docx files (queries).
 - Photos go into the job's Field Notes folder via its share link, in
@@ -618,8 +670,16 @@ server; the build includes setup instructions.
   the background**.
 
 **My calls (owner may override):**
-- Phone uploads straight to OneDrive (no server hop); server only registers
-  photos and assigns file names.
+- Phone uploads straight to OneDrive; the server backup copy goes up
+  alongside; the server takes over delivery after 30 min unconfirmed.
+- Reuse picker: nearby (150 m, any job) + this job; full image from phone,
+  server backup, or OneDrive via the original job's link; permanent server
+  thumbnails.
+- Map imagery source and optional key are sent to the app by the server
+  (default: Esri World Imagery without a key, like Cadastrus), so switching
+  to an ArcGIS account key later needs no app update.
+- No admin website; admin screens and exports live in the app (exports can
+  be shared to email/OneDrive for use on a PC).
 - Server reads job files; app is a share target for PDF/DOCX and links.
 - Built-in camera with live stamp/compass overlay; heading at the shutter.
 - Stamped copies also saved to a "Fieldmaxx" gallery album (setting, on).
@@ -643,10 +703,17 @@ server; the build includes setup instructions.
 - Stack and hosting in §7.
 
 ## 9. Open items
-- **Chunked upload through the link**: test SharePoint's chunked upload
-  calls through the share link early in the build (writes go only into the
-  existing `_FIELDMAXX_TEST_DELETE_ME` folder; needs the owner's OK). If not
-  allowed, use whole-file uploads with retries.
+- **Test folder**: the owner is creating a folder shared "anyone with the
+  link can edit" for development and on-phone testing (free to write to;
+  the owner deletes it at the end). All SharePoint integration tests,
+  including SharePoint's chunked upload calls, run against it. If chunked
+  upload isn't allowed through the link, use whole-file uploads with retries.
+- **Esri licensing**: Esri's terms expect business users to have an ArcGIS
+  account (free tier exists). The app works keyless like Cadastrus; the owner
+  can add a key later via the server (§8).
+- **Real sample files**: A05J9XE.pdf and QUERY_1_-_A05K51V.docx are in the
+  session's uploads and go into the git-ignored test folder. More real files
+  (other designers' pole PDFs, a query PDF) would strengthen the reader.
 - **Leftover test folder**: `_FIELDMAXX_TEST_DELETE_ME` in the A05J9XE Field
   Notes folder must be deleted by someone with full access.
 - **Release signing key**: generated at the first release build and handed
