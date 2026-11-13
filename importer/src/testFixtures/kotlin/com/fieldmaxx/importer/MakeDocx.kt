@@ -104,7 +104,9 @@ fun makeDocx(lists: List<DocxList>, body: List<DocxItem>): ByteArray {
         put("word/styles.xml", """$head<w:styles xmlns:w="$NS_W">$styles</w:styles>""")
         put(
             "word/_rels/document.xml.rels",
-            """$head<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">$rels</Relationships>""",
+            """$head<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">$rels""" +
+                """<Relationship Id="rIdNumbering" Type="$NS_R/numbering" Target="numbering.xml"/>""" +
+                """<Relationship Id="rIdStyles" Type="$NS_R/styles" Target="styles.xml"/></Relationships>""",
         )
         images.forEachIndexed { i, png -> put("word/media/image${i + 1}.png", png) }
     }
