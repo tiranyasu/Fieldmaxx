@@ -228,6 +228,9 @@ same SharePoint back end, so the same calls work:
 - Same results as the business link: contextinfo digest, nested folder
   creation, 9.3 MB upload in 1.8 s, read-back size match, "already exists"
   refusal (HTTP 400) on a duplicate name, and **no delete permission**.
+- **Creating a folder that already exists** returns HTTP 400 "A file or
+  folder with the name … already exists" (observed live during Task 10);
+  the client treats that as success.
 - **Chunked upload works through the link**: create an empty file, then
   `StartUpload(uploadId=guid'…')`, `ContinueUpload(uploadId,fileOffset)`,
   `FinishUpload(uploadId,fileOffset)` with 3.2 MB chunks; the final size
