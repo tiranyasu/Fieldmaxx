@@ -1,5 +1,7 @@
 # Fieldmaxx Implementation Plan
 
+> **SUPERSEDED (2026-11-13):** this plan is for the v1 web-app design. The owner switched to a native Android app (design v2). A new plan will replace this file; do not execute this one.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build Fieldmaxx, an installable web app and server where a crew imports AT&T job files (PDF/DOCX), works the points on a satellite map, records pole data, and has stamped photos delivered reliably into each job's OneDrive "Field Notes" folder.

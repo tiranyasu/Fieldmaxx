@@ -1,92 +1,111 @@
-# Fieldmaxx: Field Survey App (design)
+# Fieldmaxx: Field Survey App for Android (design)
 
 Date: 2026-11-13
-Status: approved by owner 2026-11-13 (with changes: creators can delete their jobs; techs can delete points before upload and move points anywhere)
+Status: v2 draft (native Android), awaiting owner approval. v1 (web app) was
+approved earlier the same day; the owner then switched to a native Android
+app because a friend is building a web clone of Cadastrus. Everything the
+owner decided in v1 carries over unless §8 says otherwise.
 
 ## 1. Intent and why
 
 Fieldmaxx replaces **Cadastrus**, a web app the owner's crew currently uses for
 AT&T fielding/surveying. The owner runs a crew of field techs. Each AT&T job
-arrives as one or more **PDFs** (from SharePoint) listing points (poles,
-pedestals, handholes, manholes, client queries…) with coordinates. The techs
-walk the route, photograph each point, record pole details, and the photos must
-land in the job's **Field Notes** folder in OneDrive/SharePoint, filed by
-category and point.
+arrives as one or more **PDF or Word files** (from SharePoint) listing points
+(poles, pedestals, handholes, manholes, client queries…) with coordinates. The
+techs walk the route, photograph each point, record pole details, and the
+photos must land in the job's **Field Notes** folder in OneDrive/SharePoint,
+filed by category and point.
 
 Cadastrus does this, but it is unreliable, and that is the whole reason for this
 project:
 
 - photos are sometimes lost;
 - the map zooms out on refresh;
-- sometimes it breaks completely and a job PDF can't be uploaded;
+- sometimes it breaks completely and a job file can't be uploaded;
 - points are missed because it fails to turn "point number + coordinates" into
-  a point on the map.
+  a point on the map;
+- uploads are slow: slow to Cadastrus, then "forever" to SharePoint.
 
 **Success** = the crew trusts it. No photo is ever lost without someone seeing
-it, no point in a PDF is ever silently dropped, and the app doesn't fight them
-(keeps their map view, keeps working on weak signal).
+it, no point in a job file is ever silently dropped, photos land in OneDrive
+quickly, and the app doesn't fight them (keeps their map view, keeps working
+on weak signal).
+
+Fieldmaxx is a **native Android app** plus **our own small server**. It is
+separate from the friend's web clone: no shared data.
 
 ## 2. Users and roles
 
 - **Admin** (the owner). Creates the logins and hands them out. No self-signup.
-  Sees everything: all jobs, all techs, delivery health.
+  Sees everything: all jobs, all techs, delivery health. Admin screens are
+  inside the app.
 - **Tech**. Signs in with the username and password the admin gave them, works
   jobs, takes photos, records pole data.
 - Several techs work **the same job at the same time**. Everyone sees each
-  other's progress live and **everyone sees each other's GPS position**.
-
-Primary device: Android phones (the owner uses Android). iPhone must also work.
-The admin also works from a laptop browser at times.
+  other's progress live and **everyone sees each other's GPS position while
+  their app is open**.
+- **Everyone on the crew uses Android.** No iPhone support.
 
 ## 3. Goals, non-goals, anti-goals
 
 ### Goals (first version)
-1. **Reliable import** of pole and query files (PDF and Word .docx), with a check screen that
-   accounts for every point found and every line it couldn't read.
+1. **Reliable import** of pole and query files (PDF and Word .docx), with a
+   check screen that accounts for every point found and every line it
+   couldn't read.
 2. **Map** with satellite imagery and all job points, type filters with
    progress, live crew positions.
 3. **Point screen**: instructions, navigation, move point, GPS accuracy, pole
    data capture, comment, photos, close point; query points show the client's
    reference.
-4. **Photo delivery that can't silently lose photos**: phone → server →
-   OneDrive Field Notes folder, each hop keeping its copy until the next hop
-   confirms, with visible status per photo.
-5. **Crew**: admin-issued accounts, shared live progress, live GPS.
-6. **Pole data export** as a spreadsheet for the OCALC work.
+4. **Photo delivery that can't silently lose photos, and is fast**: phone →
+   OneDrive Field Notes folder directly; the phone keeps its copy until it has
+   verified the photo in OneDrive; visible status per photo.
+5. **Built-in camera** with the stamp and a live compass on screen.
+6. **Crew**: admin-issued accounts, shared live progress, live GPS
+   (foreground only).
+7. **Pole data export** as a spreadsheet for the OCALC work.
+8. **Easy install and updates** without Google Play.
 
 ### Non-goals (later, not in v1)
-These exist in Cadastrus's menu and are explicitly deferred: My pay, Markup for
-the client, Coordinates from photos, Smart route, "On my way", rounds (the "+"
-chip), map usage estimate, photo quality picker, Russian/Spanish UI,
-Bug/Suggestion form, a native Android app. "Utilities, addresses & MDU" and
-"Data collection" are covered only as far as the add-point categories below go.
+My pay, Markup for the client, Coordinates from photos, Smart route, "On my
+way", rounds (the "+" chip), map usage estimate, per-tech photo quality
+picker, Russian/Spanish UI, Bug/Suggestion form, iPhone app, Google Play
+listing, offline map downloads, background location. "Utilities, addresses &
+MDU" and "Data collection" are covered only as far as the add-point
+categories below go.
 
 ### Anti-goals (would make this a failure even if it "works")
 - A photo that disappears without a visible failure.
-- A point in a PDF that never makes it onto the map without the importer saying so.
-- The map resetting its view on refresh or reopen.
-- Needing the company's IT department to approve anything before the crew can use it.
+- A point in a job file that never makes it onto the map without the importer
+  saying so.
+- The map resetting its view when the app is reopened.
+- Tracking a tech's location while the app isn't on their screen.
+- Needing the company's IT department to approve anything before the crew can
+  use it.
 - An import that fails as a whole because of one bad line.
 
 ## 4. Approaches considered
 
-1. **Installable web app + server, photos delivered through the job's Field
-   Notes share link** (chosen). Works on Android and iPhone from the home
-   screen, updates instantly, no app store, no IT approval. Trade-off: upload
+1. **Native Android app (Kotlin) + our own server; photos uploaded by the
+   phone straight to OneDrive through the job's Field Notes share link**
+   (chosen). Fastest delivery (one hop), uploads continue with the screen off,
+   in-app camera with live compass, no IT approval. Trade-off: uploading
    through an "anyone with the link" share isn't an official Microsoft API,
-   so Microsoft can change it. Mitigated by the store-and-confirm relay (§6.6).
-   A web app can't track GPS in the background, so a tech's dot only updates
-   while the app is open.
-2. **Same, but upload via official Microsoft sign-in (Graph API).** Most
-   durable, but needs EES's IT to approve an app registration in their
-   Microsoft 365. Not the owner's call; could take weeks or be refused.
-   **Designed as a drop-in replacement** for the share-link uploader later.
-3. **Native Android/iPhone app.** Background GPS and background uploads, but
-   app-store/sideload distribution, $99/yr Apple account, slower to build and
-   change.
+   so Microsoft can change it (mitigated by the phone keeping every photo
+   until verified, and an export-to-OneDrive-app safety net, §6.6).
+2. **Same, but photos relayed through our server** (v1's design). Adds a hop,
+   needs a fast, larger server, and gives no extra safety once the phone holds
+   photos until they are verified. Rejected.
+3. **Upload via official Microsoft sign-in (Graph API).** Most durable, but
+   needs EES's IT to approve an app registration. Not the owner's call. The
+   uploader sits behind a `PhotoDestination` interface so this can be swapped
+   in later.
+4. **Cross-platform app (Flutter/React Native)** for iPhone support. Rejected:
+   the whole crew is on Android, and the owner wants a genuine Android app.
+5. **Wrapping the web app (Capacitor).** Rejected for the same reason.
 
-**Owner's decision:** go with 1 now; possibly make it an **Android app later**.
-So the frontend must be wrappable with Capacitor later (see §7.4).
+**Owner's decisions:** native Android app, Android only, separate from the
+friend's site, our own server.
 
 ## 5. How the owner's data looks today (evidence)
 
@@ -111,17 +130,15 @@ So the frontend must be wrappable with Capacitor later (see §7.4).
     reads the wrapped layout, sees numbers split across lines
     (`39.63612682461489,-` / `119.68173217216633`).
 - Expected import result for this file: **exactly 7 POLE points** plus the job
-  notes. This file is the first fixture for the importer's tests.
+  notes.
 - Producer is iLovePDF (the designer edits/annotates PDFs there), so other job
   PDFs may differ in layout. The importer must be tolerant (§6.2).
 
 ### 5.2 Query files: Word (.docx) as well as PDF
-Queries arrive as **.docx** as well as PDF (owner, 2026-11-13). Sample:
-`QUERY_1_-_A05K51V.docx` (job A05K51V, query list 1). Cadastrus names query
-points `Query 1-43` (= query list 1, item 43) and shows the item text as the
-description, with a "Client query · reference" panel of reference pictures.
+Sample: `QUERY_1_-_A05K51V.docx` (job A05K51V, query list 1). Cadastrus names
+query points `Query 1-43` (= query list 1, item 43) and shows the item text as
+the description, with a "Client query · reference" panel of reference pictures.
 
-Structure of the sample (this is the importer's second test fixture):
 - A **numbered list of instructions**, one item per point, each followed by
   its **reference image(s)**: marked-up map/aerial screenshots (0, 1 or 2
   images per item).
@@ -138,10 +155,6 @@ Structure of the sample (this is the importer's second test fixture):
   `25A` and `25B`, each with its instruction text and its images.
 - Layer name comes from the file name: `QUERY_1_-_A05K51V` → `QUERY 1`.
 
-A reader that ignores Word's list numbering, or only looks for coordinates
-on the same line as the text, would mis-number or drop points here. That
-matches the owner's complaint about Cadastrus.
-
 ### 5.3 OneDrive Field Notes folder (from owner's screenshots)
 ```
 …/NEVADA/F2_A05K51V/                  ← job folder (shared, "anyone" link: globe icon)
@@ -151,12 +164,15 @@ matches the owner's complaint about Cadastrus.
     PED/  PFP/  POLE/  QUERY 1/  QUERY 2/  Query 3/  Rear images/  SAI/
     Street images/  UTILITIES/  VACANT LOT/
       MH/   MH_1/ MH_10/ MH_11/ … MH_19/ …          ← one folder per point
-      POLE/ POLE_10B/ POLE_14b/ … POLE_3B/ …        ← "b" = poles added between
+      POLE/ POLE_1/ POLE_10/ POLE_10B/ POLE_14b/ …  ← "b" = poles added between
 ```
 Category folder casing is inconsistent (`QUERY 1` vs `Query 3`). SharePoint
-names are case-insensitive, so match existing folders case-insensitively and
-create missing ones. (The screenshot shows only "b" poles under `POLE/`
-because it's an old job; normally `POLE_1`, `POLE_10`… are there too.)
+names are case-insensitive.
+
+### 5.4 Cadastrus UI (from 7 saved page snapshots)
+Dark UI (slate-900 `#0f172a` bars, blue `#2563eb` accents), Esri World
+Imagery + Esri World_Transportation label overlay, marker clustering.
+Fieldmaxx keeps the familiar layout so the crew doesn't have to relearn it.
 
 ### 5.5 What the upload spike found (2026-11-13, owner-approved test)
 Against the shared link for job **A05J9XE** (`…/OSP FIELDING/NEVADA/
@@ -169,21 +185,18 @@ A05J9XE_Additional fielding/Field Notes`):
 - A 9.3 MB test JPEG uploaded in **2.3 s** (~32 Mbit/s) from a US cloud
   container; read-back length matched.
 - The link's effective permissions are View/Add/Edit/Open but **not
-  Delete**: deleting or recycling a file or folder returns 403. So the app
-  can never clean up after itself in OneDrive. Uploads must be idempotent
-  (check for an existing file with the same name and size before uploading,
-  and treat a match as confirmed). The test folder
-  `_FIELDMAXX_TEST_DELETE_ME/POLE_99/POLE_99_TEST_1.jpg` had to be left
-  for a person with full access to delete.
+  Delete**: deleting or recycling returns 403. So the app can never clean up
+  after itself in OneDrive. Uploads must be idempotent (check for an existing
+  file with the same name and size before uploading; treat a match as
+  delivered). The test folder `_FIELDMAXX_TEST_DELETE_ME/POLE_99/
+  POLE_99_TEST_1.jpg` had to be left for a person with full access to delete.
 - The link can't see above the Field Notes folder (parent returns 403).
 - **Existing layout in this job**: Field Notes holds folders named just
-  `1` … `7` (one per pole, likely pre-created by the office), not
-  `POLE/POLE_1`. Files inside are named by Cadastrus as
-  `POLE_1_39.636130_-119.691104_6018.jpg` =
+  `1` … `7` (one per pole, likely pre-created by the office). Files inside are
+  named by Cadastrus as `POLE_1_39.636130_-119.691104_6018.jpg` =
   `<TYPE>_<ID>_<lat 6dp>_<lon 6dp>_<counter>.jpg`.
-- **Cadastrus photos**: 3000×4000 JPEG, 1.4–6.7 MB, **EXIF stripped**
-  (no GPS/time in the file). Visible stamp, bottom-left, white text with dark
-  shadow, four lines:
+- **Cadastrus photos**: 3000×4000 JPEG, 1.4–6.7 MB, **EXIF stripped**.
+  Visible stamp, bottom-left, white text with dark shadow, four lines:
   ```
   A05J9XE · POLE 1
   39.636130, -119.691104
@@ -193,401 +206,391 @@ A05J9XE_Additional fielding/Field Notes`):
   No compass line. The sample was stamped 13:35 local and created in
   OneDrive at 14:12 local (~37 min later); that job's 17 photos all landed
   within 21 s of each other.
-
-### 5.4 Cadastrus UI (from 7 saved page snapshots)
-Dark UI (slate-900 `#0f172a` bars, blue `#2563eb` accents), Leaflet map, Esri
-World Imagery + Esri World_Transportation label overlay, marker clustering.
-The screens referenced in §6 mirror what was observed; Fieldmaxx keeps the
-familiar layout so the crew doesn't have to relearn it.
+- Not yet tested: SharePoint's chunked upload (`StartUpload` /
+  `ContinueUpload` / `FinishUpload`) through the link (§6.6, §9).
 
 ## 6. What it does
 
 ### 6.1 Accounts and sign-in
-- Admin creates users: display name, username, initial password. Admin can
-  reset a password, disable a user, and promote another user to admin.
-- Techs can change their own password.
-- Sessions are long-lived (90 days, sliding) so techs aren't logged out in the field.
-- First admin account is created by the setup script on the server.
+- Admin creates users in the app: display name, username, initial password.
+  Admin can reset a password, disable a user, and promote another user to
+  admin. Techs can change their own password.
+- Sessions are long-lived (90 days, sliding) so techs aren't logged out in the
+  field. The session token is stored encrypted on the phone.
+- The first admin account is created by the server setup script.
 
-### 6.2 Jobs and PDF import
-**Accepted files:** PDF and Word (.docx). (Old-style .doc: convert on the
-server if it ever shows up, or ask for .docx; not required in v1.)
+### 6.2 Jobs and import
+**Accepted files:** PDF and Word (.docx). (Old-style .doc: not in v1.)
 
-**Creating a job.** "+ New job" → drop or pick one or more PDF/DOCX files →
-the check screen → paste the **Field Notes link** → save. Job name defaults to the first
-PDF's file name (`A05J9XE.pdf` → `A05J9XE`), editable. More PDFs (e.g. a query
-PDF that arrives later) can be added to an existing job through the same check
-screen. Any signed-in user can create a job or add files.
+**Getting files into the app.** "+ New job" opens Android's file picker
+(Downloads, the OneDrive app, Drive, email attachments all appear there). The
+app is also a **share target**: in the OneDrive app or an email, "Share →
+Fieldmaxx" on a PDF/DOCX opens "New job / Add to job". Several files can be
+picked at once. **Reading the files happens on our server** (the app uploads
+them and gets back the check-screen data), so importing needs signal, and a
+fix to the reader doesn't need an app update.
 
-**Deleting a job** ("accidents happen"): the tech who created the job, or
-an admin, can delete it. It asks for confirmation and shows what's in the
-job; if any photos haven't reached OneDrive yet it warns that they'll stay
-undelivered. Deletion is a soft delete: the job disappears for everyone
-but an admin can restore it for 30 days, after which it's purged. Photos
-already in OneDrive are untouched (the app can't delete there).
+**Creating a job.** Pick files → check screen → paste the **Field Notes
+link** (or share it into the app from the OneDrive app) → save. Job name
+defaults to the first file's name (`A05J9XE.pdf` → `A05J9XE`), editable. More
+files (e.g. a query file that arrives later) can be added to an existing job
+through the same check screen. Any signed-in user can create a job or add
+files.
+
+**Deleting a job** ("accidents happen"): the tech who created the job, or an
+admin, can delete it. It asks for confirmation and shows what's in the job;
+if any photos haven't reached OneDrive yet it warns that they'll stay
+undelivered (they remain on the phone that took them). Deletion is soft: the
+job disappears for everyone, an admin can restore it for 30 days, after which
+it's purged. Photos already in OneDrive are untouched.
 
 **Where the importer reads text from** (all of them, then de-duplicates):
-- PDF:
-  1. Annotation contents (FreeText, Text/sticky notes, etc.).
-  2. Form field values (the sample has an AcroForm).
-  3. The page text layer.
-- DOCX: the body in document order (paragraphs and table cells), with:
-  - **Word list numbering rendered** the way Word shows it: per list,
-    its start value (e.g. 14), number format (decimal / upper letter) and
-    level text (`%1.`, `%1-`), counting per list and level;
-  - **typed-in numbers** at the start of a paragraph (`12.`, `13..`)
-    recognised as the item number;
-  - embedded images, in order.
-
-**Query lists (numbered items).** An item starts at a numbered paragraph
-(auto or typed number) that has text. Coordinates on its line or in the
-following coordinate-only paragraphs belong to it; images that follow (until
-the next item) are its **reference images**. One coordinate = one point
-labelled `<Layer>-<n>` (`Query 1-14`); several = one point each with letter
-suffixes (`Query 1-25A`, `Query 1-25B`, using Word's letters when it has
-them). The item text is the point's description. An item with no
-coordinates is flagged on the check screen ("no coordinates"), not dropped.
-A query PDF exported from the same kind of document is read the same way,
-using text and image positions on the page to keep reading order.
+- PDF: annotation contents (FreeText, Text/sticky notes, etc.); form field
+  values (the sample has an AcroForm); the page text layer.
+- DOCX: the body in document order (paragraphs and table cells), with
+  **Word list numbering rendered** the way Word shows it (per list: start
+  value, number format, level text, counting per list and level; numbering
+  inherited from paragraph styles), **typed-in numbers** at the start of a
+  paragraph (`12.`, `13..`), and embedded images in order.
 
 **How it reads points.** Normalize text first: treat `\r`, `\n`, `\t` and runs
 of spaces as separators; re-join a number split after `-` or `,` across a line
-break. Then find:
-- **Labelled points**: a label = a type word plus an id (`POLE 1`, `MH 10`,
-  `HH 2`, `PED 3`, `POLE 14B`, `Query 1-43`), followed by `=`, `:`, `-` or
-  nothing, then a coordinate pair.
+break. Then:
+- **Labelled points**: a type word plus an id (`POLE 1`, `MH 10`, `HH 2`,
+  `PED 3`, `POLE 14B`), followed by `=`, `:`, `-` or nothing, then a
+  coordinate pair. Text after a point's coordinates up to the next label is
+  its description.
+- **Query lists (numbered items)**: an item starts at a numbered paragraph
+  (auto or typed number) that has text. Coordinates on its line or in the
+  following coordinate-only paragraphs belong to it; images that follow
+  (until the next item) are its **reference images**. One coordinate = one
+  point labelled `Query <n>-<item>` (`Query 1-14`); several = one point each
+  with letter suffixes (`Query 1-25A`, `Query 1-25B`, using Word's letters when
+  it has them). The item text is the description. A query PDF exported from
+  the same kind of document is read the same way, using text and image
+  positions on the page to keep reading order.
 - **Coordinate pairs**: decimal degrees with optional space after the comma,
   or separated by a space; also degrees-minutes-seconds (`39°38'09.9"N
-  119°41'27.8"W`). Validate ranges (lat −90…90, lon −180…180).
+  119°41'27.8"W`). Validate ranges.
 - **Sanity checks** (flag, don't drop): lat/lon look swapped; the sign of
   longitude disagrees with the rest of the job; a point is more than ~50 km
   from the job's other points; a duplicate label with different coordinates.
-- Any remaining text between labelled points becomes that point's
-  **description**. A free-standing notes block (like "NOTE FOR AERIAL PATH")
+- A free-standing block with no coordinates (like "NOTE FOR AERIAL PATH")
   becomes the **job notes**.
 - **Unlabelled coordinate pairs** become points named by layer + sequence and
-  are flagged for review.
+  are flagged for review. An item with no coordinates is flagged "no
+  coordinates".
 - A line that contains a type word or a number that looks like a coordinate
-  but couldn't be parsed is listed as **"couldn't read"**. It is never
-  silently ignored.
+  but couldn't be parsed is listed as **"couldn't read"**. Never silently
+  ignored.
+- Importing the same file twice into a job doesn't double points (same label
+  within 1 m is skipped and reported).
 
-**Point type / layer.** Taken from the label's type word (POLE, MH…). For
-query PDFs the layer name (`Query 1`, `Query 2`, `Address Query`) is chosen on
-the check screen, defaulting from the label (`Query 1-43` → `Query 1`).
+**Point type / layer.** From the label's type word (POLE, MH…). For query
+files the layer name (`QUERY 1`) comes from the file name and is editable on
+the check screen.
 
-**Check screen** (the core of "no point silently missed"):
+**Check screen** (the core of "no point silently missed"), phone-sized:
 - "Found 7 POLE points" summary per type, a small map preview with all points,
-  and a table: label, type, lat, lon, description, flags.
-- A "Couldn't read" section showing the raw text of every unparsed line, with
-  an inline editor to fix it into a point, or "ignore" explicitly.
-- Every row is editable before saving.
-- The importer never fails the whole file because of one bad line. If the
-  PDF itself can't be opened, it says so plainly and nothing is saved.
+  and a list of point cards: label, lat, lon, description, flag badges; each
+  editable or removable.
+- A "Couldn't read" section with the raw text of every unparsed line, a "Fix"
+  form (label + coordinates) or an explicit "Ignore".
+- Save is enabled only when every "no coordinates" point is fixed or removed
+  and every "couldn't read" line is fixed or ignored.
+- If the file itself can't be opened, it says so plainly and nothing is saved.
 
-**Reference images.** For query items, the item's own images (from the DOCX,
-or from the PDF by position) are attached to its point(s) and shown as the
-**"Client query · reference"** panel, tap to zoom. In addition, every PDF
-page is rendered to an image at import and kept with the job; each point
-links to the page(s) its text came from (for poles this is the route
-screenshot). Reference images are stored on our server with the job, so
-they don't vanish like Cadastrus's did.
+**Reference images.** Query items' own images are attached to their point(s)
+and shown as the **"Client query · reference"** panel (tap to zoom). Every PDF
+page is also rendered to an image; each point links to the page(s) its text
+came from (for poles this is the route screenshot). Reference images live on
+our server with the job and are cached on the phone when the job is opened, so
+they work offline and don't vanish like Cadastrus's did.
 
-**Job info** shows the job notes, the source PDFs (downloadable), the Field
-Notes link, and the crew working it.
+**Job info** shows the job notes, the source files (open on the phone), the
+Field Notes link, and the crew who has worked it.
 
 ### 6.3 Map screen
 Layout follows Cadastrus:
 - **Top bar**: job name; search; connection pill (online / offline / "3
-  photos waiting"); menu ☰.
+  photos waiting"); menu ☰. A red banner under it when OneDrive delivery for
+  this job is failing (with the reason).
 - **Chip row**: "Hide shot" toggle; "All (N)"; one chip per type with
   done/total and a progress underline (e.g. "✓ POLE (80/80)"); tapping a chip
   filters to that type.
-- **Progress strip**: "Progress: 152/159 (96%)", **"Left: 7"** button (opens
-  remaining points sorted by distance from you), sunset countdown ("☀️ 5h 40m
-  until sunset", from device location and date), progress bar, per-type counts.
+- **Progress strip**: "Progress: 152/159 (96%)", **"Left: 7"** (remaining
+  points sorted by distance from you), sunset countdown ("☀️ 5h 40m until
+  sunset"), progress bar, per-type counts.
 - **Map**: Esri World Imagery base + toggleable street-name overlay (Aa);
-  house-number overlay (123), source left to the builder (§9); "center on me";
-  zoom. Markers are circles with a short type code (P, MH, HH, PED, BU, Q…)
-  coloured by type; shot points turn grey, faded and struck-through; a small
-  badge marks points with photos not yet confirmed in OneDrive. Clustering at
-  low zoom, off at high zoom.
-- **Your position**: pulsing blue dot. **Crew**: one dot per other signed-in
-  tech with their name and "2 min ago"; dots older than 10 min are faded,
+  house-number overlay (123, OpenStreetMap addresses at high zoom); "center on
+  me"; zoom. Markers are circles with a short type code (P, MH, HH, PED, BU,
+  Q…) coloured by type; shot points turn grey, faded and struck-through; a
+  small badge marks points with photos not yet in OneDrive. Clustering at low
+  zoom, off at high zoom.
+- **Your position**: pulsing blue dot. **Crew**: one dot per other tech with
+  their name and "2 min ago". A tech whose app went to the background shows
+  as a grey dot "app closed · 3 min ago"; dots older than 10 min are faded,
   older than 1 h hidden.
 - **"+" button** (bottom-left): add a point here (§6.5).
 - **The map remembers its view** (centre + zoom) per user per job, saved on
-  every move, restored on refresh/reopen. First open of a job fits all points.
+  every move, restored whenever the job is reopened. First open fits all
+  points.
 
 ### 6.4 Point screen (bottom sheet on tapping a marker)
 - Header: point name; **Navigate** (opens Google Maps directions to the
   point); **Move point**: any tech can drag the marker anywhere, any time
   (imported or added points, open or closed). Confirm/cancel after the drag,
-  and an "Undo move" right after. The original coordinates are kept and the
-  move is recorded with who/when; the crew sees the new position live;
-  close.
-- Instructions for the type (e.g. POLE: "Photograph the pole and the carrier
-  equipment on it.") and the point's description from the PDF.
-- **GPS accuracy** badge from the phone's reported accuracy ("GPS ±12 ft";
-  green / amber / red).
-- **Pole data** (POLE type, including added poles):
-  - Line height (ft, decimal)
-  - Anchor (toggle)
-  - Self-supporting / Lashed (one or neither)
-  - Tags (multi-select): N/A, Carrier label, Grounding, No ground, No fiber,
-    Damaged cable
-- **Client query · reference** panel for query points (§6.2). The reference
-  comes from the query PDF. Cadastrus also stored it on its own server,
-  which is why it showed "unavailable (401)" once an old job was cleared.
+  and "Undo move" for 10 s after. The original coordinates are kept and the
+  move is recorded with who/when; the crew sees the new position live; close.
+- Instructions for the type (POLE: "Photograph the pole and the carrier
+  equipment on it.") and the point's description from the file.
+- **GPS accuracy** badge ("GPS ±12 ft"; green ≤ 16 ft, amber ≤ 50 ft, red
+  above).
+- **Pole data** (POLE type, including added poles): line height (ft,
+  decimal); Anchor (toggle); Self-supporting / Lashed (one or neither); tags
+  (multi-select): N/A, Carrier label, Grounding, No ground, No fiber, Damaged
+  cable.
+- **Client query · reference** panel for query points.
 - **Use existing photos** (query points): pick photos already taken in this
-  job for another point. The server delivers its copy into the query
-  point's folder too (if past the server's retention, use Pick from gallery).
-  Reused photos count toward the "≥1 photo" rule.
+  job for another point; the phone uploads a copy into this point's folder.
 - Comment (free text).
-- **Take photo** (opens the phone camera) and **Pick from gallery**.
-- Photo strip: thumbnails with per-photo status (§6.6).
+- **Take photo** (built-in camera, §6.6) and **Pick from gallery** (Android
+  photo picker).
+- Photo strip: thumbnails with per-photo status.
+- Folder line: "→ Field Notes/POLE/POLE_18". If two folders could match, it
+  asks once which one to use.
 - **Done** closes the point (requires ≥1 photo), or **Can't shoot** with a
   reason (Not found, No access, Not applicable, Other + text). Both count as
-  complete for progress; "Can't shoot" points are listed for the admin.
-  Closed points can be reopened.
-- All edits save as you go (no separate "save" button) and sync to the crew.
+  complete; "Can't shoot" points are listed for the admin. Closed points can
+  be reopened.
+- All edits save as you go and sync to the crew.
 
 ### 6.5 Adding points
 "+" → a crosshair at your GPS position (drag the map to adjust) → choose type
-(the job's types plus the standard categories: POLE, PED, HH, MH, BU, SAI, PFP,
-MDU, CULVERT, Drainage, CREEK IMAGE, MAIL BOX IMAGES, Street images, Rear
-images, VACANT LOT, UTILITIES, Aerial Fielding, F3 BUILDING DATA) → name.
-For POLE the name is suggested from the nearest existing pole number plus the
-next free letter (`POLE_14B`), editable. Added points behave like imported
-ones and are marked "added by <tech>". Menu → "Points I added" lists them.
+(the job's types plus: POLE, PED, HH, MH, BU, SAI, PFP, MDU, CULVERT, Drainage,
+CREEK IMAGE, MAIL BOX IMAGES, Street images, Rear images, VACANT LOT,
+UTILITIES, Aerial Fielding, F3 BUILDING DATA) → name. For POLE the name is
+suggested from the nearest existing pole number plus the next free letter
+(`POLE 14B`), editable; for other types the next free number. Added points
+behave like imported ones and are marked "added by <tech>". Menu → "Points I
+added" lists them.
 
 ### 6.5a Deleting points
 Any tech can delete a point (imported or added) **as long as none of its
-photos has been uploaded** (no photo has reached the server). Photos still
-only on the phone are discarded with it, after a warning. Once a photo has
-been uploaded, only an admin can delete the point. Deletes are soft: the
-point disappears for everyone, is listed in the job's activity with
+photos has reached OneDrive**; photos still on the phone are discarded with
+it, after a warning. After that, only an admin can delete it. Deletes are
+soft: the point disappears for everyone, shows in the job's activity with
 who/when, and an admin can restore it. Folders already created in OneDrive
 are left alone.
 
-### 6.6 Photos and delivery to OneDrive (the reliability core)
-**On the phone:**
-1. The photo file is written to on-device storage (IndexedDB) **before**
-   anything else happens, with its point, job, tech and timestamp. The
-   camera original is saved first; the smaller upload copy (see "Speed"
-   below) is made from it afterwards, so a crash mid-resize loses nothing.
-2. The app requests persistent storage so the browser won't evict it.
-3. An upload queue sends it to the server in resumable chunks (weak signal
-   friendly), retrying with backoff, resuming after app restarts.
-4. The local copy is deleted only after the server reports the photo is
-   **confirmed in OneDrive**, plus a 3-day grace period.
+### 6.6 Photos: camera, stamp, delivery (the reliability core)
 
-**On the server:**
-5. Stores the file on disk, records it in the database, replies "received",
-   and puts it on a durable delivery queue.
-6. A delivery worker uploads it into the job's Field Notes folder, choosing
-   the point's folder like this (owner: "if there's no pole 33 folder it goes
-   to poles in Field Notes and makes a POLE_33 folder"):
-   1. **Use an existing folder for the point if there is one.** The office
-      sometimes pre-creates them, in different styles. Search Field Notes and
-      its category folders (two levels deep) for a folder whose name is the
-      point's id in any common form, case-insensitive: `1`, `POLE_1`,
-      `POLE 1`, `Pole1`, `P1`; for added poles `14B`/`POLE_14b`; for queries
-      `43`, `Query 1-43`, `QUERY_1-43`. Prefer a match inside the point's
-      category folder over one at the top level.
-   2. **Otherwise create** `<Category>/<TYPE>_<ID>`, e.g. `POLE/POLE_33`,
-      `MH/MH_10`, `QUERY 1/Query_1-43`. The category folder is matched
-      case-insensitively to an existing one (`POLE`, `QUERY 1`) or created.
-   3. The folder chosen for each point is stored, shown on the point screen
-      ("→ Field Notes/1"), and reused for every later photo of that point.
-      If a match is ambiguous (two candidate folders), the point screen asks
-      the tech/admin to pick once.
-   - **File name** matches Cadastrus:
-     `<TYPE>_<ID>_<lat 6dp>_<lon 6dp>_<counter>.jpg`, with the phone's
-     coordinates at capture and a server-wide counter.
-   - Never overwrites; on a name clash it bumps the counter. Before
-     uploading, it checks for an existing file of the same name and size and
-     treats that as already delivered (the link can't delete, so retries
-     must not create duplicates).
-7. After uploading it **verifies** by reading the file back from OneDrive
-   (exists, byte size matches). Only then is it marked **confirmed**.
-8. Failures retry with backoff. After repeated failure the photo is marked
-   **stuck**, the reason is shown, and the admin is alerted in-app. The
-   server keeps its copy until confirmed, then deletes it 14 days later.
+**Camera.** A built-in camera screen (CameraX): full-resolution capture,
+shutter, flash, zoom, and a **live overlay** showing exactly what will be
+stamped: job · point, coordinates, ±accuracy · altitude, compass heading
+(live, from the phone's rotation sensor), date/time. Several photos in a row
+without leaving the camera; a counter shows how many were taken for this
+point. The heading stamped is the reading at the moment the shutter is
+pressed. If the compass needs calibration, the overlay says "Compass:
+calibrate" (figure-8 hint).
 
-**What people see:**
-- Each photo thumbnail: ⏳ on phone → ☁ on server → ✓ in OneDrive, or ⚠ stuck
-  (tap for reason + retry).
-- Top-bar pill shows the count of photos not yet confirmed.
-- Menu → **Where the photos went**: per job, per point, the OneDrive path and
-  status of each photo, with a link to open the folder.
-
-**Speed (owner requirement).** Cadastrus is slow at both hops: phone →
-Cadastrus takes long, then Cadastrus → SharePoint "takes forever". Its server
-is a DigitalOcean machine in Santa Clara, CA (per DigitalOcean's public IP
-geofeed), so distance isn't the cause: the slowness is in how it handles
-uploads. Fieldmaxx must be fast at both hops:
-- **Phone → server**: upload starts the moment a photo is saved, in the
-  background while the tech keeps working; resumable chunks so a dropped
-  connection resumes instead of restarting; 2–3 photos in parallel.
-- **Smaller files, same picture**: by default the phone re-saves the photo
-  at full resolution as a high-quality JPEG (roughly half the size of the
-  camera original, JPEG quality 0.85), copying the EXIF/GPS data across.
-  An admin setting switches to **Maximum** (JPEG quality 0.95, larger
-  files). Untouched camera originals aren't possible because the stamp
-  must be drawn onto the image. Images above 16 megapixels are scaled down
-  to 16 MP (the iPhone browser's canvas limit).
-- **Server → OneDrive**: the delivery worker starts on each photo as soon
-  as it's received (no batching), runs several uploads in parallel, and
-  streams from disk. Folder lookups/creations are cached per job so each
-  photo doesn't re-walk the folder tree.
-- **Measure it**: each photo records how long each hop took and the
-  throughput. Admin → Delivery health shows typical times, so slowness is
-  visible and attributable to the right hop.
-- **Target**: on a decent LTE signal, a photo is confirmed in OneDrive
-  within ~30 s of being taken; server → OneDrive adds no more than a few
-  seconds per photo.
-
-**Uploading through the share link:** the server resolves the per-job Field
-Notes "anyone with the link can edit" URL and uses the same SharePoint calls
-the browser makes when someone opens that link and uploads. This is
-unofficial, so it's isolated behind a `PhotoDestination` interface
-(`ensureFolder`, `upload`, `verify`) so an official Microsoft Graph
-implementation (approach 2) can replace it later. **First implementation
-task is a spike against a test folder** to prove upload + folder creation +
-verify works through an anyone-link before building on it. **Done:** the
-spike succeeded (§5.5); the implementation should follow the calls proven
-there.
-
-The Field Notes link is checked when entered (can we list the folder?) and
-the job shows a red banner if delivery to it starts failing.
-
-**Safety net if the share-link route fails or breaks later:** the admin can
-download any job's photos as a ZIP already laid out in the Field Notes folder
-structure, ready to drag into OneDrive. Photos stay on the server until
-confirmed, so nothing is lost while the route is down. The rest of the app is
-built in parallel with the upload spike; only the OneDrive uploader waits on it.
-
-**Photo stamp (owner requirement: time stamp, coordinates, compass, point
-name burned into the image).** Done on the phone when the upload copy is
-made (§6.6 step 1 / Speed), at full resolution. Same look as Cadastrus
-(bottom-left, white text, dark shadow, sized relative to the image), plus a
-compass line:
+**Stamp** (owner requirement), same look as Cadastrus plus a compass line,
+burned into the image at full resolution (bottom-left, white bold text, dark
+shadow, sized at 2.8% of the shorter side):
 ```
 A05J9XE · POLE 1
 39.636130, -119.691104
 ±16 ft · alt 4430 ft
-NE 47°  (compass)
+NE 47°
 11/05/26 13:35:47
 ```
-- Coordinates, accuracy and altitude come from the phone's GPS at the moment
-  the photo comes back from the camera (the freshest fix ≤ 10 s old;
-  otherwise the stamp says "GPS stale"). Gallery picks use the photo's own
-  EXIF GPS/time if present; otherwise the stamp is marked "from gallery".
-- **Compass**: taken from the camera's EXIF image direction when the camera
-  app records it; otherwise from the phone's compass reading when the photo
-  returns to the app (the tech is normally still facing the subject).
-  iPhone needs a one-time compass permission, asked on first photo. If this
-  proves not accurate enough in the field, the fix is an in-app camera with
-  a live compass, which is also a natural part of the Android app later.
-- Unlike Cadastrus, the upload copy **keeps EXIF** (GPS, time, direction),
-  written from the app's own fix when the camera didn't provide it.
-- The stamp is also shown on the thumbnail so the tech can see it's right.
+- GPS fix older than 10 s at the shutter → line 2 ends "(GPS stale)"; no fix
+  → "No GPS". Gallery picks use the photo's own EXIF GPS/time if present and
+  the time line ends "(from gallery)".
+- EXIF is kept and written: GPS, altitude, image direction, date/time, camera
+  make/model.
 
-**Deleting a photo:** a tech can delete a photo that hasn't reached OneDrive
-yet. Once delivered, it stays in OneDrive (the share link has no delete
-permission, see §5.5; remove it there by hand if needed); the app hides it from the point and records who removed it and
-when, so a removed photo is never mistaken for a lost one.
+**Steps on the phone** (each step persists before the next starts, so a
+crash, a dead battery or a force-stop never loses a photo):
+1. **Saved**: the full-resolution capture is written to app storage and
+   recorded in the phone's database (point, job, tech, time, GPS, heading).
+2. **Stamped**: a worker makes the upload copy: stamp drawn, JPEG quality
+   85% (admin setting "Maximum" = 95%), images above 16 megapixels scaled to
+   16 MP (memory safety), EXIF written. A copy is also saved to the phone's
+   gallery in an album "Fieldmaxx" (setting, on by default) as an extra
+   backup.
+3. **Registered**: the app tells our server about the photo; the server
+   assigns its file name `<TYPE>_<ID>_<lat 6dp>_<lon 6dp>_<counter>.jpg`
+   (server-wide counter) and now knows the photo exists. Needs signal to our
+   server.
+4. **Uploading**: the phone uploads straight to the job's Field Notes folder
+   (§6.6.1), up to 3 photos in parallel, in the background (Android
+   WorkManager: keeps going with the screen off or the app closed, resumes
+   after a reboot, waits for signal). Uses SharePoint's chunked upload if the
+   link allows it (resumes mid-file on weak signal), otherwise whole-file
+   upload with retries (§9).
+5. **Confirmed**: the phone reads the file back from OneDrive (exists, byte
+   size matches), then reports "confirmed" (destination path, timings) to our
+   server, which tells the crew.
+6. The phone's own copies are deleted 3 days after confirmation (the gallery
+   copy stays, if enabled).
 
-**Server disk:** server copies are deleted 7 days after confirmation. If the
-disk passes 80%, the oldest *confirmed* copies are purged first;
-unconfirmed photos are never purged. Admin sees disk usage and an alert
-above 80%.
+Failures retry with backoff (15 s doubling to 30 min). After 6 failed
+attempts the photo is **stuck**: the reason shows on the photo and is
+reported to the server, the admin sees it in Delivery health, and retrying
+continues every 30 min. "Retry now" on the photo forces an attempt.
 
-### 6.7 Live crew positions
-- While the app is open, the phone sends its position when it moves > 5 m or
-  every 15 s, whichever comes first (with accuracy).
-- Positions are broadcast to every signed-in user and shown on every job map.
-  Only the latest position per user is kept (no location history in v1).
-- A tech can't hide their dot in v1 (owner's requirement: everyone sees
-  everyone). "Pause for today" (stop sharing) is a candidate for later.
+**6.6.1 Where photos go in OneDrive** (owner: "if there's no pole 33 folder it
+goes to poles in Field Notes and makes a POLE_33 folder"):
+1. **Use an existing folder for the point if there is one.** Search Field
+   Notes and its category folders (two levels) for a folder whose name is the
+   point's id in any common form, case-insensitive: `1`, `POLE_1`, `POLE 1`,
+   `Pole1`, `P1`; for added poles `14B`/`POLE_14b`; for queries `43`,
+   `Query 1-43`, `QUERY_1-43`. Prefer a match inside the point's category
+   folder; at the top level a bare number only matches POLE points (the
+   A05J9XE layout).
+2. **Otherwise create** `<Category>/<TYPE>_<ID>` (`POLE/POLE_33`, `MH/MH_10`,
+   `QUERY 1/Query_1-43`), reusing an existing category folder's spelling.
+3. The folder chosen is stored on the point (shared via the server) and
+   reused for every later photo. Two candidates → the point screen asks once.
+- Never overwrites. Before uploading, check for an existing file of the same
+  name and size and treat it as delivered (the link can't delete, so retries
+  must not create duplicates); same name, different size → ask the server for
+  a new counter.
+
+**What people see.** Each thumbnail: ⏳ on phone → ⬆ uploading → ✓ in OneDrive,
+or ⚠ stuck (tap for reason + Retry now). Top-bar pill counts photos not yet in
+OneDrive. Menu → **Where the photos went**: per point, each photo's OneDrive
+path and status, plus a button to open the Field Notes folder.
+
+**Speed.** One hop, starting the moment the photo is stamped, 3 in parallel.
+Each photo records time from shutter to confirmed and upload time; admin's
+Delivery health shows typical times. **Target**: on a decent LTE signal, a
+photo is confirmed in OneDrive within ~30 s of being taken. (Android may slow
+background work when a phone sits idle in a pocket for a long time; opening
+the app speeds it back up.)
+
+**Field Notes link** is checked when entered (can we list the folder?). If
+delivery for a job starts failing for everyone (link expired, needs sign-in,
+no upload permission), the server marks the job and every phone shows the red
+banner; photos wait on the phones.
+
+**Safety net if the share-link route breaks:** menu → **Export photos to
+OneDrive app**: the phone bundles the job's photos that aren't confirmed yet
+into a ZIP laid out like Field Notes and hands it to Android's share sheet
+(the official OneDrive app, Drive, email…). Nothing is lost while the route
+is down because the phone keeps every unconfirmed photo.
+
+**Deleting a photo:** a tech can delete their own photo before it reaches
+OneDrive. Once delivered, it stays in OneDrive (the link has no delete
+permission; remove it there by hand); the app hides it from the point and
+records who removed it and when, so a removed photo is never mistaken for a
+lost one.
+
+### 6.7 Live crew positions (foreground only, owner requirement)
+- Location is collected **only while the app is on screen**. The app asks
+  only for "while using the app" location permission and never for
+  background location. No foreground service for location.
+- While on screen, the phone sends its position when it moves > 5 m or every
+  15 s.
+- When the app leaves the screen, it sends "paused" once and stops; others see
+  the grey "app closed" dot. Only the latest position per user is kept (no
+  history).
+- Positions go to every signed-in user and show on every job map.
 
 ### 6.8 Working with weak or no signal
-- The app shell is cached (service worker), so it opens with no signal.
-- The current job's points, pole data and reference images are cached on the
-  phone.
-- Changes made offline (close point, pole data, comment, move point, added
-  points, photos) are queued and synced when back online. Last write wins per
-  field; photos are additive and never conflict.
-- Live updates arrive over a WebSocket; on reconnect the app re-syncs
+- The app opens and works with no signal: jobs, points, pole data, reference
+  images and photos are stored on the phone (local database).
+- Changes made offline (close point, pole data, comment, move, add/delete
+  point, photos) are queued and synced when back online, in order, with
+  retries. Last write wins per field; photos never conflict.
+- Live updates arrive over a WebSocket; on reconnect the app fetches
   everything changed since it last heard from the server.
-- **Map imagery offline:** tiles you've already viewed are kept on the
-  phone; there is no "download this area" in v1 (Esri's terms restrict bulk
-  downloading World Imagery). With no signal and no cached imagery, points,
-  your GPS dot and all point screens still work on a plain background.
+- **Map imagery offline**: tiles already viewed are kept in the map's cache;
+  no "download this area" in v1 (Esri's terms restrict bulk downloading
+  World Imagery). Without imagery, points, your GPS dot and the point screens
+  still work on a plain background.
+- Importing a new job file needs signal (the server reads it).
 
-### 6.9 Admin
+### 6.9 Admin (inside the app, admin role only)
 - **Users**: create, reset password, disable, promote.
-- **Jobs**: all jobs with progress, crew, created/finished dates; archive,
-  delete, and restore deleted jobs (30 days) and deleted points.
+- **Jobs**: all jobs with progress, crew, created/finished dates; restore
+  deleted jobs (30 days) and deleted points.
 - **Delivery health**: every photo not yet confirmed across the crew, stuck
-  ones first, with reasons and retry.
+  ones first, with each phone's last reported reason, plus typical delivery
+  times. A red count on the menu when anything is stuck.
 - **Activity**: who shot which point and when; "Can't shoot" list.
-- **Pole data export**: per job, `.xlsx` and `.csv` with: point, original
-  lat/lon, moved lat/lon, line height, anchor, self-supporting/lashed, tags,
-  comment, photo count, tech, closed at.
+- **Settings**: photo quality (Standard 85% / Maximum 95%).
 
-### 6.10 Finishing a job
-Menu → **Finish this job**: shows anything unfinished (points left, photos
-not confirmed). When everything is confirmed it writes the pole data
-spreadsheet into the job's Field Notes folder and moves the job to
-"Finished". Finished jobs stay viewable; job data is kept (no automatic
-clearing).
+### 6.10 Pole data export and finishing a job
+- **Pole data export** (any user): `.xlsx` or `.csv` with Point, Original
+  lat, Original lon, Moved lat, Moved lon, Line height (ft), Anchor,
+  Self-supporting/Lashed, Tags, Comment, Photos, Tech, Closed at. Generated by
+  the server; the phone saves it to Downloads or shares it.
+- **Finish this job**: shows anything unfinished (points left, photos not
+  confirmed). When everything is confirmed, the server writes
+  `<job>_pole_data.xlsx` into the job's Field Notes folder (next free name if
+  taken) and moves the job to "Finished". Finished jobs stay viewable; job
+  data is kept.
 
-### 6.11 Menu (v1)
-Job: All jobs · Job info · Links & folders (Field Notes link) · Points I
-added · Where the photos went · Pole data export · Finish this job · Refresh
-data. Account: profile, change password, sign out. Admin: admin screens.
-Also shows the app version, plus "update available, tap to reload" when a new
-version is deployed (replaces Cadastrus's "Force the newest version").
+### 6.11 Install and updates
+- The server hosts a small download page (`https://<server>/`) with a
+  "Download Fieldmaxx for Android" button and three-step instructions
+  (allow install from this source once, open the file, sign in).
+- On start and once a day the app checks the server for a newer version and
+  shows "Update available — tap to install"; tapping downloads the new APK and
+  opens Android's installer. Updates keep the phone's data.
+- Builds are signed with one **release key**. The owner must keep a backup of
+  it: losing it means everyone has to uninstall and reinstall to get updates.
+
+### 6.12 Menu (v1)
+Job: All jobs · Job info · Field Notes link · Points I added · Where the
+photos went · Export photos to OneDrive app · Pole data export · Finish this
+job · Refresh. Account: profile, change password, sign out. Admin: admin
+screens. Also: app version and update check. Settings: save copies to
+gallery (on/off).
 
 ## 7. Architecture
 
-### 7.1 Stack (builder's call, recorded here as a recommendation)
-- **Frontend**: React + TypeScript + Vite; Leaflet (react-leaflet) with
-  Leaflet.markercluster; PWA via vite-plugin-pwa (Workbox); IndexedDB via
-  Dexie for the photo queue and offline cache; suncalc for sunset.
-- **Backend**: Node.js 22 + TypeScript, Fastify, WebSocket for live updates,
-  SQLite (WAL mode) for data, local disk for photos in transit, pdf.js
-  (pdfjs-dist) for import (annotations, form fields, text, page rendering).
-- One repo, two packages (`web/`, `server/`) plus a shared types package.
+### 7.1 Stack (my calls; recorded as the plan's starting point)
+- **One Gradle repo, Kotlin everywhere**, five modules:
+  - `core` (pure Kotlin/JVM): shared models, coordinate parsing, naming rules,
+    stamp text/layout, compass helpers. Used by app and server.
+  - `sharepoint` (Kotlin/JVM, OkHttp): the share-link client and folder
+    resolver behind the `PhotoDestination` interface. Used by the app
+    (uploads) and the server (link check, finish-job spreadsheet).
+  - `importer` (Kotlin/JVM): PDF (Apache PDFBox 3) and DOCX (zip + XML)
+    reading. Server only.
+  - `server`: Ktor, SQLite, WebSocket, sessions, jobs/points/ops, photo
+    registry, exports (xlsx/csv), APK hosting. Runs in Docker.
+  - `app`: Android, Jetpack Compose, MapLibre Native (Esri raster tiles,
+    clustering), CameraX, Room, WorkManager, DataStore, Fused Location
+    Provider (foreground only), OkHttp WebSocket. Min Android 9 (API 28).
+- **Testing**: JVM unit tests for `core`, `sharepoint` (against a mock
+  SharePoint server), `importer`; Ktor test host for `server`; Robolectric for
+  app logic and Compose screens. There's no Android emulator in the build
+  environment, so on-device checks are done by the owner installing test
+  builds.
 
 ### 7.2 Data (sketch)
-`users`, `sessions`, `jobs` (name, notes, field_notes_url, status),
-`job_files` (source PDFs + rendered pages), `points` (job, type/layer, label,
-folder name, lat/lon, original lat/lon, description, source page, added_by,
-status: open/done/cant_shoot, reason, pole fields, comment, updated_at/by),
-`photos` (point, tech, local id, file path, size, sha256, status:
-received/uploading/confirmed/stuck, destination path, attempts, last_error),
-`positions` (user, lat, lon, accuracy, at), `events` (audit/activity).
+Server: `users`, `sessions`, `jobs` (name, notes, field_notes_url, status,
+delivery_problem), `job_files`, `ref_images`, `points` (job, layer, type, num,
+label, lat/lon, original lat/lon, description, status, cant reason/text, pole
+fields, comment, folder_path, folder_candidates, flags, added_by, updated
+at/by, deleted at/by), `photos` (point, tech, file_name, size, status:
+registered/uploading/confirmed/stuck/removed, dest_path, last_error,
+taken_at, confirmed_at, upload_ms, reused_from), `ops_done`, `changes`
+(sync feed), `positions`, `events`, `settings`, `counters`, `app_releases`.
+Phone: the same jobs/points/photo info as a local cache, plus local photo
+files and their pipeline state, and the outbox of pending changes.
 
 ### 7.3 Hosting
-A VPS chosen for **network speed** (owner requirement): a US-West region
-(close to the crew in Nevada and to Microsoft's US datacenters), a ≥1 Gbps
-port and ≥4 TB/month transfer included, and enough disk for photos in
-transit (≥80 GB). Examples: DigitalOcean (San Francisco), Hetzner
-(Hillsboro, OR), Vultr (Silicon Valley / Seattle); roughly $12–25/month at
-that spec. Before going live, measure real upload speed from the server to
-the OneDrive tenant with a test file and pick the region that's fastest.
-It runs Docker Compose: the app container + Caddy for automatic HTTPS. Works with a bought domain or a free
-`<ip>.sslip.io` name (Cadastrus does the latter). One-command setup script
-creates the first admin. Nightly backup of the SQLite file. The owner provides
-the server; the build includes deploy instructions.
-
-### 7.4 Android later
-Keep camera, geolocation, file storage and background upload behind small
-interfaces in the frontend so a Capacitor Android build can swap in native
-plugins (background geolocation, background upload) without rewriting
-screens.
+Photos don't pass through the server, so it's small: a basic VPS with 2 GB
+RAM in a US region (e.g. DigitalOcean or Hetzner, ~$6–12/month), Docker
+Compose with the app container + Caddy for automatic HTTPS. Works with a
+bought domain or a free `<ip>.sslip.io` name. One-command setup script creates
+the first admin. Nightly backup of the SQLite file. The owner provides the
+server; the build includes setup instructions.
 
 ## 8. Decisions log
 
@@ -595,74 +598,68 @@ screens.
 - Replace Cadastrus because it's unreliable; do it better.
 - Job input is PDFs (poles; queries) and Word .docx files (queries).
 - Photos go into the job's Field Notes folder via its share link, in
-  category/point folders, done by the app itself.
+  category/point folders, done by the app itself; folders created where
+  needed (`POLE/POLE_33`).
 - Multiple techs at once; everyone sees everyone's GPS; admin (owner) hands
-  out logins; runs on a server.
+  out logins; own server.
 - The point screen (pole data, query reference, navigate, move, gallery) is
-  essential to the job.
-- Approach 1 now, maybe an Android app later.
-- Uploads must be fast at both hops; the server must have good upload and
-  download speed.
-- Everyone sees every job (no per-job assignment). "Crew" on a job = who
-  has worked on it.
-- Folders are created where needed: a pole 33 with no folder goes to
-  `POLE/POLE_33` in Field Notes.
+  essential.
+- Uploads must be fast.
+- Everyone sees every job (no per-job assignment).
 - Upload test approved against the A05J9XE Field Notes link.
-- Stamps required on the images: time, coordinates, compass, point name.
-- The tech who created a job can delete it (as can an admin).
-- Techs can delete a point before any of its photos is uploaded, and can
-  drag/move any point anywhere.
+- Stamps on the images: time, coordinates, compass, point name.
+- The tech who created a job can delete it (as can an admin). Techs can
+  delete a point before any of its photos is delivered, and can move any
+  point anywhere.
+- **v2:** a genuine **Android app** instead of a web app; **Android only**
+  (whole crew on Android); **separate** from the friend's Cadastrus clone,
+  with **our own server**.
+- **v2:** crew locations update **only while the app is on screen, never in
+  the background**.
 
 **My calls (owner may override):**
-- v1 scope and the deferred list in §3.
+- Phone uploads straight to OneDrive (no server hop); server only registers
+  photos and assigns file names.
+- Server reads job files; app is a share target for PDF/DOCX and links.
+- Built-in camera with live stamp/compass overlay; heading at the shutter.
+- Stamped copies also saved to a "Fieldmaxx" gallery album (setting, on).
+- Install from our own download page; in-app update prompt; no Google Play
+  in v1.
+- Admin screens inside the app; no separate admin website.
+- "App closed" grey dot when a tech's app leaves the screen.
+- Safety net = export unconfirmed photos as a Field-Notes-shaped ZIP to the
+  OneDrive app via the share sheet.
 - Point can only be "Done" with ≥1 photo; otherwise "Can't shoot" + reason.
-- Any user can create jobs. Deletes of jobs and points are soft (admin can restore).
-- Point folder lookup: reuse an existing folder in any common naming style
-  before creating `<Category>/<TYPE>_<ID>`; photo file names match
-  Cadastrus's pattern.
-- Stamp layout copies Cadastrus's plus a compass line; compass from camera
-  EXIF or the phone's compass when the photo returns; native camera (not an
-  in-app camera) in v1.
-- Photos re-saved at full resolution, high-quality JPEG, EXIF kept (about
-  half the size) by default; admin can switch to Maximum quality. No
-  per-tech quality picker.
-- Reference pages = rendered PDF pages linked to each point.
-- Pole data exported as xlsx/csv and written to Field Notes on finish.
-- Job data kept indefinitely; server photo copies purged 7 days after
-  confirmation (sooner, oldest-confirmed-first, if disk > 80%); phone copies
-  3 days after.
-- ZIP download of a job's photos in Field Notes layout as the safety net
-  for the share-link uploader; rest of the app built in parallel with the
-  upload spike.
-- Missing EXIF GPS filled in from the app's own fix.
-- Techs can delete photos only before delivery; delivered photos are hidden
-  with an audit record, not deleted from OneDrive.
-- Query "use existing photos" = reuse photos from other points in the job.
-- No offline map download in v1; viewed tiles are cached.
+- Any user can create jobs. Deletes of jobs and points are soft.
+- Folder lookup rules and Cadastrus-style file names (§6.6.1).
+- Photo quality Standard 85% / Maximum 95% (admin setting); 16 MP cap.
+- Pole data as xlsx/csv; written to Field Notes on finish.
+- Phone copies deleted 3 days after confirmation; job data kept indefinitely.
+- Techs can delete their own photos only before delivery.
+- No offline map download in v1; viewed tiles cached.
 - Switchover: jobs already in progress finish in Cadastrus; new jobs start
-  in Fieldmaxx. Fieldmaxx never overwrites files in OneDrive, so sharing a
-  folder with Cadastrus can't destroy anything. Cadastrus's code is assumed
-  unavailable (someone else's custom app).
-- English only.
+  in Fieldmaxx. Fieldmaxx never overwrites files in OneDrive.
+- English only. Android 9+.
 - Stack and hosting in §7.
 
 ## 9. Open items
-- A **query PDF** sample would be a useful extra test fixture (the DOCX
-  sample settles the format).
+- **Chunked upload through the link**: test SharePoint's chunked upload
+  calls through the share link early in the build (writes go only into the
+  existing `_FIELDMAXX_TEST_DELETE_ME` folder; needs the owner's OK). If not
+  allowed, use whole-file uploads with retries.
 - **Leftover test folder**: `_FIELDMAXX_TEST_DELETE_ME` in the A05J9XE Field
-  Notes folder must be deleted by someone with full access (the link can't).
-- Whether the owner has their own EES Microsoft login (only matters for
-  approach 2 later).
-- **House-number source**: builder's call (e.g. OpenStreetMap addresses for
-  the visible area at high zoom); not essential to v1.
+  Notes folder must be deleted by someone with full access.
+- **Release signing key**: generated at the first release build and handed
+  to the owner to keep safe.
+- A **query PDF** sample would be a useful extra test file.
 
 ## 10. Left to the builder
 Exact visual styling within the Cadastrus-like layout; library versions;
-database access layer; chunked-upload protocol details; marker colours per
-type; clustering thresholds; test strategy (must include: importer unit tests
-with the A05J9XE PDF fixture expecting exactly 7 POLE points and the
-QUERY_1_-_A05K51V DOCX fixture expecting exactly 26 points numbered 1–24,
-25A, 25B with their images; the line-break and spacing variants, DMS,
-swapped and unparseable lines; an end-to-end test of
-photo capture → server → stub destination → confirmed; an offline/resume test
-for the photo queue).
+database access layer; marker colours per type; clustering thresholds; sync
+and upload protocol details within the rules above; test strategy (must
+include: importer tests expecting exactly 7 POLE points from the A05J9XE
+layout and exactly 26 points numbered 1–24, 25A, 25B with their images from
+the QUERY 1 layout, using synthetic look-alike files in the repo and the real
+samples in a git-ignored folder; the line-break and spacing variants, DMS,
+swapped and unparseable lines; the photo pipeline surviving a process kill at
+every step; the folder rules; idempotent uploads).
