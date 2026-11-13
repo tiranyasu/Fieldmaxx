@@ -1,0 +1,183 @@
+package com.fieldmaxx.server.ops
+
+import com.fieldmaxx.core.FmxJson
+import com.fieldmaxx.core.model.CantShootReason
+import com.fieldmaxx.core.model.Op
+import com.fieldmaxx.core.model.OpResult
+import com.fieldmaxx.core.model.Point
+import com.fieldmaxx.core.model.PoleData
+import com.fieldmaxx.core.model.Role
+import com.fieldmaxx.core.model.User
+import com.fieldmaxx.core.naming.pointLabel
+import com.fieldmaxx.server.Ctx
+import com.fieldmaxx.server.jobs.toPoint
+import java.sql.Connection
+import java.sql.Types
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+
+/** A refusal that leaves the database untouched; its code is the op's `error`. */
+private class OpFail(val code: String) : RuntimeException(code, null, false, false)
+
+/** What an op did: the point it changed (null when nothing changed) and the event kind to log. */
+private class Applied(val point: Point?, val kind: String)
+
+/**
+ * Applies [ops] in order. Each op is its own transaction: it is checked against `ops_done` first (a replay returns the
+ * stored result and changes nothing), applied field by field, and recorded in `ops_done` in that same transaction. A
+ * failing op is recorded too and never undoes earlier ones.
+ */
+fun applyOps(ctx: Ctx, user: User, ops: List<Op>): List<OpResult> = ops.map { applyOp(ctx, user, it) }
+
+private fun applyOp(ctx: Ctx, user: User, op: Op): OpResult {
+    // Photo ops arrive with Task 16; until then nothing is stored so a later retry can succeed.
+    if (op is Op.PhotoReuse || op is Op.PhotoRemove || op is Op.PhotoConfirmed || op is Op.PhotoFailed) {
+        return OpResult(op.opId, false, "unsupported")
+    }
+    val (result, changed) = ctx.db.tx {
+        storedResult(op.opId)?.let { return@tx it to null }
+        val now = ctx.clock.millis()
+        var applied: Applied? = null
+        val r = try {
+            applied = apply(user, op, now)
+            OpResult(op.opId, true)
+        } catch (e: OpFail) {
+            OpResult(op.opId, false, e.code)
+        }
+        prepareStatement("INSERT INTO ops_done(op_id, user_id, at, result_json) VALUES (?,?,?,?)").use {
+            it.setString(1, op.opId); it.setString(2, user.id); it.setLong(3, now)
+            it.setString(4, FmxJson.encodeToString(OpResult.serializer(), r)); it.executeUpdate()
+        }
+        val p = applied?.point
+        if (p != null) {
+            prepareStatement("INSERT INTO events(job_id, user_id, kind, data_json, at) VALUES (?,?,?,?,?)").use {
+                it.setString(1, p.jobId); it.setString(2, user.id); it.setString(3, applied!!.kind)
+                it.setString(4, buildJsonObject { put("opId", op.opId); put("pointId", p.id) }.toString())
+                it.setLong(5, now); it.executeUpdate()
+            }
+        }
+        r to p
+    }
+    // After the commit: the change log opens its own write transaction.
+    changed?.let { ctx.changes.record(it.jobId, "point", it.id, point = it) }
+    return result
+}
+
+private fun Connection.storedResult(opId: String): OpResult? =
+    prepareStatement("SELECT result_json FROM ops_done WHERE op_id = ?").use { ps ->
+        ps.setString(1, opId)
+        ps.executeQuery().use { rs ->
+            if (rs.next()) rs.getString(1)?.let { FmxJson.decodeFromString(OpResult.serializer(), it) } ?: OpResult(opId, true) else null
+        }
+    }
+
+private fun Connection.findPoint(id: String): Point? =
+    prepareStatement("SELECT * FROM points WHERE id = ?").use { ps ->
+        ps.setString(1, id); ps.executeQuery().use { if (it.next()) it.toPoint() else null }
+    }
+
+/** null: no such job. */
+private fun Connection.jobDeleted(jobId: String): Boolean? =
+    prepareStatement("SELECT deleted_at FROM jobs WHERE id = ?").use { ps ->
+        ps.setString(1, jobId); ps.executeQuery().use { if (it.next()) it.getObject(1) != null else null }
+    }
+
+private fun Connection.exec(sql: String, vararg args: Any?) {
+    prepareStatement(sql).use { ps ->
+        args.forEachIndexed { i, a ->
+            when (a) {
+                null -> ps.setNull(i + 1, Types.NULL)
+                is String -> ps.setString(i + 1, a)
+                is Long -> ps.setLong(i + 1, a)
+                is Double -> ps.setDouble(i + 1, a)
+                else -> error("unsupported argument $a")
+            }
+        }
+        ps.executeUpdate()
+    }
+}
+
+/** An existing point of a live job; [allowDeleted] lets restore (and a repeated delete) see a deleted point. */
+private fun Connection.livePoint(pointId: String, allowDeleted: Boolean = false): Point {
+    val p = findPoint(pointId) ?: throw OpFail("not_found")
+    if (jobDeleted(p.jobId) == true) throw OpFail("job_deleted")
+    if (p.deletedAt != null && !allowDeleted) throw OpFail("point_deleted")
+    return p
+}
+
+/** Writes only [sets] (column = value) plus updated_at/updated_by, so concurrent edits of other fields survive. */
+private fun Connection.touch(pointId: String, user: User, now: Long, kind: String, vararg sets: Pair<String, Any?>): Applied {
+    val cols = sets.joinToString("") { "${it.first} = ?, " }
+    exec("UPDATE points SET $cols" + "updated_at = ?, updated_by = ? WHERE id = ?", *sets.map { it.second }.toTypedArray(), now, user.id, pointId)
+    return Applied(findPoint(pointId), kind)
+}
+
+private fun Connection.apply(user: User, op: Op, now: Long): Applied {
+    return when (op) {
+        is Op.PointUpdate -> {
+            livePoint(op.pointId)
+            val sets = buildList<Pair<String, Any?>> {
+                op.pole?.let { add("pole_json" to FmxJson.encodeToString(PoleData.serializer(), it)) }
+                op.comment?.let { add("comment" to it) }
+            }
+            touch(op.pointId, user, now, "point.update", *sets.toTypedArray())
+        }
+        is Op.PointMove -> {
+            livePoint(op.pointId)
+            // The first move remembers where the point came from; later moves keep that original.
+            exec("UPDATE points SET orig_lat = COALESCE(orig_lat, lat), orig_lon = COALESCE(orig_lon, lon) WHERE id = ?", op.pointId)
+            touch(op.pointId, user, now, "point.move", "lat" to op.lat, "lon" to op.lon)
+        }
+        is Op.PointClose -> {
+            livePoint(op.pointId)
+            if (op.photoIds.isEmpty()) throw OpFail("needs_photo")
+            touch(op.pointId, user, now, "point.close", "status" to "done", "cant_reason" to null, "cant_text" to null)
+        }
+        is Op.PointCantShoot -> {
+            livePoint(op.pointId)
+            val text = op.text?.trim()?.ifEmpty { null }
+            if (op.reason == CantShootReason.other && text == null) throw OpFail("needs_text")
+            touch(op.pointId, user, now, "point.cantShoot", "status" to "cant_shoot", "cant_reason" to op.reason.name, "cant_text" to text)
+        }
+        is Op.PointReopen -> {
+            livePoint(op.pointId)
+            touch(op.pointId, user, now, "point.reopen", "status" to "open", "cant_reason" to null, "cant_text" to null)
+        }
+        is Op.PointAdd -> {
+            if (jobDeleted(op.jobId) == null) throw OpFail("job_not_found")
+            if (jobDeleted(op.jobId) == true) throw OpFail("job_deleted")
+            if (findPoint(op.pointId) != null) throw OpFail("exists")
+            exec(
+                "INSERT INTO points(id, job_id, layer, type, num, label, lat, lon, description, status, ref_image_ids_json, flags_json, " +
+                    "added_by, created_at, updated_at, updated_by) VALUES (?,?,?,?,?,?,?,?,'','open','[]','[]',?,?,?,?)",
+                op.pointId, op.jobId, op.layer, op.type, op.num, pointLabel(op.layer, op.type, op.num), op.lat, op.lon,
+                user.id, now, now, user.id,
+            )
+            Applied(findPoint(op.pointId), "point.add")
+        }
+        is Op.PointDelete -> {
+            val p = livePoint(op.pointId, allowDeleted = true)
+            if (p.deletedAt != null) return Applied(null, "point.delete")
+            if (user.role != Role.admin && hasConfirmedPhoto(op.pointId)) throw OpFail("photos_delivered")
+            exec("UPDATE points SET deleted_at = ?, deleted_by = ? WHERE id = ?", now, user.id, op.pointId)
+            touch(op.pointId, user, now, "point.delete")
+        }
+        is Op.PointRestore -> {
+            if (user.role != Role.admin) throw OpFail("admin_only")
+            val p = livePoint(op.pointId, allowDeleted = true)
+            if (p.deletedAt == null) return Applied(null, "point.restore")
+            exec("UPDATE points SET deleted_at = NULL, deleted_by = NULL WHERE id = ?", op.pointId)
+            touch(op.pointId, user, now, "point.restore")
+        }
+        is Op.PointSetFolder -> {
+            livePoint(op.pointId)
+            touch(op.pointId, user, now, "point.setFolder", "folder_path" to op.folderPath, "folder_candidates_json" to null)
+        }
+        is Op.PhotoReuse, is Op.PhotoRemove, is Op.PhotoConfirmed, is Op.PhotoFailed -> throw OpFail("unsupported")
+    }
+}
+
+private fun Connection.hasConfirmedPhoto(pointId: String): Boolean =
+    prepareStatement("SELECT 1 FROM photos WHERE point_id = ? AND status = 'confirmed' LIMIT 1").use { ps ->
+        ps.setString(1, pointId); ps.executeQuery().use { it.next() }
+    }
