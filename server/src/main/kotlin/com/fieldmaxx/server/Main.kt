@@ -1,0 +1,22 @@
+package com.fieldmaxx.server
+
+import com.fieldmaxx.sharepoint.FakeDestination
+import com.fieldmaxx.sharepoint.sharePointDestinations
+import io.ktor.server.engine.embeddedServer
+import io.ktor.server.netty.Netty
+import java.time.Clock
+import okhttp3.OkHttpClient
+
+fun main() {
+    System.setProperty("java.awt.headless", "true") // the importer renders PDF pages
+    val config = loadConfig()
+    java.nio.file.Files.createDirectories(config.dataDir)
+    val db = Db("jdbc:sqlite:${config.dataDir.resolve("fieldmaxx.db").toAbsolutePath()}")
+    val destinations = when (config.destination) {
+        "sharepoint" -> sharePointDestinations(OkHttpClient())
+        "fake" -> { val fake = FakeDestination(); { _: String -> fake } }
+        else -> error("FMX_DESTINATION must be sharepoint or fake, was '${config.destination}'")
+    }
+    val ctx = Ctx(config, db, Clock.systemUTC(), destinations, NoopChangeRecorder, NoopDeliveryKick)
+    embeddedServer(Netty, port = config.port, host = "0.0.0.0") { fieldmaxx(ctx) }.start(wait = true)
+}

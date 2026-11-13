@@ -19,6 +19,6 @@ include(":core")
 include(":importer")
 // Added by later tasks, once their directories exist:
 include(":sharepoint")
+include(":server")
 
-// include(":server")
 // include(":app")
