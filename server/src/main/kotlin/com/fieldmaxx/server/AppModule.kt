@@ -14,6 +14,7 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
 import io.ktor.server.application.install
+import com.fieldmaxx.server.exports.exportRoutes
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.response.respond
@@ -54,6 +55,7 @@ fun Application.fieldmaxx(ctx: Ctx) {
             linkRoutes(ctx)
             opsRoutes(ctx)
             photoRoutes(ctx)
+            exportRoutes(ctx)
             get("/version") { call.respond(VersionBody(ctx.config.buildId)) }
         }
     }

@@ -31,7 +31,7 @@ import kotlinx.serialization.Serializable
 @Serializable data class UpdateJobRequest(val name: String? = null, val fieldNotesUrl: String? = null, val notes: String? = null)
 
 /** A deleted job is gone for techs (404); admins can still read it, e.g. before restoring. */
-private fun requireReadable(ctx: Ctx, user: User, jobId: String) {
+internal fun requireReadable(ctx: Ctx, user: User, jobId: String) {
     val deleted = ctx.db.read {
         prepareStatement("SELECT deleted_at FROM jobs WHERE id = ?").use { ps ->
             ps.setString(1, jobId)

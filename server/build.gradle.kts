@@ -25,10 +25,12 @@ dependencies {
     implementation(libs.bouncycastle.prov)
     implementation(libs.ktor.serialization.json)
     implementation(libs.sqlite.jdbc)
+    implementation(libs.fastexcel)
     implementation(libs.kotlinx.coroutines.core)
     runtimeOnly("ch.qos.logback:logback-classic:1.5.18")
 
     testImplementation(libs.ktor.server.test.host)
+    testImplementation("org.apache.poi:poi-ooxml:5.4.1")
     testImplementation(libs.ktor.client.websockets)
     testImplementation(testFixtures(project(":importer")))
     testImplementation(platform(libs.junit.bom))
