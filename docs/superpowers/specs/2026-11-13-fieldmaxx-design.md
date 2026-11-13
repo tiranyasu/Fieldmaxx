@@ -267,7 +267,8 @@ ones and are marked "added by <tech>". Menu → "Points I added" lists them.
 **On the phone:**
 1. The photo file is written to on-device storage (IndexedDB) **before**
    anything else happens, with its point, job, tech and timestamp. The
-   original camera file is kept as-is (no re-encoding, EXIF/GPS preserved).
+   camera original is saved first; the smaller upload copy (see "Speed"
+   below) is made from it afterwards, so a crash mid-resize loses nothing.
 2. The app requests persistent storage so the browser won't evict it.
 3. An upload queue sends it to the server in resumable chunks (weak signal
    friendly), retrying with backoff, resuming after app restarts.
@@ -296,6 +297,29 @@ ones and are marked "added by <tech>". Menu → "Points I added" lists them.
 - Top-bar pill shows the count of photos not yet confirmed.
 - Menu → **Where the photos went**: per job, per point, the OneDrive path and
   status of each photo, with a link to open the folder.
+
+**Speed (owner requirement).** Cadastrus is slow at both hops: phone →
+Cadastrus takes long, then Cadastrus → SharePoint "takes forever". Its server
+is a DigitalOcean machine in Santa Clara, CA (per DigitalOcean's public IP
+geofeed), so distance isn't the cause: the slowness is in how it handles
+uploads. Fieldmaxx must be fast at both hops:
+- **Phone → server**: upload starts the moment a photo is saved, in the
+  background while the tech keeps working; resumable chunks so a dropped
+  connection resumes instead of restarting; 2–3 photos in parallel.
+- **Smaller files, same picture**: by default the phone re-saves the photo
+  at full resolution as a high-quality JPEG (roughly half the size of the
+  camera original), copying the EXIF/GPS data across. An admin setting
+  switches to sending camera originals untouched.
+- **Server → OneDrive**: the delivery worker starts on each photo as soon
+  as it's received (no batching), runs several uploads in parallel, and
+  streams from disk. Folder lookups/creations are cached per job so each
+  photo doesn't re-walk the folder tree.
+- **Measure it**: each photo records how long each hop took and the
+  throughput. Admin → Delivery health shows typical times, so slowness is
+  visible and attributable to the right hop.
+- **Target**: on a decent LTE signal, a photo is confirmed in OneDrive
+  within ~30 s of being taken; server → OneDrive adds no more than a few
+  seconds per photo.
 
 **Uploading through the share link:** the server resolves the per-job Field
 Notes "anyone with the link can edit" URL and uses the same SharePoint calls
@@ -375,8 +399,14 @@ received/uploading/confirmed/stuck, destination path, attempts, last_error),
 `positions` (user, lat, lon, accuracy, at), `events` (audit/activity).
 
 ### 7.3 Hosting
-A small VPS (e.g. DigitalOcean, ~$6–12/month) running Docker Compose: the app
-container + Caddy for automatic HTTPS. Works with a bought domain or a free
+A VPS chosen for **network speed** (owner requirement): a US-West region
+(close to the crew in Nevada and to Microsoft's US datacenters), a ≥1 Gbps
+port and ≥4 TB/month transfer included, and enough disk for photos in
+transit (≥80 GB). Examples: DigitalOcean (San Francisco), Hetzner
+(Hillsboro, OR), Vultr (Silicon Valley / Seattle); roughly $12–25/month at
+that spec. Before going live, measure real upload speed from the server to
+the OneDrive tenant with a test file and pick the region that's fastest.
+It runs Docker Compose: the app container + Caddy for automatic HTTPS. Works with a bought domain or a free
 `<ip>.sslip.io` name (Cadastrus does the latter). One-command setup script
 creates the first admin. Nightly backup of the SQLite file. The owner provides
 the server; the build includes deploy instructions.
@@ -399,12 +429,16 @@ screens.
 - The point screen (pole data, query reference, navigate, move, gallery) is
   essential to the job.
 - Approach 1 now, maybe an Android app later.
+- Uploads must be fast at both hops; the server must have good upload and
+  download speed.
 
 **My calls (owner may override):**
 - v1 scope and the deferred list in §3.
 - Point can only be "Done" with ≥1 photo; otherwise "Can't shoot" + reason.
 - Any user can create jobs; only admins delete.
-- Original photo files, no recompression, no quality picker.
+- Photos re-saved at full resolution, high-quality JPEG, EXIF kept (about
+  half the size) by default; admin can switch to untouched originals. No
+  per-tech quality picker.
 - Reference pages = rendered PDF pages linked to each point.
 - Pole data exported as xlsx/csv and written to Field Notes on finish.
 - Job data kept indefinitely; server photo copies purged 14 days after
