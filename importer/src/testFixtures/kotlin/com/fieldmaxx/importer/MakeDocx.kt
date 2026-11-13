@@ -4,7 +4,15 @@ import java.io.ByteArrayOutputStream
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
-data class DocxList(val numId: Int, val start: Int, val fmt: String /* decimal|upperLetter */, val lvlText: String)
+/** [abstractId] lets several lists share one abstractNum; [startOverride] adds a `w:lvlOverride/w:startOverride` on level 0. */
+data class DocxList(
+    val numId: Int,
+    val start: Int,
+    val fmt: String /* decimal|upperLetter */,
+    val lvlText: String,
+    val abstractId: Int = numId,
+    val startOverride: Int? = null,
+)
 
 sealed interface DocxItem {
     data class Para(val text: String, val numId: Int? = null, val ilvl: Int = 0, val styleNumId: Int? = null) : DocxItem
@@ -78,13 +86,16 @@ fun makeDocx(lists: List<DocxList>, body: List<DocxItem>): ByteArray {
         )
         put("word/document.xml", """$head<w:document xmlns:w="$NS_W" xmlns:r="$NS_R"><w:body>$bodyXml</w:body></w:document>""")
         val numbering = StringBuilder()
-        for (l in lists) {
+        for (l in lists.distinctBy { it.abstractId }) {
             numbering.append(
-                """<w:abstractNum w:abstractNumId="${l.numId}"><w:lvl w:ilvl="0"><w:start w:val="${l.start}"/>""" +
+                """<w:abstractNum w:abstractNumId="${l.abstractId}"><w:lvl w:ilvl="0"><w:start w:val="${l.start}"/>""" +
                     """<w:numFmt w:val="${l.fmt}"/><w:lvlText w:val="${esc(l.lvlText)}"/></w:lvl></w:abstractNum>""",
             )
         }
-        for (l in lists) numbering.append("""<w:num w:numId="${l.numId}"><w:abstractNumId w:val="${l.numId}"/></w:num>""")
+        for (l in lists) {
+            val ov = l.startOverride?.let { """<w:lvlOverride w:ilvl="0"><w:startOverride w:val="$it"/></w:lvlOverride>""" } ?: ""
+            numbering.append("""<w:num w:numId="${l.numId}"><w:abstractNumId w:val="${l.abstractId}"/>$ov</w:num>""")
+        }
         put("word/numbering.xml", """$head<w:numbering xmlns:w="$NS_W">$numbering</w:numbering>""")
         val styles = lists.joinToString("") {
             """<w:style w:type="paragraph" w:styleId="NumberedStyle${it.numId}"><w:name w:val="NumberedStyle${it.numId}"/>""" +

@@ -51,6 +51,18 @@ class DocxTest {
         assertEquals(listOf("before", "c1", "c2", "after"), x.blocks.map { (it as ParaBlock).text })
     }
 
+    @Test fun twoNumsSharingAbstractContinue() {
+        val lists = listOf(DocxList(1, 1, "decimal", "%1."), DocxList(2, 1, "decimal", "%1.", abstractId = 1))
+        val x = docxToBlocks(makeDocx(lists, listOf(1, 1, 2).map { DocxItem.Para("p", numId = it) }))
+        assertEquals(listOf("1.", "2.", "3."), labels(x))
+    }
+
+    @Test fun startOverrideRestarts() {
+        val lists = listOf(DocxList(1, 1, "decimal", "%1."), DocxList(2, 1, "decimal", "%1.", abstractId = 1, startOverride = 1))
+        val x = docxToBlocks(makeDocx(lists, listOf(1, 1, 2, 2).map { DocxItem.Para("p", numId = it) }))
+        assertEquals(listOf("1.", "2.", "1.", "2."), labels(x))
+    }
+
     @Test fun garbage() {
         assertEquals("unreadable_docx", assertFailsWith<ImportException> { docxToBlocks("not a zip".toByteArray()) }.code)
     }

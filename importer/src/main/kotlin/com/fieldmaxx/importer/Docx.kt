@@ -11,7 +11,7 @@ private const val R = "http://schemas.openxmlformats.org/officeDocument/2006/rel
 private const val REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 private class LevelDef(val start: Int?, val numFmt: String, val lvlText: String)
-private class NumDef(val levels: Map<Int, LevelDef>, val startOverrides: Map<Int, Int>)
+private class NumDef(val abstractId: String, val levels: Map<Int, LevelDef>, val startOverrides: Map<Int, Int>)
 private class NumPr(val numId: Int?, val ilvl: Int?)
 
 private fun unreadable(cause: Throwable? = null) =
@@ -62,13 +62,14 @@ private fun parseNumbering(root: Element?): Map<Int, NumDef> {
     val nums = HashMap<Int, NumDef>()
     for (n in root.kids(W, "num")) {
         val id = n.getAttributeNS(W, "numId").toIntOrNull() ?: continue
-        val levels = abstracts[n.kid(W, "abstractNumId")?.wVal()] ?: continue
+        val abstractId = n.kid(W, "abstractNumId")?.wVal() ?: continue
+        val levels = abstracts[abstractId] ?: continue
         val overrides = HashMap<Int, Int>()
         for (o in n.kids(W, "lvlOverride")) {
             val ilvl = o.getAttributeNS(W, "ilvl").toIntOrNull() ?: continue
             o.kid(W, "startOverride")?.wVal()?.toIntOrNull()?.let { overrides[ilvl] = it }
         }
-        nums[id] = NumDef(levels, overrides)
+        nums[id] = NumDef(abstractId, levels, overrides)
     }
     return nums
 }
@@ -107,8 +108,10 @@ private class State(
 ) {
     val blocks = ArrayList<DocBlock>()
     val images = ArrayList<ExtractedImage>()
-    val counters = HashMap<Int, IntArray>()
-    val set = HashMap<Int, BooleanArray>()
+    // Word keeps one counter per abstractNum: several w:num sharing it continue one sequence.
+    val counters = HashMap<String, IntArray>()
+    val set = HashMap<String, BooleanArray>()
+    val usedLevels = HashSet<Pair<Int, Int>>()
 
     fun label(p: Element): String? {
         val pPr = p.kid(W, "pPr")
@@ -122,10 +125,16 @@ private class State(
         val lvl = num.levels[ilvl] ?: return null
         if (lvl.numFmt == "bullet" || lvl.numFmt == "none") return null
 
-        val values = counters.getOrPut(numId) { IntArray(9) }
-        val isSet = set.getOrPut(numId) { BooleanArray(9) }
-        fun startOf(i: Int) = num.startOverrides[i] ?: num.levels[i]?.start ?: 1
-        values[ilvl] = if (isSet[ilvl]) values[ilvl] + 1 else startOf(ilvl)
+        val values = counters.getOrPut(num.abstractId) { IntArray(9) }
+        val isSet = set.getOrPut(num.abstractId) { BooleanArray(9) }
+        fun startOf(i: Int) = num.levels[i]?.start ?: 1
+        // A startOverride restarts the level on this num's first use of it; later use continues the shared counter.
+        val override = if (usedLevels.add(numId to ilvl)) num.startOverrides[ilvl] else null
+        values[ilvl] = when {
+            override != null -> override
+            isSet[ilvl] -> values[ilvl] + 1
+            else -> startOf(ilvl)
+        }
         isSet[ilvl] = true
         for (d in ilvl + 1..8) isSet[d] = false
         val levels = (0..ilvl).map { i ->
