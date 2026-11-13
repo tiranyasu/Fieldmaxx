@@ -3,25 +3,33 @@ package com.fieldmaxx.sharepoint
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.OutputStream
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
 
-/** In-memory [PhotoDestination] for tests of the server and the app. */
+/** In-memory [PhotoDestination] for tests of the server and the app. Thread-safe: uploads may overlap. */
 class FakeDestination(private val root: String = "Field Notes") : PhotoDestination {
-    val folders: MutableSet<String> = mutableSetOf()
-    val files: MutableMap<String, ByteArray> = mutableMapOf()
-    val calls: MutableList<String> = mutableListOf()
+    val folders: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    val files: MutableMap<String, ByteArray> = ConcurrentHashMap()
+    val calls: MutableList<String> = CopyOnWriteArrayList()
+    @Volatile
     var uploadDelayMs: Long = 0
 
     /** One-shot: after this many chunks of one `uploadChunked` call, throw NETWORK (progress already reported). */
+    @Volatile
     var dropChunkAfter: Int? = null
 
-    private val partials = mutableMapOf<String, ByteArrayOutputStream>()
+    private val partials = ConcurrentHashMap<String, ByteArrayOutputStream>()
+    private val lock = Any()
     private var failuresLeft = 0
     private var failureCode = DestinationErrorCode.UNEXPECTED
-    private var nextUploadId = 1
+    private val nextUploadId = AtomicInteger(1)
 
     fun failNext(n: Int, code: DestinationErrorCode) {
-        failuresLeft = n
-        failureCode = code
+        synchronized(lock) {
+            failuresLeft = n
+            failureCode = code
+        }
     }
 
     override fun rootName(): String = root
@@ -51,9 +59,9 @@ class FakeDestination(private val root: String = "Field Notes") : PhotoDestinati
 
     override fun upload(relPath: String, bytes: ByteArray) {
         begin("upload $relPath")
-        delay()
         checkTarget(relPath)
-        files[relPath] = bytes.copyOf()
+        delay()
+        store(relPath, bytes.copyOf())
     }
 
     override fun uploadChunked(relPath: String, file: File, chunkBytes: Int, resume: ChunkSession?, onProgress: (ChunkSession) -> Unit) {
@@ -68,15 +76,14 @@ class FakeDestination(private val root: String = "Field Notes") : PhotoDestinati
             partial = p
             session = ChunkSession(resume.uploadId, partial.size().toLong())
         } else {
-            val id = "upload-${nextUploadId++}"
+            val id = "upload-${nextUploadId.getAndIncrement()}"
             partial = ByteArrayOutputStream().also { partials[id] = it }
             session = ChunkSession(id, 0)
         }
         var offset = session.offset.toInt()
         var sent = 0
         while (offset < data.size) {
-            if (dropChunkAfter != null && sent >= dropChunkAfter!!) {
-                dropChunkAfter = null
+            if (shouldDrop(sent)) {
                 throw DestinationException(DestinationErrorCode.NETWORK, "connection dropped")
             }
             delay()
@@ -86,7 +93,7 @@ class FakeDestination(private val root: String = "Field Notes") : PhotoDestinati
             sent++
             onProgress(ChunkSession(session.uploadId, offset.toLong()))
         }
-        files[relPath] = partial.toByteArray()
+        store(relPath, partial.toByteArray())
         partials.remove(session.uploadId)
     }
 
@@ -97,10 +104,25 @@ class FakeDestination(private val root: String = "Field Notes") : PhotoDestinati
 
     private fun begin(call: String) {
         calls.add(call)
-        if (failuresLeft > 0) {
-            failuresLeft--
-            throw DestinationException(failureCode, "injected failure for $call")
+        val code = synchronized(lock) {
+            if (failuresLeft > 0) {
+                failuresLeft--
+                failureCode
+            } else null
         }
+        if (code != null) throw DestinationException(code, "injected failure for $call")
+    }
+
+    private fun shouldDrop(sent: Int): Boolean = synchronized(lock) {
+        val limit = dropChunkAfter
+        if (limit != null && sent >= limit) {
+            dropChunkAfter = null
+            true
+        } else false
+    }
+
+    private fun store(relPath: String, bytes: ByteArray) {
+        if (files.putIfAbsent(relPath, bytes) != null) throw DestinationException(DestinationErrorCode.EXISTS, "$relPath already exists")
     }
 
     private fun delay() {
