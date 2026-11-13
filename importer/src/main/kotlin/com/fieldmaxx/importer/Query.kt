@@ -87,7 +87,7 @@ fun extractQueryItems(blocks: List<DocBlock>, layer: String): QueryResult {
                     cur.text = if (cur.text.isEmpty()) words else cur.text + " " + words
                     cur.raw.append("\n").append(b.text)
                 }
-                hasWords -> notes.add(b.text.trim())
+                b.text.any { it.isLetterOrDigit() } -> notes.add(b.text.trim())
             }
         }
     }

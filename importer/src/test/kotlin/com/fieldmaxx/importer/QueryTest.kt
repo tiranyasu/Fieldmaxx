@@ -71,4 +71,20 @@ class QueryTest {
         assertEquals(1, r.points.size)
         assertEquals(listOf("stray words"), r.notes)
     }
+
+    @Test fun unreadableParagraphsGoToNotes() {
+        val r = extractQueryItems(
+            listOf(
+                ParaBlock("VERIFY HH – 39.1234,-119.1234", "1.", null),
+                ParaBlock("(39.12 -119.1)", null, null),
+                ParaBlock("39.1234", null, null),
+                ParaBlock("----", null, null),
+            ),
+            "QUERY 1",
+        )
+        assertEquals(listOf("(39.12 -119.1)", "39.1234"), r.notes)
+        val p = r.points.single()
+        assertEquals("VERIFY HH", p.description)
+        assertEquals(39.1234, p.lat)
+    }
 }
