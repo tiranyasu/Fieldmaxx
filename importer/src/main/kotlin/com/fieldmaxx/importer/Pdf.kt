@@ -48,7 +48,10 @@ fun pdfToGroups(bytes: ByteArray, renderDpi: Float = 144f): PdfExtract {
     }
 }
 
+const val MAX_PDF_PAGES = 200
+
 private fun extract(doc: PDDocument, renderDpi: Float): PdfExtract {
+    if (doc.numberOfPages > MAX_PDF_PAGES) throw ImportException("too_many_pages", "PDF has too many pages (max $MAX_PDF_PAGES)")
     val groups = mutableListOf<PdfGroup>()
     val images = mutableListOf<ExtractedImage>()
     val renders = mutableListOf<ExtractedImage>()

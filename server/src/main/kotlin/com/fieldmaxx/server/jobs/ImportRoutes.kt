@@ -3,6 +3,8 @@ package com.fieldmaxx.server.jobs
 import com.fieldmaxx.core.FmxJson
 import com.fieldmaxx.core.model.ImportPreview
 import com.fieldmaxx.core.model.RefImageInfo
+import com.fieldmaxx.core.model.Role
+import com.fieldmaxx.core.model.User
 import com.fieldmaxx.importer.ImportException
 import com.fieldmaxx.importer.importFile
 import com.fieldmaxx.server.Ctx
@@ -26,6 +28,8 @@ import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.io.readByteArray
+
+const val MAX_UPLOAD_BYTES = 50L * 1024 * 1024
 
 /**
  * Reads the file, stores it under `imports/<id>/` and its reference images under `refs/`, and returns the preview for
@@ -74,10 +78,13 @@ fun storeImport(ctx: Ctx, userId: String, fileName: String, bytes: ByteArray): I
 }
 
 /** The stored reference image whose id matches and whose import/job column equals [owner]. */
-internal fun refImage(ctx: Ctx, column: String, owner: String, refId: String): Pair<ByteArray, String> {
+internal fun refImage(ctx: Ctx, column: String, owner: String, refId: String, user: User): Pair<ByteArray, String> {
     val row = ctx.db.read {
-        prepareStatement("SELECT stored_path, mime FROM ref_images WHERE id = ? AND $column = ?").use { ps ->
-            ps.setString(1, refId); ps.setString(2, owner)
+        prepareStatement(
+            "SELECT r.stored_path, r.mime FROM ref_images r LEFT JOIN jobs j ON j.id = r.job_id " +
+                "WHERE r.id = ? AND r.$column = ? AND (j.deleted_at IS NULL OR ?)",
+        ).use { ps ->
+            ps.setString(1, refId); ps.setString(2, owner); ps.setBoolean(3, user.role == Role.admin)
             ps.executeQuery().use { if (it.next()) it.getString(1) to it.getString(2) else null }
         }
     } ?: throw HttpError(HttpStatusCode.NotFound, "Image not found")
@@ -90,20 +97,25 @@ fun Route.importRoutes(ctx: Ctx) {
             post {
                 var name: String? = null
                 var bytes: ByteArray? = null
-                call.receiveMultipart().forEachPart { part ->
-                    if (part is PartData.FileItem && part.name == "file" && bytes == null) {
+                var tooLarge = false
+                try { call.receiveMultipart(formFieldLimit = MAX_UPLOAD_BYTES + 1).forEachPart { part ->
+                    if (part is PartData.FileItem && part.name == "file" && bytes == null && !tooLarge) {
                         name = part.originalFileName
-                        bytes = part.provider().readRemaining().readByteArray()
+                        val read = part.provider().readRemaining(MAX_UPLOAD_BYTES + 1).readByteArray()
+                        if (read.size > MAX_UPLOAD_BYTES) tooLarge = true else bytes = read
                     }
                     part.dispose()
+                } } catch (e: java.io.IOException) {
+                    if (e.message?.contains("exceeds limit") == true) tooLarge = true else throw e // ktor's own multipart cap
                 }
+                if (tooLarge) throw HttpError(HttpStatusCode.PayloadTooLarge, "File is too large (max 50 MB)")
                 val fileName = name?.takeIf { it.isNotBlank() } ?: throw IllegalArgumentException("Choose a file to upload")
                 val data = bytes ?: throw IllegalArgumentException("Choose a file to upload")
                 val userId = call.user().id
                 call.respond(withContext(Dispatchers.IO) { storeImport(ctx, userId, fileName, data) })
             }
             get("/{importId}/ref/{refId}") {
-                val (bytes, mime) = refImage(ctx, "import_id", call.parameters["importId"]!!, call.parameters["refId"]!!)
+                val (bytes, mime) = refImage(ctx, "import_id", call.parameters["importId"]!!, call.parameters["refId"]!!, call.user())
                 call.respondBytes(bytes, ContentType.parse(mime))
             }
         }

@@ -3,6 +3,8 @@ package com.fieldmaxx.server.jobs
 import com.fieldmaxx.core.model.CreateJobInput
 import com.fieldmaxx.core.model.JobImportInput
 import com.fieldmaxx.core.model.Point
+import com.fieldmaxx.core.model.Role
+import com.fieldmaxx.core.model.User
 import com.fieldmaxx.server.Ctx
 import com.fieldmaxx.server.HttpError
 import com.fieldmaxx.server.auth.user
@@ -28,6 +30,17 @@ import kotlinx.serialization.Serializable
 @Serializable data class AddImportResponse(val points: List<Point>, val skippedDuplicates: List<String>)
 @Serializable data class UpdateJobRequest(val name: String? = null, val fieldNotesUrl: String? = null, val notes: String? = null)
 
+/** A deleted job is gone for techs (404); admins can still read it, e.g. before restoring. */
+private fun requireReadable(ctx: Ctx, user: User, jobId: String) {
+    val deleted = ctx.db.read {
+        prepareStatement("SELECT deleted_at FROM jobs WHERE id = ?").use { ps ->
+            ps.setString(1, jobId)
+            ps.executeQuery().use { rs -> if (rs.next()) rs.getObject(1) != null else throw HttpError(HttpStatusCode.NotFound, "Job not found") }
+        }
+    }
+    if (deleted && user.role != Role.admin) throw HttpError(HttpStatusCode.NotFound, "Job not found")
+}
+
 fun Route.jobRoutes(ctx: Ctx) {
     authenticate("bearer") {
         route("/jobs") {
@@ -40,7 +53,10 @@ fun Route.jobRoutes(ctx: Ctx) {
                 call.respond(HttpStatusCode.Created, CreateJobResponse(job, skipped))
             }
             route("/{id}") {
-                get("/snapshot") { call.respond(jobSnapshot(ctx, call.parameters["id"]!!)) }
+                get("/snapshot") {
+                    requireReadable(ctx, call.user(), call.parameters["id"]!!)
+                    call.respond(jobSnapshot(ctx, call.parameters["id"]!!))
+                }
                 patch {
                     val r = call.receive<UpdateJobRequest>()
                     call.respond(updateJob(ctx, call.parameters["id"]!!, r.name, r.fieldNotesUrl, r.notes))
@@ -58,10 +74,11 @@ fun Route.jobRoutes(ctx: Ctx) {
                     call.respond(HttpStatusCode.Created, AddImportResponse(points, skipped))
                 }
                 get("/ref/{refId}") {
-                    val (bytes, mime) = refImage(ctx, "job_id", call.parameters["id"]!!, call.parameters["refId"]!!)
+                    val (bytes, mime) = refImage(ctx, "job_id", call.parameters["id"]!!, call.parameters["refId"]!!, call.user())
                     call.respondBytes(bytes, ContentType.parse(mime))
                 }
                 get("/files/{fileId}") {
+                    requireReadable(ctx, call.user(), call.parameters["id"]!!)
                     val row = ctx.db.read {
                         prepareStatement("SELECT original_name, stored_path, kind FROM job_files WHERE id = ? AND job_id = ?").use { ps ->
                             ps.setString(1, call.parameters["fileId"]!!); ps.setString(2, call.parameters["id"]!!)

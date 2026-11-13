@@ -337,4 +337,32 @@ class JobsTest {
         assertTrue(!dir.toFile().exists())
         assertEquals(HttpStatusCode.NotFound, client.get("/api/imports/${p.importId}/ref/${p.refImages[0].id}") { bearerAuth(t) }.status)
     }
+
+    @Test fun deletedJobIsHiddenFromTechsButNotAdmins() = TestApp().run {
+        val ann = tokenFor("ann"); val bob = tokenFor("bob"); val root = tokenFor("root", Role.admin)
+        val p = preview(ann)
+        val j = create(ann, p).job
+        val s = snapshot(ann, j.id)
+        val urls = listOf("/api/jobs/${j.id}/snapshot", "/api/jobs/${j.id}/ref/${s.refImages[0].id}",
+            "/api/jobs/${j.id}/files/${s.files[0].id}", "/api/imports/${p.importId}/ref/${s.refImages[0].id}")
+        for (u in urls) assertEquals(HttpStatusCode.OK, client.get(u) { bearerAuth(bob) }.status, u)
+        client.delete("/api/jobs/${j.id}") { bearerAuth(ann) }
+        for (u in urls) {
+            assertEquals(HttpStatusCode.NotFound, client.get(u) { bearerAuth(bob) }.status, u)
+            assertEquals(HttpStatusCode.NotFound, client.get(u) { bearerAuth(ann) }.status, u)
+            assertEquals(HttpStatusCode.OK, client.get(u) { bearerAuth(root) }.status, u)
+        }
+    }
+
+    @Test fun uploadOver50MbIs413() = TestApp().run {
+        val res = upload(tokenFor("ann"), "big.pdf", ByteArray(50 * 1024 * 1024 + 1))
+        assertEquals(HttpStatusCode.PayloadTooLarge, res.status)
+        assertTrue(res.bodyAsText().contains("File is too large (max 50 MB)"))
+    }
+
+    @Test fun pdfOver200PagesIs400() = TestApp().run {
+        val res = upload(tokenFor("ann"), "long.pdf", makePdf(List(201) { PdfPageSpec() }))
+        assertEquals(HttpStatusCode.BadRequest, res.status)
+        assertTrue(res.bodyAsText().contains("PDF has too many pages (max 200)"))
+    }
 }

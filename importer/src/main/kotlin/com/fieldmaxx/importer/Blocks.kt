@@ -10,6 +10,6 @@ data class ImageBlock(val imageId: String, override val page: Int?) : DocBlock
 
 class ExtractedImage(val id: String, val mime: String /* image/png|image/jpeg */, val bytes: ByteArray)
 
-class ImportException(val code: String /* unreadable_pdf|unreadable_docx|unsupported_type */, message: String) : Exception(message)
+class ImportException(val code: String /* unreadable_pdf|unreadable_docx|unsupported_type|too_many_pages */, message: String) : Exception(message)
 
 data class DocxExtract(val blocks: List<DocBlock>, val images: List<ExtractedImage>)
