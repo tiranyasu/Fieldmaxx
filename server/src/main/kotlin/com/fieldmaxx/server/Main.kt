@@ -8,6 +8,7 @@ import com.fieldmaxx.server.sync.ChangeLog
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
 import java.time.Clock
+import kotlin.system.exitProcess
 import okhttp3.OkHttpClient
 
 fun main(args: Array<String>) {
@@ -22,7 +23,12 @@ fun main(args: Array<String>) {
     }
     val ctx = Ctx(config, db, Clock.systemUTC(), destinations, NoopChangeRecorder, NoopDeliveryKick)
     ctx.changes = ChangeLog(db, ctx.clock, ctx.hub)
-    if (runCli(args, ctx)) { db.close(); return }
+    val cli = runCli(args, ctx)
+    if (cli != CliResult.NotACommand) {
+        db.close()
+        if (cli == CliResult.Failed) exitProcess(1)
+        return
+    }
     val delivery = DeliveryWorker(ctx)
     ctx.delivery = delivery
     startJobMaintenance(ctx)

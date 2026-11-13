@@ -207,14 +207,29 @@ class AdminTest {
 
     @Test fun publishApkCli() = TestApp().run { app ->
         val lines = mutableListOf<String>()
-        assertTrue(runCli(arrayOf("publish-apk", apk(byteArrayOf(1, 2, 3)).toString(), "4", "0.4.0"), app.ctx, emptyMap(), lines::add))
+        assertEquals(CliResult.Done, runCli(arrayOf("publish-apk", apk(byteArrayOf(1, 2, 3)).toString(), "4", "0.4.0"), app.ctx, emptyMap(), lines::add))
         assertTrue(lines.single().startsWith("Published 0.4.0"), lines.toString())
         lines.clear()
-        runCli(arrayOf("publish-apk", "/nonexistent.apk", "5", "0.5.0"), app.ctx, emptyMap(), lines::add)
+        assertEquals(CliResult.Failed, runCli(arrayOf("publish-apk", "/nonexistent.apk", "5", "0.5.0"), app.ctx, emptyMap(), lines::add))
         assertTrue(lines.single().startsWith("Could not publish"), lines.toString())
         lines.clear()
-        runCli(arrayOf("publish-apk", apk(byteArrayOf(1)).toString(), "6", "../evil"), app.ctx, emptyMap(), lines::add)
+        assertEquals(CliResult.Failed, runCli(arrayOf("publish-apk", apk(byteArrayOf(1)).toString(), "6", "../evil"), app.ctx, emptyMap(), lines::add))
         assertTrue(lines.single().startsWith("Could not publish"), lines.toString())
+    }
+
+    @Test fun cliFailuresReportFailedStatus() = TestApp().run { app ->
+        val out = mutableListOf<String>()
+        // publish-apk usage error (missing arguments, non-numeric code)
+        assertEquals(CliResult.Failed, runCli(arrayOf("publish-apk", "x.apk"), app.ctx, emptyMap(), out::add))
+        assertEquals(CliResult.Failed, runCli(arrayOf("publish-apk", "x.apk", "abc", "1.0"), app.ctx, emptyMap(), out::add))
+        // publish-apk rejected file
+        assertEquals(CliResult.Failed, runCli(arrayOf("publish-apk", "/nonexistent.apk", "1", "1.0"), app.ctx, emptyMap(), out::add))
+        // create-admin usage error (no password) and a failing create (duplicate user)
+        assertEquals(CliResult.Failed, runCli(arrayOf("create-admin", "boss", "Boss"), app.ctx, emptyMap(), out::add))
+        val env = mapOf("FMX_ADMIN_PASSWORD" to "boss-pass-123")
+        assertEquals(CliResult.Done, runCli(arrayOf("create-admin", "boss", "Boss"), app.ctx, env, out::add))
+        assertEquals(CliResult.Failed, runCli(arrayOf("create-admin", "boss", "Boss"), app.ctx, env, out::add))
+        assertEquals(CliResult.NotACommand, runCli(arrayOf(), app.ctx, emptyMap(), out::add))
     }
 
     @Test fun publishApkRejectsEmptyAndNonZip() = TestApp().run { app ->
@@ -224,7 +239,7 @@ class AdminTest {
             assertTrue(runCatching { publishApk(app.ctx, f, 1, "0.1.0") }.exceptionOrNull() is IllegalArgumentException)
         }
         val lines = mutableListOf<String>()
-        runCli(arrayOf("publish-apk", text.toString(), "1", "0.1.0"), app.ctx, emptyMap(), lines::add)
+        assertEquals(CliResult.Failed, runCli(arrayOf("publish-apk", text.toString(), "1", "0.1.0"), app.ctx, emptyMap(), lines::add))
         assertTrue(lines.single().startsWith("Could not publish"), lines.toString())
         assertEquals("null", getAs(tokenFor("ann"), "/api/app/latest").bodyAsText())
         assertTrue(!Files.exists(app.ctx.config.dataDir.resolve("apk/fieldmaxx-0.1.0.apk")))

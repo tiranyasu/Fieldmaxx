@@ -188,15 +188,15 @@ class AuthTest {
         val app = TestApp()
         try {
             val out = mutableListOf<String>()
-            assertFalse(runCli(arrayOf(), app.ctx, emptyMap(), out::add))
-            assertTrue(runCli(arrayOf("create-admin", "owner", "The Owner"), app.ctx, mapOf("FMX_ADMIN_PASSWORD" to "owner-pass-123"), out::add))
+            assertEquals(CliResult.NotACommand, runCli(arrayOf(), app.ctx, emptyMap(), out::add))
+            assertEquals(CliResult.Done, runCli(arrayOf("create-admin", "owner", "The Owner"), app.ctx, mapOf("FMX_ADMIN_PASSWORD" to "owner-pass-123"), out::add))
             val (role, hash) = app.ctx.db.read {
                 createStatement().use { st -> st.executeQuery("SELECT role, password_hash FROM users WHERE username='owner'").use { it.next(); it.getString(1) to it.getString(2) } }
             }
             assertEquals("admin", role)
             assertTrue(verifyPassword(hash, "owner-pass-123"))
             // no password in the environment: nothing is created
-            assertTrue(runCli(arrayOf("create-admin", "other", "Other"), app.ctx, emptyMap(), out::add))
+            assertEquals(CliResult.Failed, runCli(arrayOf("create-admin", "other", "Other"), app.ctx, emptyMap(), out::add))
             assertTrue(out.last().startsWith("Usage"))
         } finally { app.ctx.db.close() }
     }
