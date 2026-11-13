@@ -2,6 +2,7 @@ package com.fieldmaxx.server
 
 import com.fieldmaxx.sharepoint.FakeDestination
 import com.fieldmaxx.sharepoint.sharePointDestinations
+import com.fieldmaxx.server.delivery.DeliveryWorker
 import com.fieldmaxx.server.jobs.startJobMaintenance
 import com.fieldmaxx.server.sync.ChangeLog
 import io.ktor.server.engine.embeddedServer
@@ -22,6 +23,9 @@ fun main(args: Array<String>) {
     val ctx = Ctx(config, db, Clock.systemUTC(), destinations, NoopChangeRecorder, NoopDeliveryKick)
     ctx.changes = ChangeLog(db, ctx.clock, ctx.hub)
     if (runCli(args, ctx)) { db.close(); return }
+    val delivery = DeliveryWorker(ctx)
+    ctx.delivery = delivery
     startJobMaintenance(ctx)
+    delivery.start()
     embeddedServer(Netty, port = config.port, host = "0.0.0.0") { fieldmaxx(ctx) }.start(wait = true)
 }

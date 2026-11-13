@@ -147,11 +147,18 @@ fun registerPhoto(ctx: Ctx, user: User, reg: PhotoRegistration): RegisteredPhoto
 }
 
 /** The phone found a different-size file of the same name in OneDrive: give the photo a fresh counter. */
-fun renamePhoto(ctx: Ctx, user: User, photoId: String): RegisteredPhoto {
+fun renamePhoto(ctx: Ctx, user: User, photoId: String): RegisteredPhoto = rename(ctx, photoId) { row ->
+    if (!canTouch(user, row.userId)) throw HttpError(HttpStatusCode.Forbidden, "Not your photo")
+}
+
+/** The server's own delivery met a different file under the photo's name: a fresh counter, as [renamePhoto]. */
+internal fun renamePhotoForDelivery(ctx: Ctx, photoId: String): RegisteredPhoto = rename(ctx, photoId) {}
+
+private fun rename(ctx: Ctx, photoId: String, check: (PhotoRow) -> Unit): RegisteredPhoto {
     var change: Change? = null
     val result = ctx.db.tx {
         val row = photoRow(photoId) ?: throw HttpError(HttpStatusCode.NotFound, "Photo not found")
-        if (!canTouch(user, row.userId)) throw HttpError(HttpStatusCode.Forbidden, "Not your photo")
+        check(row)
         if (row.confirmedAt != null) throw HttpError(HttpStatusCode.Conflict, "Photo already delivered")
         val point = pointRef(row.pointId) ?: throw HttpError(HttpStatusCode.NotFound, "Point not found")
         val name = cadastrusName(point, row.lat, row.lon, nextCounter("photo"))

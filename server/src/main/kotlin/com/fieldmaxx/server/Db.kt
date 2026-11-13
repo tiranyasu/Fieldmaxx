@@ -75,6 +75,6 @@ class Db(private val url: String) : AutoCloseable {
 
     companion object {
         /** Migration files in order; add new files here. */
-        private val MIGRATIONS = listOf("001_init.sql")
+        private val MIGRATIONS = listOf("001_init.sql", "002_delivery_sessions.sql")
     }
 }

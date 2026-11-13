@@ -17,6 +17,7 @@ import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
 import com.fieldmaxx.server.Ctx
 import com.fieldmaxx.server.HttpError
+import com.fieldmaxx.server.delivery.backupMaintenance
 import io.ktor.http.HttpStatusCode
 import java.nio.file.Files
 import java.nio.file.Path
@@ -234,6 +235,12 @@ fun updateJob(ctx: Ctx, jobId: String, name: String?, fieldNotesUrl: String?, no
             it.setBoolean(5, newLink != null); it.setString(6, jobId)
             it.executeUpdate()
         }
+        if (newLink != null) {
+            // A new link may fix what made them fail: the server tries its waiting photos at once, not after their backoff.
+            prepareStatement("UPDATE photos SET next_attempt_at = NULL WHERE job_id = ? AND confirmed_at IS NULL AND status IN ('registered', 'stuck')").use {
+                it.setString(1, jobId); it.executeUpdate()
+            }
+        }
         val updated = requireJob(jobId)
         updated to ctx.changes.recordInTx(this, jobId, "job", jobId, job = updated)
     }
@@ -281,6 +288,7 @@ fun purgeDeletedJobs(ctx: Ctx): Int {
     val files = mutableListOf<String>()
     val dirs = mutableListOf<String>()
     val n = ctx.db.tx {
+        val thumbs = mutableSetOf<String>()
         val ids = prepareStatement("SELECT id FROM jobs WHERE deleted_at IS NOT NULL AND deleted_at < ?").use { ps ->
             ps.setLong(1, cutoff); ps.executeQuery().use { rs -> buildList { while (rs.next()) add(rs.getString(1)) } }
         }
@@ -291,12 +299,20 @@ fun purgeDeletedJobs(ctx: Ctx): Int {
             }
             collect("SELECT stored_path FROM ref_images WHERE job_id = ?")
             collect("SELECT backup_path FROM photos WHERE job_id = ?")
-            collect("SELECT thumb_path FROM photos WHERE job_id = ?")
+            prepareStatement("SELECT thumb_path FROM photos WHERE job_id = ? AND thumb_path IS NOT NULL").use { ps ->
+                ps.setString(1, id); ps.executeQuery().use { rs -> while (rs.next()) thumbs += rs.getString(1) }
+            }
             for (table in listOf("photos", "points", "job_files", "ref_images")) {
                 prepareStatement("DELETE FROM $table WHERE job_id = ?").use { it.setString(1, id); it.executeUpdate() }
             }
             prepareStatement("DELETE FROM jobs WHERE id = ?").use { it.setString(1, id); it.executeUpdate() }
             dirs += "jobs/$id"
+        }
+        // Reuse copies in other jobs share the original's thumbnail: keep any still in use.
+        files += thumbs.filter { thumb ->
+            prepareStatement("SELECT 1 FROM photos WHERE thumb_path = ? LIMIT 1").use { ps ->
+                ps.setString(1, thumb); ps.executeQuery().use { !it.next() }
+            }
         }
         ids.size
     }
@@ -329,11 +345,16 @@ fun sweepImports(ctx: Ctx): Int {
     return n
 }
 
-/** Hourly: sweep stale uploads and purge jobs past the 30-day restore window. Daemon thread; call once from main. */
+/**
+ * Hourly: sweep stale uploads, purge jobs past the 30-day restore window, and the backup upkeep (retention purge,
+ * missing thumbnails, disk warning). Daemon thread; call once from main.
+ */
 fun startJobMaintenance(ctx: Ctx) {
     val ex = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "job-maintenance").apply { isDaemon = true } }
     ex.scheduleWithFixedDelay({
         runCatching { sweepImports(ctx); purgeDeletedJobs(ctx) }
             .onFailure { System.err.println("Job maintenance failed: ${it.message}") }
+        runCatching { backupMaintenance(ctx) }
+            .onFailure { System.err.println("Backup maintenance failed: ${it.message}") }
     }, 1, 60, TimeUnit.MINUTES)
 }

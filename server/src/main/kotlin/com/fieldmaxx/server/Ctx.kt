@@ -54,7 +54,7 @@ object NoopChangeRecorder : ChangeRecorder {
     override fun headSeq() = 0L
 }
 
-/** Placeholder until the delivery worker exists (Task 17). */
+/** Does nothing: for tests and the CLI. The running server installs the DeliveryWorker. */
 object NoopDeliveryKick : DeliveryKick {
     override fun kick() {}
 }
