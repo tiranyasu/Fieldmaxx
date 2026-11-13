@@ -19,6 +19,7 @@ import java.security.MessageDigest
 import kotlinx.serialization.builtins.nullable
 
 val APK_TYPE: ContentType = ContentType("application", "vnd.android.package-archive")
+private val ZIP_MAGIC = byteArrayOf(0x50, 0x4B, 0x03, 0x04)
 private val VERSION_NAME = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
 
 private data class ReleaseRow(val code: Int, val name: String, val filePath: String, val sha256: String)
@@ -41,6 +42,9 @@ fun latestRelease(ctx: Ctx): AppRelease? = ctx.latestRow()?.let {
 /** Copies [source] into `<dataDir>/apk/` and records it. Throws IllegalArgumentException on bad input or a repeated version. */
 fun publishApk(ctx: Ctx, source: java.nio.file.Path, versionCode: Int, versionName: String): AppRelease {
     require(Files.isRegularFile(source)) { "No such file: $source" }
+    val magic = Files.newInputStream(source).use { it.readNBytes(4) }
+    require(magic.isNotEmpty()) { "The file is empty" }
+    require(magic.contentEquals(ZIP_MAGIC)) { "That is not an APK (it does not start with the ZIP header PK\\x03\\x04)" }
     require(versionCode > 0) { "versionCode must be a positive number" }
     require(VERSION_NAME.matches(versionName)) { "versionName may only use letters, digits, '.', '_' and '-'" }
     val dir = ctx.config.dataDir.resolve("apk")

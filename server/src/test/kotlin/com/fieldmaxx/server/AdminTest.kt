@@ -170,7 +170,13 @@ class AdminTest {
         assertEquals(HttpStatusCode.Unauthorized, client.get("/api/config").status)
     }
 
-    private fun apk(bytes: ByteArray) = Files.createTempFile("fmx", ".apk").also { Files.write(it, bytes); it.toFile().deleteOnExit() }
+    /** A minimal valid ZIP whose single entry holds [bytes] (an APK is a ZIP). */
+    private fun apk(bytes: ByteArray) = Files.createTempFile("fmx", ".apk").also {
+        java.util.zip.ZipOutputStream(Files.newOutputStream(it)).use { z ->
+            z.putNextEntry(java.util.zip.ZipEntry("classes.dex")); z.write(bytes); z.closeEntry()
+        }
+        it.toFile().deleteOnExit()
+    }
 
     @Test fun publishApkThenLatest() = TestApp().run { app ->
         val tech = tokenFor("ann")
@@ -178,24 +184,25 @@ class AdminTest {
         assertEquals(HttpStatusCode.Unauthorized, client.get("/api/app/latest").status)
         val v1 = ByteArray(5000) { (it % 251).toByte() }
         val v2 = ByteArray(7000) { (it % 13).toByte() }
-        publishApk(app.ctx, apk(v2), 12, "1.2.0")
-        publishApk(app.ctx, apk(v1), 9, "0.9.0")
+        val f2 = apk(v2); val f1 = apk(v1)
+        publishApk(app.ctx, f2, 12, "1.2.0")
+        publishApk(app.ctx, f1, 9, "0.9.0")
         val latest = FmxJson.decodeFromString(AppRelease.serializer(), getAs(tech, "/api/app/latest").bodyAsText())
         assertEquals(12, latest.versionCode); assertEquals("1.2.0", latest.versionName)
         assertEquals("http://localhost/app/fieldmaxx-1.2.0.apk", latest.url)
-        assertEquals(MessageDigest.getInstance("SHA-256").digest(v2).joinToString("") { "%02x".format(it) }, latest.sha256)
+        assertEquals(MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(f2)).joinToString("") { "%02x".format(it) }, latest.sha256)
         // The file is public (the download page links to it) and served with the APK content type.
         val res = client.get("/app/fieldmaxx-1.2.0.apk")
         assertEquals(HttpStatusCode.OK, res.status)
         assertEquals("application/vnd.android.package-archive", res.headers["Content-Type"])
-        assertContentEquals(v2, res.bodyAsBytes())
-        assertContentEquals(v1, client.get("/app/fieldmaxx-0.9.0.apk").bodyAsBytes())
+        assertContentEquals(Files.readAllBytes(f2), res.bodyAsBytes())
+        assertContentEquals(Files.readAllBytes(f1), client.get("/app/fieldmaxx-0.9.0.apk").bodyAsBytes())
         // Only what the database knows is served; paths never come from the URL.
         assertEquals(HttpStatusCode.NotFound, client.get("/app/fieldmaxx-9.9.9.apk").status)
         assertEquals(HttpStatusCode.NotFound, client.get("/app/..%2Ffieldmaxx.db").status)
         assertEquals(HttpStatusCode.NotFound, client.get("/app/fieldmaxx-..%2F..%2Fx.apk").status)
         // Re-publishing a version code is refused.
-        assertTrue(runCatching { publishApk(app.ctx, apk(v1), 12, "1.2.1") }.isFailure)
+        assertTrue(runCatching { publishApk(app.ctx, f1, 12, "1.2.1") }.isFailure)
     }
 
     @Test fun publishApkCli() = TestApp().run { app ->
@@ -208,6 +215,40 @@ class AdminTest {
         lines.clear()
         runCli(arrayOf("publish-apk", apk(byteArrayOf(1)).toString(), "6", "../evil"), app.ctx, emptyMap(), lines::add)
         assertTrue(lines.single().startsWith("Could not publish"), lines.toString())
+    }
+
+    @Test fun publishApkRejectsEmptyAndNonZip() = TestApp().run { app ->
+        val empty = Files.createTempFile("fmx", ".apk")
+        val text = Files.createTempFile("fmx", ".apk").also { Files.write(it, "hello, not an apk".toByteArray()) }
+        for (f in listOf(empty, text)) {
+            assertTrue(runCatching { publishApk(app.ctx, f, 1, "0.1.0") }.exceptionOrNull() is IllegalArgumentException)
+        }
+        val lines = mutableListOf<String>()
+        runCli(arrayOf("publish-apk", text.toString(), "1", "0.1.0"), app.ctx, emptyMap(), lines::add)
+        assertTrue(lines.single().startsWith("Could not publish"), lines.toString())
+        assertEquals("null", getAs(tokenFor("ann"), "/api/app/latest").bodyAsText())
+        assertTrue(!Files.exists(app.ctx.config.dataDir.resolve("apk/fieldmaxx-0.1.0.apk")))
+        assertEquals(0, app.ctx.db.read { createStatement().use { st -> st.executeQuery("SELECT COUNT(*) FROM app_releases").use { it.next(); it.getInt(1) } } })
+    }
+
+    @Test fun cantShootReasonSurvivesReopenAndRemark() = TestApp().run { app ->
+        seed(app)
+        val ann = tokenFor("ann")
+        suspend fun send(op: Op) = client.post("/api/ops") {
+            bearerAuth(ann); contentType(ContentType.Application.Json)
+            setBody(FmxJson.encodeToString(OpsRequest.serializer(), OpsRequest(listOf(op))))
+        }
+        for ((i, op) in listOf(
+            Op.PointCantShoot("a1", "pt-1", CantShootReason.other, "gate locked"),
+            Op.PointReopen("a2", "pt-1"),
+            Op.PointCantShoot("a3", "pt-1", CantShootReason.no_access, null),
+        ).withIndex()) {
+            app.clock.nowMs += 1000
+            assertEquals(HttpStatusCode.OK, send(op).status, "op $i")
+        }
+        val items = FmxJson.decodeFromString(ListSerializer(ActivityItem.serializer()), getAs(tokenFor("boss", Role.admin), "/api/admin/activity").bodyAsText())
+        assertEquals(listOf("no_access", "", "other: gate locked"), items.map { it.detail })
+        assertEquals(listOf("point.cantShoot", "point.reopen", "point.cantShoot"), items.map { it.kind })
     }
 
     @Test fun downloadPageHasButtonAndSteps() = TestApp().run { app ->

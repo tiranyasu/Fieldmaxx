@@ -88,7 +88,7 @@ fun healthReport(ctx: Ctx): HealthReport {
 /** Newest first; "Can't shoot" entries carry their reason (and the tech's text) in `detail`. */
 fun activity(ctx: Ctx, jobId: String?): List<ActivityItem> = ctx.db.read {
     prepareStatement(
-        "SELECT e.at, e.kind, u.display_name, p.label, p.cant_reason, p.cant_text, p.status AS point_status FROM events e " +
+        "SELECT e.at, e.kind, u.display_name, p.label, json_extract(e.data_json, '\$.reason') AS reason, json_extract(e.data_json, '\$.text') AS text FROM events e " +
             "LEFT JOIN users u ON u.id = e.user_id " +
             "LEFT JOIN points p ON p.id = json_extract(e.data_json, '\$.pointId') " +
             "WHERE (? IS NULL OR e.job_id = ?) ORDER BY e.at DESC, e.id DESC LIMIT $ACTIVITY_LIMIT",
@@ -98,9 +98,9 @@ fun activity(ctx: Ctx, jobId: String?): List<ActivityItem> = ctx.db.read {
             buildList {
                 while (rs.next()) {
                     val kind = rs.getString("kind")
-                    val reason = rs.getString("cant_reason")
+                    val reason = rs.getString("reason")
                     val detail = if (kind == "point.cantShoot" && reason != null) {
-                        val text = rs.getString("cant_text")
+                        val text = rs.getString("text")
                         if (text.isNullOrBlank()) reason else "$reason: $text"
                     } else ""
                     add(ActivityItem(rs.getLong("at"), rs.getString("display_name") ?: "", kind, rs.getString("label"), detail))

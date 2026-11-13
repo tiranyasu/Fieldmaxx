@@ -29,6 +29,8 @@ internal class OpFail(val code: String) : RuntimeException(code, null, false, fa
 internal class Applied(
     val point: Point?, val kind: String, val photo: PhotoInfo? = null,
     val afterCommit: (() -> Unit)? = null, val kickDelivery: Boolean = false,
+    /** Extra string fields for the event's data_json (the can't-shoot reason and text). */
+    val eventExtra: Map<String, String> = emptyMap(),
 )
 
 /**
@@ -63,7 +65,7 @@ private fun applyOp(ctx: Ctx, user: User, op: Op): OpResult {
         if (a != null && jobId != null) {
             prepareStatement("INSERT INTO events(job_id, user_id, kind, data_json, at) VALUES (?,?,?,?,?)").use {
                 it.setString(1, jobId); it.setString(2, user.id); it.setString(3, a.kind)
-                it.setString(4, buildJsonObject { put("opId", op.opId); if (p != null) put("pointId", p.id); if (photo != null) put("photoId", photo.id) }.toString())
+                it.setString(4, buildJsonObject { put("opId", op.opId); if (p != null) put("pointId", p.id); if (photo != null) put("photoId", photo.id); a.eventExtra.forEach { (k, v) -> put(k, v) } }.toString())
                 it.setLong(5, now); it.executeUpdate()
             }
         }
@@ -154,7 +156,8 @@ private fun Connection.apply(ctx: Ctx, user: User, op: Op, now: Long): Applied {
             livePoint(op.pointId)
             val text = op.text?.trim()?.ifEmpty { null }
             if (op.reason == CantShootReason.other && text == null) throw OpFail("needs_text")
-            touch(op.pointId, user, now, "point.cantShoot", "status" to "cant_shoot", "cant_reason" to op.reason.name, "cant_text" to text)
+            val done = touch(op.pointId, user, now, "point.cantShoot", "status" to "cant_shoot", "cant_reason" to op.reason.name, "cant_text" to text)
+            Applied(done.point, done.kind, eventExtra = buildMap { put("reason", op.reason.name); text?.let { put("text", it) } })
         }
         is Op.PointReopen -> {
             livePoint(op.pointId)
