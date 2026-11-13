@@ -1,7 +1,7 @@
 # Fieldmaxx: Field Survey App (design)
 
 Date: 2026-11-13
-Status: draft, awaiting owner approval
+Status: approved by owner 2026-11-13 (with changes: creators can delete their jobs; techs can delete points before upload and move points anywhere)
 
 ## 1. Intent and why
 
@@ -217,8 +217,14 @@ server if it ever shows up, or ask for .docx; not required in v1.)
 the check screen → paste the **Field Notes link** → save. Job name defaults to the first
 PDF's file name (`A05J9XE.pdf` → `A05J9XE`), editable. More PDFs (e.g. a query
 PDF that arrives later) can be added to an existing job through the same check
-screen. Any signed-in user can create a job or add PDFs; only admins can delete
-a job (owner's call to confirm; Cadastrus let techs create projects).
+screen. Any signed-in user can create a job or add files.
+
+**Deleting a job** ("accidents happen"): the tech who created the job, or
+an admin, can delete it. It asks for confirmation and shows what's in the
+job; if any photos haven't reached OneDrive yet it warns that they'll stay
+undelivered. Deletion is a soft delete: the job disappears for everyone
+but an admin can restore it for 30 days, after which it's purged. Photos
+already in OneDrive are untouched (the app can't delete there).
 
 **Where the importer reads text from** (all of them, then de-duplicates):
 - PDF:
@@ -314,8 +320,11 @@ Layout follows Cadastrus:
 
 ### 6.4 Point screen (bottom sheet on tapping a marker)
 - Header: point name; **Navigate** (opens Google Maps directions to the
-  point); **Move point** (drag marker to the true location; the original
-  coordinates are kept and the move is recorded with who/when); close.
+  point); **Move point**: any tech can drag the marker anywhere, any time
+  (imported or added points, open or closed). Confirm/cancel after the drag,
+  and an "Undo move" right after. The original coordinates are kept and the
+  move is recorded with who/when; the crew sees the new position live;
+  close.
 - Instructions for the type (e.g. POLE: "Photograph the pole and the carrier
   equipment on it.") and the point's description from the PDF.
 - **GPS accuracy** badge from the phone's reported accuracy ("GPS ±12 ft";
@@ -350,6 +359,15 @@ images, VACANT LOT, UTILITIES, Aerial Fielding, F3 BUILDING DATA) → name.
 For POLE the name is suggested from the nearest existing pole number plus the
 next free letter (`POLE_14B`), editable. Added points behave like imported
 ones and are marked "added by <tech>". Menu → "Points I added" lists them.
+
+### 6.5a Deleting points
+Any tech can delete a point (imported or added) **as long as none of its
+photos has been uploaded** (no photo has reached the server). Photos still
+only on the phone are discarded with it, after a warning. Once a photo has
+been uploaded, only an admin can delete the point. Deletes are soft: the
+point disappears for everyone, is listed in the job's activity with
+who/when, and an admin can restore it. Folders already created in OneDrive
+are left alone.
 
 ### 6.6 Photos and delivery to OneDrive (the reliability core)
 **On the phone:**
@@ -506,8 +524,8 @@ above 80%.
 
 ### 6.9 Admin
 - **Users**: create, reset password, disable, promote.
-- **Jobs**: all jobs with progress, crew, created/finished dates; archive and
-  delete.
+- **Jobs**: all jobs with progress, crew, created/finished dates; archive,
+  delete, and restore deleted jobs (30 days) and deleted points.
 - **Delivery health**: every photo not yet confirmed across the crew, stuck
   ones first, with reasons and retry.
 - **Activity**: who shot which point and when; "Can't shoot" list.
@@ -588,11 +606,14 @@ screens.
   `POLE/POLE_33` in Field Notes.
 - Upload test approved against the A05J9XE Field Notes link.
 - Stamps required on the images: time, coordinates, compass, point name.
+- The tech who created a job can delete it (as can an admin).
+- Techs can delete a point before any of its photos is uploaded, and can
+  drag/move any point anywhere.
 
 **My calls (owner may override):**
 - v1 scope and the deferred list in §3.
 - Point can only be "Done" with ≥1 photo; otherwise "Can't shoot" + reason.
-- Any user can create jobs; only admins delete.
+- Any user can create jobs. Deletes of jobs and points are soft (admin can restore).
 - Point folder lookup: reuse an existing folder in any common naming style
   before creating `<Category>/<TYPE>_<ID>`; photo file names match
   Cadastrus's pattern.
