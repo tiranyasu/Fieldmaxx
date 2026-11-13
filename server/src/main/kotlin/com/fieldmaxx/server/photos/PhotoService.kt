@@ -17,7 +17,10 @@ import com.fieldmaxx.core.naming.photoFileName
 import com.fieldmaxx.server.Ctx
 import com.fieldmaxx.server.HttpError
 import com.fieldmaxx.server.jobs.path
+import com.fieldmaxx.server.jobs.toJob
 import com.fieldmaxx.server.jobs.toPhoto
+import com.fieldmaxx.server.delivery.FORBIDDEN_PROBLEM
+import com.fieldmaxx.server.delivery.SIGN_IN_PROBLEM
 import com.fieldmaxx.server.ops.Applied
 import com.fieldmaxx.server.ops.OpFail
 import com.fieldmaxx.server.ops.applyOps
@@ -271,7 +274,8 @@ internal fun Connection.applyPhotoOp(ctx: Ctx, user: User, op: Op, now: Long): A
                 "UPDATE photos SET status = ?, dest_path = ?, upload_ms = ?, confirmed_at = ?, last_error = NULL, next_attempt_at = NULL WHERE id = ?",
                 status, op.destPath, op.uploadMs, now, op.photoId,
             )
-            Applied(null, "photo.confirmed", photo = photoInfo(op.photoId))
+            val jobChange = clearLinkProblem(ctx, row.jobId)
+            Applied(null, "photo.confirmed", photo = photoInfo(op.photoId), afterCommit = jobChange?.let { { ctx.changes.publish(it) } })
         }
     }
     is Op.PhotoFailed -> {
@@ -284,6 +288,19 @@ internal fun Connection.applyPhotoOp(ctx: Ctx, user: User, op: Op, now: Long): A
         }
     }
     else -> error("not a photo op: $op")
+}
+
+/**
+ * A photo got through to OneDrive, so the job's link works: clear a sign-in / no-uploads banner (in the caller's
+ * transaction) and return the job change to publish after commit. "Add the Field Notes link" stays until one is added.
+ */
+private fun Connection.clearLinkProblem(ctx: Ctx, jobId: String): Change? {
+    val n = prepareStatement("UPDATE jobs SET delivery_problem = NULL WHERE id = ? AND delivery_problem IN (?, ?)").use { ps ->
+        ps.setString(1, jobId); ps.setString(2, SIGN_IN_PROBLEM); ps.setString(3, FORBIDDEN_PROBLEM); ps.executeUpdate()
+    }
+    if (n == 0) return null
+    val job = prepareStatement("SELECT * FROM jobs WHERE id = ?").use { ps -> ps.setString(1, jobId); ps.executeQuery().use { it.next(); it.toJob() } }
+    return ctx.changes.recordInTx(this, jobId, "job", jobId, job = job)
 }
 
 private fun Connection.ownedPhoto(photoId: String, user: User): PhotoRow {

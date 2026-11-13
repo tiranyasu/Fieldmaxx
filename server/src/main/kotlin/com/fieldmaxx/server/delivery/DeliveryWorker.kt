@@ -5,6 +5,7 @@ import com.fieldmaxx.core.model.PhotoStatus
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
 import com.fieldmaxx.core.naming.PointKey
+import com.fieldmaxx.core.retry.MAX_RETRY_DELAY_MS
 import com.fieldmaxx.core.retry.nextDelayMs
 import com.fieldmaxx.server.Ctx
 import com.fieldmaxx.server.DeliveryKick
@@ -87,8 +88,6 @@ private const val TARGET_SELECT =
     "SELECT ph.*, pt.layer, pt.type, pt.num, pt.label, pt.folder_path, pt.deleted_at AS pt_deleted, " +
         "j.field_notes_url, j.deleted_at AS job_deleted FROM photos ph JOIN points pt ON pt.id = ph.point_id JOIN jobs j ON j.id = ph.job_id "
 
-private class Due(val id: String, val jobId: String, val hasLink: Boolean)
-
 /**
  * Delivers to OneDrive the photos the server holds that the phones haven't: a phone photo whose server copy arrived
  * [TAKEOVER_AFTER_MS] ago without a confirmation, and every reuse copy at once. Uses the phone's rules: the point's
@@ -145,19 +144,20 @@ class DeliveryWorker internal constructor(
     /** One round: delivers every due photo not already being delivered and waits for them. Returns how many were attempted. */
     fun runOnce(): Int {
         if (stopped) return 0
-        val due = ctx.db.read { due(ctx.clock.millis()) }
-        due.filter { !it.hasLink }.map { it.jobId }.distinct().forEach { setJobProblem(it, NO_LINK_PROBLEM) }
-        val futures = due.filter { it.hasLink && inFlight.add(it.id) }.mapNotNull { d ->
+        val now = ctx.clock.millis()
+        ctx.db.read { jobsWaitingForLink(now) }.forEach { setJobProblem(it, NO_LINK_PROBLEM) }
+        val due = ctx.db.read { due(now) }
+        val futures = due.filter { inFlight.add(it) }.mapNotNull { id ->
             try {
                 pool.submit<Outcome> {
                     try {
-                        if (stopped) Outcome.SKIPPED else deliver(d.id)
+                        if (stopped) Outcome.SKIPPED else deliver(id)
                     } finally {
-                        inFlight.remove(d.id)
+                        inFlight.remove(id)
                     }
                 }
             } catch (_: RejectedExecutionException) {
-                inFlight.remove(d.id)
+                inFlight.remove(id)
                 null
             }
         }
@@ -171,21 +171,37 @@ class DeliveryWorker internal constructor(
         Outcome.FAILED
     }
 
-    private fun Connection.due(now: Long): List<Due> =
-        prepareStatement(
-            "SELECT ph.id, ph.job_id, j.field_notes_url FROM photos ph JOIN points pt ON pt.id = ph.point_id JOIN jobs j ON j.id = ph.job_id " +
-                "WHERE ph.status IN ('registered', 'stuck') AND ph.confirmed_at IS NULL AND j.deleted_at IS NULL AND pt.deleted_at IS NULL " +
-                "AND (ph.next_attempt_at IS NULL OR ph.next_attempt_at <= ?) " +
-                "AND (ph.reused_from IS NOT NULL OR (ph.backup_path IS NOT NULL AND ph.backup_purged_at IS NULL AND ph.backup_received_at <= ?)) " +
-                // A point with several candidate folders waits until someone picks one.
-                "AND NOT (pt.folder_path IS NULL AND pt.folder_candidates_json IS NOT NULL) " +
-                "ORDER BY ph.reused_from IS NULL, COALESCE(ph.next_attempt_at, 0), ph.created_at, ph.rowid LIMIT $BATCH",
-        ).use { ps ->
-            ps.setLong(1, now); ps.setLong(2, now - TAKEOVER_AFTER_MS)
-            ps.executeQuery().use { rs ->
-                buildList { while (rs.next()) add(Due(rs.getString(1), rs.getString(2), !rs.getString(3).isNullOrBlank())) }
-            }
-        }
+    /**
+     * Photos that could be attempted now, apart from their job's link. Only photos that can actually be attempted are
+     * due, so a backlog that has to wait (no link, a reuse of a photo not in OneDrive yet, a folder to pick) never
+     * fills the batch and starves the rest.
+     */
+    private fun dueSql(select: String, linkCondition: String) =
+        "SELECT $select FROM photos ph JOIN points pt ON pt.id = ph.point_id JOIN jobs j ON j.id = ph.job_id " +
+            "LEFT JOIN photos o ON o.id = ph.reused_from " +
+            "WHERE ph.status IN ('registered', 'stuck') AND ph.confirmed_at IS NULL AND j.deleted_at IS NULL AND pt.deleted_at IS NULL " +
+            "AND (ph.next_attempt_at IS NULL OR ph.next_attempt_at <= ?) " +
+            "AND ((ph.reused_from IS NULL AND ph.backup_path IS NOT NULL AND ph.backup_purged_at IS NULL AND ph.backup_received_at <= ?) " +
+            // A reuse copy: its original has a server copy or is in OneDrive (or is gone, which fails visibly).
+            "OR (ph.reused_from IS NOT NULL AND (o.id IS NULL OR (o.backup_path IS NOT NULL AND o.backup_purged_at IS NULL) " +
+            "OR (o.confirmed_at IS NOT NULL AND o.dest_path IS NOT NULL)))) " +
+            // A point with several candidate folders waits until someone picks one.
+            "AND NOT (pt.folder_path IS NULL AND pt.folder_candidates_json IS NOT NULL) AND $linkCondition"
+
+    private fun Connection.ids(sql: String, now: Long): List<String> = prepareStatement(sql).use { ps ->
+        ps.setLong(1, now); ps.setLong(2, now - TAKEOVER_AFTER_MS)
+        ps.executeQuery().use { rs -> buildList { while (rs.next()) add(rs.getString(1)) } }
+    }
+
+    private fun Connection.due(now: Long): List<String> = ids(
+        dueSql("ph.id", "j.field_notes_url IS NOT NULL AND TRIM(j.field_notes_url) != ''") +
+            " ORDER BY ph.reused_from IS NULL, COALESCE(ph.next_attempt_at, 0), ph.created_at, ph.rowid LIMIT $BATCH",
+        now,
+    )
+
+    /** Jobs with photos the server would deliver now if the job had a Field Notes link. */
+    private fun Connection.jobsWaitingForLink(now: Long): List<String> =
+        ids(dueSql("DISTINCT ph.job_id", "(j.field_notes_url IS NULL OR TRIM(j.field_notes_url) = '')"), now)
 
     private fun deliver(photoId: String): Outcome {
         val t = ctx.db.read { target(photoId) } ?: return Outcome.SKIPPED
@@ -235,7 +251,11 @@ class DeliveryWorker internal constructor(
         val (o, destPath, confirmed) = orig
         // The original's server copy when it still has one, else the original as delivered to its own job's Field Notes.
         usable(o.backupPath)?.let { return Source.Local(it) }
-        if (!confirmed || destPath == null) return null
+        if (!confirmed || destPath == null) {
+            // Listed as due because the original has a server copy, but its file is gone: fail (backoff), never spin.
+            if (o.backupPath != null) throw DeliveryFailure("The original photo's server copy is missing")
+            return null
+        }
         val url = o.url ?: throw DeliveryFailure("The original photo's job has no Field Notes link")
         return Source.Remote(url, destPath)
     }
@@ -415,10 +435,13 @@ class DeliveryWorker internal constructor(
             }
             if (row != null && !row.third && row.first != PhotoStatus.removed.name) {
                 val attempts = row.second + 1
-                val status = if (attempts >= STUCK_AFTER_ATTEMPTS) PhotoStatus.stuck else PhotoStatus.registered
+                val stuck = attempts >= STUCK_AFTER_ATTEMPTS
+                val status = if (stuck) PhotoStatus.stuck else PhotoStatus.registered
+                // A stuck photo is still retried, every 30 min.
+                val wait = if (stuck) MAX_RETRY_DELAY_MS else nextDelayMs(attempts)
                 prepareStatement("UPDATE photos SET status = ?, attempts = ?, last_error = ?, next_attempt_at = ? WHERE id = ?").use {
                     it.setString(1, status.name); it.setInt(2, attempts); it.setString(3, message)
-                    it.setLong(4, ctx.clock.millis() + nextDelayMs(attempts)); it.setString(5, t.id); it.executeUpdate()
+                    it.setLong(4, ctx.clock.millis() + wait); it.setString(5, t.id); it.executeUpdate()
                 }
                 out += ctx.changes.recordInTx(this, t.jobId, "photo", t.id, photo = photoInfo(t.id))
             }

@@ -8,6 +8,7 @@ import com.fieldmaxx.core.model.PhotoStatus
 import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
+import com.fieldmaxx.core.retry.MAX_RETRY_DELAY_MS
 import com.fieldmaxx.core.retry.nextDelayMs
 import com.fieldmaxx.server.delivery.DeliveryWorker
 import com.fieldmaxx.server.delivery.backupDays
@@ -414,13 +415,18 @@ class DeliveryTest {
             for (n in 1..6) {
                 assertEquals(1, w.runOnce())
                 assertEquals(if (n < 6) PhotoStatus.registered else PhotoStatus.stuck, photo(app, "ph-1").status)
-                app.clock.nowMs += nextDelayMs(n)
+                // Once stuck, retried every 30 min.
+                val wait = if (n < 6) nextDelayMs(n) else MAX_RETRY_DELAY_MS
+                assertEquals(app.clock.nowMs + wait, col(app, "ph-1", "next_attempt_at"))
+                app.clock.nowMs += wait
             }
             // Stuck photos are still retried.
             assertEquals(1, w.runOnce())
             assertEquals(PhotoStatus.stuck, photo(app, "ph-1").status)
             assertEquals(7L, col(app, "ph-1", "attempts"))
-            assertEquals(0, w.runOnce()) // not due for another 16 min
+            assertEquals(app.clock.nowMs + MAX_RETRY_DELAY_MS, col(app, "ph-1", "next_attempt_at"))
+            app.clock.nowMs += MAX_RETRY_DELAY_MS - 1
+            assertEquals(0, w.runOnce()) // not due for another millisecond
 
             assertEquals(HttpStatusCode.Forbidden, assertFailsWith<HttpError> { retryPhoto(app.ctx, ann, "ph-1") }.status)
             retryPhoto(app.ctx, boss, "ph-1")
@@ -532,6 +538,55 @@ class DeliveryTest {
         }
         assertEquals(PhotoStatus.confirmed, photo(app, "ph-1").status)
         assertNull(job(app, "job-3").deliveryProblem)
+    }
+
+    @Test fun noLinkBacklogDoesNotStarveOtherJobs() = withApp { app, fake, _ ->
+        repeat(201) { backedUp(app, "nl-$it", jpeg(it, 16, 16), pointId = "pt-3", jobId = "job-3") }
+        backedUp(app, "ph-1", jpeg())
+        app.clock.nowMs += TAKEOVER
+        app.worker { w -> assertEquals(1, w.runOnce()) }
+        assertEquals(PhotoStatus.confirmed, photo(app, "ph-1").status)
+        assertEquals("Add the Field Notes link", job(app, "job-3").deliveryProblem)
+        assertEquals(1, fake.files.size)
+    }
+
+    @Test fun waitingReuseBacklogDoesNotStarveOtherPhotos() = withApp { app, _, _ ->
+        register(app, "ph-src", jpeg(), pointId = "pt-2", jobId = "job-2") // not in OneDrive, no server copy
+        repeat(201) { op(app, Op.PhotoReuse("op-r$it", "copy-$it", "ph-src", "pt-1")) }
+        backedUp(app, "ph-1", jpeg(2), pointId = "pt-2", jobId = "job-2")
+        app.clock.nowMs += TAKEOVER
+        app.worker { w -> assertEquals(1, w.runOnce()) }
+        assertEquals(PhotoStatus.confirmed, photo(app, "ph-1").status)
+        assertEquals(0L, col(app, "copy-0", "attempts"))
+    }
+
+    @Test fun reuseWhoseOriginalCopyVanishedFailsInsteadOfWaiting() = withApp { app, _, _ ->
+        backedUp(app, "ph-src", jpeg(), pointId = "pt-2", jobId = "job-2")
+        op(app, Op.PhotoReuse("op-r", "ph-copy", "ph-src", "pt-1"))
+        Files.delete(backupFile(app, "ph-src"))
+        app.worker { w -> assertEquals(1, w.runOnce()) }
+        assertEquals(1L, col(app, "ph-copy", "attempts"))
+        assertNotNull(photo(app, "ph-copy").lastError)
+    }
+
+    @Test fun phoneConfirmationClearsForbiddenBanner() = withApp { app, fake, _ ->
+        backedUp(app, "ph-1", jpeg())
+        val other = register(app, "ph-2", jpeg(2))
+        app.clock.nowMs += TAKEOVER
+        fake.failNext(1, DestinationErrorCode.FORBIDDEN)
+        app.worker { w -> assertEquals(1, w.runOnce()) }
+        assertEquals("The link no longer allows uploads", job(app, "job-1").deliveryProblem)
+
+        // A phone gets a photo through: the link works again.
+        op(app, Op.PhotoConfirmed("op-c", "ph-2", "POLE/POLE_1/$other", 900))
+        assertNull(job(app, "job-1").deliveryProblem)
+        assertNull(changes(app, "job", "job-1").last().job?.deliveryProblem)
+
+        // "Add the Field Notes link" is only cleared by adding one.
+        app.ctx.db.tx { createStatement().use { it.execute("UPDATE jobs SET delivery_problem = 'Add the Field Notes link' WHERE id = 'job-3'") } }
+        val p3 = register(app, "ph-3", jpeg(3), pointId = "pt-3", jobId = "job-3")
+        op(app, Op.PhotoConfirmed("op-c3", "ph-3", "POLE/POLE_2/$p3", 900))
+        assertEquals("Add the Field Notes link", job(app, "job-3").deliveryProblem)
     }
 
     @Test fun deletedJobOrPointIsNotDelivered() = withApp { app, fake, _ ->
