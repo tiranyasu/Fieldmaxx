@@ -431,8 +431,11 @@ uploads. Fieldmaxx must be fast at both hops:
   connection resumes instead of restarting; 2–3 photos in parallel.
 - **Smaller files, same picture**: by default the phone re-saves the photo
   at full resolution as a high-quality JPEG (roughly half the size of the
-  camera original), copying the EXIF/GPS data across. An admin setting
-  switches to sending camera originals untouched.
+  camera original, JPEG quality 0.85), copying the EXIF/GPS data across.
+  An admin setting switches to **Maximum** (JPEG quality 0.95, larger
+  files). Untouched camera originals aren't possible because the stamp
+  must be drawn onto the image. Images above 16 megapixels are scaled down
+  to 16 MP (the iPhone browser's canvas limit).
 - **Server → OneDrive**: the delivery worker starts on each photo as soon
   as it's received (no batching), runs several uploads in parallel, and
   streams from disk. Folder lookups/creations are cached per job so each
@@ -621,7 +624,7 @@ screens.
   EXIF or the phone's compass when the photo returns; native camera (not an
   in-app camera) in v1.
 - Photos re-saved at full resolution, high-quality JPEG, EXIF kept (about
-  half the size) by default; admin can switch to untouched originals. No
+  half the size) by default; admin can switch to Maximum quality. No
   per-tech quality picker.
 - Reference pages = rendered PDF pages linked to each point.
 - Pole data exported as xlsx/csv and written to Field Notes on finish.
