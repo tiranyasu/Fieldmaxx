@@ -7,3 +7,4 @@ keystore.properties
 importer/src/test/resources/private/
 data/
 .superpowers/
+.kotlin/
