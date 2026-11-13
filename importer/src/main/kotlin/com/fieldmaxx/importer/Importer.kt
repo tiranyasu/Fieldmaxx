@@ -34,82 +34,128 @@ private class Collector {
     val notes = LinkedHashSet<String>()
 
     /** A leftover line is unread when it looks like a point or a coordinate; otherwise it is a note. */
+    private fun reasonFor(t: String) = when {
+        TYPE_AND_NUMBER.containsMatchIn(t) -> "type and number without readable coordinates"
+        COORD_LOOKING.containsMatchIn(t) -> "number that looks like a coordinate"
+        else -> null
+    }
+
+    fun isUnreadable(line: String) = reasonFor(line.trim()) != null
+
     fun leftover(line: String, page: Int?) {
         val t = line.trim()
         if (t.isEmpty()) return
-        val reason = when {
-            TYPE_AND_NUMBER.containsMatchIn(t) -> "type and number without readable coordinates"
-            COORD_LOOKING.containsMatchIn(t) -> "number that looks like a coordinate"
-            else -> null
-        }
+        val reason = reasonFor(t)
         if (reason == null) notes.add(t) else if (unread.none { it.text == t && it.sourcePage == page }) unread.add(UnreadLine(t, page, reason))
     }
 }
 
 private fun isNumbered(p: ParaBlock) = p.listLabel != null || TYPED_NUMBER.containsMatchIn(p.text)
 
-private fun hasCoords(text: String) = findCoordinatePairs(normalizeText(text)).isNotEmpty()
+private fun pairCount(text: String) = findCoordinatePairs(normalizeText(text)).size
 
-/** A numbered paragraph that carries coordinates, or is followed by a coordinate paragraph, marks a query file. */
+/** True when [text] is nothing but coordinate pairs (hemisphere letters N/S/E/W and separators allowed). */
+private fun isCoordinateOnly(text: String): Boolean {
+    val t = normalizeText(text)
+    val pairs = findCoordinatePairs(t)
+    if (pairs.isEmpty()) return false
+    val sb = StringBuilder(t)
+    pairs.sortedByDescending { it.start }.forEach { sb.delete(it.start, it.end) }
+    return sb.none { it.isLetter() && it.uppercaseChar() !in "NSEW" }
+}
+
+/**
+ * A numbered paragraph that carries a coordinate pair, or is directly followed by a coordinate-only
+ * paragraph, marks a query file. Numbered notes before an unnumbered point list do not.
+ */
 private fun isQueryGroup(blocks: List<DocBlock>): Boolean {
     val paras = blocks.filterIsInstance<ParaBlock>()
     return paras.withIndex().any { (i, p) ->
-        isNumbered(p) && (hasCoords(p.text) || paras.getOrNull(i + 1)?.let { hasCoords(it.text) } == true)
+        isNumbered(p) && (pairCount(p.text) > 0 || paras.getOrNull(i + 1)?.let { isCoordinateOnly(it.text) } == true)
     }
 }
 
-private val SPLIT_PAIR_END = Regex(""",\s*-?\s*$""")
 private val NUMBER_START = Regex("""^\s*-?\s*\d""")
 private val LETTER_LABEL = Regex("""^\s*([A-Za-z])\s*[-–.)]\s*(\S.*)$""")
 
-/**
- * Repairs what a PDF's line wrapping does to a query list: a coordinate pair broken across two lines is
- * re-joined, and a bare `A- 39.3,-119.8` line gets its letter back as a list label.
- */
-private fun repairBlocks(blocks: List<DocBlock>): List<DocBlock> {
+/** Normalizes every paragraph and re-joins a coordinate pair that line wrapping broke across two paragraphs. */
+private fun prepare(blocks: List<DocBlock>): List<DocBlock> {
     val joined = ArrayList<DocBlock>()
-    for (b in blocks) {
+    for (raw in blocks) {
+        val b = if (raw is ParaBlock) raw.copy(text = normalizeText(raw.text)) else raw
         val prev = joined.lastOrNull()
-        if (b is ParaBlock && prev is ParaBlock && b.listLabel == null && SPLIT_PAIR_END.containsMatchIn(prev.text) && NUMBER_START.containsMatchIn(b.text)) {
-            joined[joined.lastIndex] = prev.copy(text = prev.text.trimEnd() + b.text.trimStart())
-        } else {
-            joined.add(b)
+        if (b is ParaBlock && prev is ParaBlock && b.listLabel == null && NUMBER_START.containsMatchIn(b.text)) {
+            val both = prev.text.trimEnd() + b.text.trimStart()
+            if (pairCount(both) > pairCount(prev.text) + pairCount(b.text)) {
+                joined[joined.lastIndex] = prev.copy(text = both)
+                continue
+            }
         }
+        joined.add(b)
     }
-    return joined.map { b ->
-        if (b !is ParaBlock || b.listLabel != null) return@map b
-        val m = LETTER_LABEL.find(b.text) ?: return@map b
-        val rest = m.groupValues[2]
-        val coords = findCoordinatePairs(normalizeText(rest))
-        val onlyCoords = coords.isNotEmpty() && normalizeText(rest).let { t ->
-            val sb = StringBuilder(t)
-            coords.sortedByDescending { it.start }.forEach { sb.delete(it.start, it.end) }
-            sb.none { ch -> ch.isLetter() }
-        }
-        if (onlyCoords) b.copy(text = rest, listLabel = m.groupValues[1].uppercase() + "-") else b
-    }
+    return joined
 }
 
+/** Turns a bare `A- 39.3,-119.8` line (a lettered sub-item) into a paragraph with list label `A-`. */
+private fun restoreLetterLabels(blocks: List<DocBlock>): List<DocBlock> = blocks.map { b ->
+    if (b !is ParaBlock || b.listLabel != null) return@map b
+    val m = LETTER_LABEL.find(b.text) ?: return@map b
+    val rest = m.groupValues[2]
+    if (isCoordinateOnly(rest) && rest.none { it.isLetter() }) b.copy(text = rest, listLabel = m.groupValues[1].uppercase() + "-") else b
+}
+
+private val UNREADABLE_FIELD = Regex(""": unreadable$""")
+
 private fun processGroup(source: GroupSource, page: Int?, rawBlocks: List<DocBlock>, queryLayer: String, out: Collector) {
-    val blocks = repairBlocks(rawBlocks)
-    val text = normalizeText(blocks.filterIsInstance<ParaBlock>().joinToString("\n") { it.text })
+    var blocks = prepare(rawBlocks)
+    if (source == GroupSource.FIELD) {
+        val (bad, good) = blocks.partition { it is ParaBlock && UNREADABLE_FIELD.containsMatchIn(it.text) }
+        bad.filterIsInstance<ParaBlock>().forEach { out.unread += UnreadLine(it.text, it.page ?: page, "form field could not be read") }
+        blocks = good
+    }
+    val text = blocks.filterIsInstance<ParaBlock>().joinToString("\n") { it.text }
     if (findCoordinatePairs(text).isEmpty()) {
         text.lines().forEach { out.leftover(it, page) }
         return
     }
     if (isQueryGroup(blocks)) {
-        val q = extractQueryItems(blocks, queryLayer)
+        val labelled = restoreLetterLabels(blocks)
+        val q = extractQueryItems(labelled, queryLayer)
         out.points += q.points
-        val pageOf = blocks.filterIsInstance<ParaBlock>().associate { it.text.trim() to it.page }
+        val pageOf = labelled.filterIsInstance<ParaBlock>().associate { it.text.trim() to it.page }
         q.notes.forEach { out.leftover(it, pageOf[it] ?: page) }
         return
     }
     val r = extractLabelledPoints(TextGroup(source, page, text))
-    out.points += r.points
+    // A line a point swallowed as its description that looks like an unreadable point goes to unread instead.
+    for (p in r.points) {
+        val keep = ArrayList<String>()
+        for (line in p.description.lines()) if (out.isUnreadable(line)) out.leftover(line, page) else keep.add(line)
+        out.points += p.copy(description = keep.joinToString("\n").trim())
+    }
     for (c in r.unlabelled) {
         out.strays += Stray(c.lat, c.lon, page, if (c.swapped) listOf(ImportFlag.unlabelled, ImportFlag.swapped) else listOf(ImportFlag.unlabelled), text.substring(c.start, c.end))
     }
     r.leftoverText.lines().forEach { out.leftover(it, page) }
+}
+
+/** Page-text groups that are each a query list and are consecutive are read as one list (an item can span a page break). */
+private fun processPdfGroups(groups: List<PdfGroup>, queryLayer: String, out: Collector) {
+    val runOf = HashMap<PdfGroup, List<PdfGroup>>()
+    var run = ArrayList<PdfGroup>()
+    fun close() { if (run.size > 1) run.forEach { runOf[it] = run }; run = ArrayList() }
+    for (g in groups.filter { it.source == GroupSource.PAGE_TEXT }) {
+        if (isQueryGroup(prepare(g.blocks))) run.add(g) else close()
+    }
+    close()
+    val done = HashSet<PdfGroup>()
+    for (g in groups) {
+        val r = runOf[g]
+        when {
+            r == null -> processGroup(g.source, g.page, g.blocks, queryLayer, out)
+            done.add(r.first()) -> processGroup(GroupSource.PAGE_TEXT, r.first().page, r.flatMap { it.blocks }, queryLayer, out)
+        }
+    }
 }
 
 private fun same(a: Double?, b: Double?) = (a == null && b == null) || (a != null && b != null && abs(a - b) < SAME_COORD)
@@ -124,33 +170,28 @@ private fun dedupe(points: List<DraftPoint>): List<DraftPoint> {
     return out
 }
 
-fun importFile(fileName: String, bytes: ByteArray): ImportResult {
-    val kind = when (fileName.substringAfterLast('.', "").lowercase()) {
-        "pdf" -> "pdf"
-        "docx" -> "docx"
+fun importFile(fileName: String, bytes: ByteArray): ImportResult =
+    when (fileName.substringAfterLast('.', "").lowercase()) {
+        "pdf" -> importPdfExtract(fileName, pdfToGroups(bytes))
+        "docx" -> importDocxExtract(fileName, docxToBlocks(bytes))
         else -> throw ImportException("unsupported_type", "Only PDF and Word (.docx) files")
     }
-    val queryLayer = layerFromFileName(fileName)
+
+internal fun importPdfExtract(fileName: String, x: PdfExtract): ImportResult {
     val out = Collector()
-    val images = ArrayList<ExtractedImage>()
-    val refs = ArrayList<RefImageInfo>()
+    processPdfGroups(x.groups, layerFromFileName(fileName), out)
+    val refs = x.pageRenders.map { RefImageInfo(it.id, "page", it.id.removePrefix("page-").toIntOrNull()) } +
+        x.images.map { RefImageInfo(it.id, "item", it.id.split('-').getOrNull(1)?.toIntOrNull()) }
+    return finish(fileName, "pdf", out, x.pageRenders + x.images, refs)
+}
 
-    if (kind == "pdf") {
-        val x = pdfToGroups(bytes)
-        // A query list runs on across pages (an item and its coordinates can be split by a page break), so read it as one.
-        val pageText = x.groups.filter { it.source == GroupSource.PAGE_TEXT }
-        val merged = pageText.flatMap { it.blocks }
-        val oneQuery = pageText.size > 1 && isQueryGroup(repairBlocks(merged))
-        if (oneQuery) processGroup(GroupSource.PAGE_TEXT, pageText.first().page, merged, queryLayer, out)
-        for (g in x.groups) if (!(oneQuery && g.source == GroupSource.PAGE_TEXT)) processGroup(g.source, g.page, g.blocks, queryLayer, out)
-        x.pageRenders.forEach { images += it; refs += RefImageInfo(it.id, "page", it.id.removePrefix("page-").toIntOrNull()) }
-        x.images.forEach { images += it; refs += RefImageInfo(it.id, "item", it.id.split('-').getOrNull(1)?.toIntOrNull()) }
-    } else {
-        val x = docxToBlocks(bytes)
-        processGroup(GroupSource.DOCX, null, x.blocks, queryLayer, out)
-        x.images.forEach { images += it; refs += RefImageInfo(it.id, "item", null) }
-    }
+private fun importDocxExtract(fileName: String, x: DocxExtract): ImportResult {
+    val out = Collector()
+    processGroup(GroupSource.DOCX, null, x.blocks, layerFromFileName(fileName), out)
+    return finish(fileName, "docx", out, x.images, x.images.map { RefImageInfo(it.id, "item", null) })
+}
 
+private fun finish(fileName: String, kind: String, out: Collector, images: List<ExtractedImage>, refs: List<RefImageInfo>): ImportResult {
     var points = out.points.toList()
     if (kind == "pdf") {
         points = points.map { p ->
@@ -170,7 +211,7 @@ fun importFile(fileName: String, bytes: ByteArray): ImportResult {
         )
     }
     val all = addSanityFlags(dedupe(points) + strayPoints)
-    val layer = all.filter { ImportFlag.unlabelled !in it.flags }.groupingBy { it.layer }.eachCount().maxByOrNull { it.value }?.key ?: queryLayer
+    val layer = all.filter { ImportFlag.unlabelled !in it.flags }.groupingBy { it.layer }.eachCount().maxByOrNull { it.value }?.key ?: layerFromFileName(fileName)
     return ImportResult(fileName, kind, layer, out.notes.joinToString("\n"), all, out.unread, images, refs)
 }
 

@@ -93,6 +93,105 @@ class ImporterTest {
         assertTrue(r.points.none { ImportFlag.duplicate_label in it.flags })
     }
 
+    private fun page(vararg texts: String) = PdfPageSpec(lines = texts.mapIndexed { i, t -> Triple(t, 40f, 740f - i * 20f) })
+
+    private fun pdfLines(vararg pages: PdfPageSpec) = makePdf(pages.toList())
+
+    // Fix round 1, finding 1: a bad line in the middle of a labelled list is reported, not swallowed.
+    @Test fun unreadableLineInMiddleOfListIsReported() {
+        val r = importFile("job.pdf", annotationPdf("POLE 1 = 39.6361,-119.6912\rPOLE 2 = 39.63,abc\rPOLE 3 = 39.6370,-119.6920"))
+        assertEquals(listOf("POLE 1", "POLE 3"), r.points.map { it.label })
+        assertEquals("", r.points[0].description)
+        assertEquals("POLE 2 = 39.63,abc", r.unread.single().text)
+    }
+
+    @Test fun outOfRangeLineInMiddleOfListIsReported() {
+        val r = importFile("job.pdf", annotationPdf("POLE 1 = 39.6361,-119.6912\rPOLE 2 = 95.123456,-199.123456\rPOLE 3 = 39.6370,-119.6920"))
+        assertEquals(listOf("POLE 1", "POLE 3"), r.points.map { it.label })
+        assertEquals("POLE 2 = 95.123456,-199.123456", r.unread.single().text)
+    }
+
+    @Test fun badPointOnSameLineAsGoodOnesIsReported() {
+        val r = importFile("job.pdf", annotationPdf("POLE 1 = 39.6361,-119.6912 POLE 2 = 39.63,abc POLE 3 = 39.6370,-119.6920"))
+        assertEquals(listOf("POLE 1", "POLE 3"), r.points.map { it.label })
+        assertEquals(1, r.unread.size)
+        assertTrue("POLE 2" in r.unread[0].text)
+    }
+
+    // Finding 2: line-wrap repair.
+    @Test fun splitCoordinatePairIsJoined() {
+        val r = importFile("QUERY_1_-X.pdf", pdfLines(page("1. VERIFY HH 39.3553123, -", "119.8128123", "2. VERIFY PED 39.3560123, -119.8200123")))
+        assertEquals(listOf("Query 1-1", "Query 1-2"), r.points.map { it.label })
+        assertEquals(39.3553123, r.points[0].lat!!, 1e-9)
+        assertEquals(-119.8128123, r.points[0].lon!!, 1e-9)
+        assertTrue(r.unread.isEmpty())
+    }
+
+    @Test fun lineEndingInCommaDoesNotSwallowNextItem() {
+        val r = importFile("QUERY_1_-X.pdf", pdfLines(page("1. Check poles 12, 13,", "2. Go to pole 5", "39.3553,-119.8128", "3. Next item")))
+        val two = r.points.single { it.label == "Query 1-2" }
+        assertEquals(39.3553, two.lat!!, 1e-9)
+        assertTrue(ImportFlag.no_coordinates in r.points.single { it.label == "Query 1-1" }.flags)
+    }
+
+    @Test fun letterLabelledLinesBecomeLetteredItems() {
+        val r = importFile("QUERY_1_-X.pdf", pdfLines(page("24. CHECK 39.3553055,-119.8159072", "25. POLE DATA", "A- 39.3548480,-119.8126657", "B- 39.3540205,-119.8126599")))
+        assertEquals(listOf("Query 1-24", "Query 1-25A", "Query 1-25B"), r.points.map { it.label })
+    }
+
+    @Test fun letterLineInsideLabelledListDoesNotFlipMode() {
+        val r = importFile("job.pdf", annotationPdf("POLE 1 = 39.6361,-119.6912\rB- 39.6400,-119.7000\rPOLE 3 = 39.6370,-119.6920"))
+        assertEquals(listOf("POLE 1", "POLE 3"), r.points.filter { ImportFlag.unlabelled !in it.flags }.map { it.label })
+        assertEquals(1, r.points.count { ImportFlag.unlabelled in it.flags })
+    }
+
+    // Finding 3: normalization happens in query mode too.
+    @Test fun queryModeNormalizesMinusSign() {
+        val r = importFile("QUERY_1_-X.docx", makeDocx(emptyList(), listOf(DocxItem.Para("1. Verify HH"), DocxItem.Para("39.3553,\u2212119.8128"))))
+        val p = r.points.single()
+        assertEquals(-119.8128, p.lon!!, 1e-9)
+        assertTrue(p.flags.none { it == ImportFlag.no_coordinates })
+        assertTrue(r.unread.isEmpty())
+    }
+
+    // Finding 4.
+    @Test fun unreadableFormFieldIsUnread() {
+        val x = PdfExtract(listOf(PdfGroup(GroupSource.FIELD, 2, listOf(ParaBlock("Pole 4: unreadable", null, 2)))), emptyList(), emptyList())
+        val r = importPdfExtract("job.pdf", x)
+        val u = r.unread.single()
+        assertEquals("Pole 4: unreadable", u.text)
+        assertEquals(2, u.sourcePage)
+        assertEquals("form field could not be read", u.reason)
+        assertEquals("", r.notes)
+    }
+
+    // Finding 5 and 6: query-mode trigger and cross-page merge.
+    @Test fun numberedNotesBeforePoleListStayLabelled() {
+        val r = importFile("A05J9XE.pdf", annotationPdf("NOTE\r1. IDENTIFY POLES.\r2. PLEASE MARK THE POLES.\rPOLE 1 = 39.6361,-119.6912\rPOLE 2 = 39.6370,-119.6920"))
+        assertEquals(listOf("POLE 1", "POLE 2"), r.points.map { it.label })
+        assertTrue("IDENTIFY POLES" in r.notes)
+    }
+
+    @Test fun queryListContinuesAcrossPages() {
+        val r = importFile(
+            "QUERY_1_-X.pdf",
+            pdfLines(page("1. VERIFY HH 39.3553123,-119.8128123", "2. PROVIDE POLE DATA"), page("39.3560123,-119.8200123", "3. CHECK 39.3570123,-119.8210123")),
+        )
+        assertEquals(listOf("Query 1-1", "Query 1-2", "Query 1-3"), r.points.map { it.label })
+        assertEquals(39.3560123, r.points[1].lat!!, 1e-9)
+    }
+
+    @Test fun numberedNoteOnOnePageDoesNotMakeWholeFileQuery() {
+        val r = importFile("job.pdf", pdfLines(page("1. IDENTIFY POLES.", "POLE 1 = 39.6361,-119.6912"), page("POLE 2 = 39.6370,-119.6920")))
+        assertEquals(listOf("POLE 1", "POLE 2"), r.points.map { it.label })
+    }
+
+    @Test fun strayCoordinateEqualToExistingPointIsNotDoubled() {
+        val bytes = makePdf(listOf(PdfPageSpec(lines = listOf(Triple("39.6361,-119.6912", 40f, 700f)), freeText = listOf("POLE 1 = 39.6361,-119.6912"))))
+        val r = importFile("job.pdf", bytes)
+        assertEquals(listOf("POLE 1"), r.points.map { it.label })
+    }
+
     @Test fun unsupportedType() {
         val e = assertFailsWith<ImportException> { importFile("job.xlsx", byteArrayOf(1)) }
         assertEquals("unsupported_type", e.code)
