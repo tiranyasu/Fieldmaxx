@@ -45,9 +45,7 @@ fun Route.syncRoutes(ctx: Ctx) {
             close(CloseReason(WS_UNAUTHORIZED.toShort(), "Sign in required"))
             return@webSocket
         }
-        // Register before reading the head: a change is then covered by the hello seq or delivered by broadcast.
-        ctx.hub.add(this, user)
-        ctx.hub.sendTo(this, ServerMessage.Hello(ctx.changes.headSeq()))
+        ctx.hub.add(this, user) { ServerMessage.Hello(ctx.changes.headSeq()) }
         for (frame in incoming) {
             if (frame !is Frame.Text) continue
             try {

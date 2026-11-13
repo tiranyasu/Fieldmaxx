@@ -1,6 +1,7 @@
 package com.fieldmaxx.server
 
 import com.fieldmaxx.core.FmxJson
+import com.fieldmaxx.core.model.Change
 import com.fieldmaxx.core.model.ClientMessage
 import com.fieldmaxx.core.model.ServerMessage
 import com.fieldmaxx.core.model.User
@@ -139,6 +140,24 @@ class SyncTest {
         assertEquals(0, listPositions(app.ctx).size)
     }
 
+    /** Records a change just before every head read, i.e. exactly while a socket is being registered. */
+    private class RecordingHead(private val inner: ChangeRecorder, private val onHead: () -> Unit) : ChangeRecorder by inner {
+        override fun headSeq(): Long { onHead(); return inner.headSeq() }
+    }
+
+    @Test fun helloIsAlwaysTheFirstFrame() = TestApp(fileDb = true).run { app ->
+        val token = tokenFor("ann")
+        val real = app.ctx.changes
+        var injected: Change? = null
+        app.ctx.changes = RecordingHead(real) { if (injected == null) injected = real.record("j1", "point", "injected") }
+        val c = createClient { install(WebSockets) }
+        c.webSocket("/api/ws?token=$token") {
+            val hello = assertIs<ServerMessage.Hello>(next())
+            assertTrue(injected!!.seq <= hello.seq, "change committed before the head read is covered by Hello")
+            close()
+        }
+    }
+
     @Test fun changeBetweenConnectAndHelloIsNotMissed() = TestApp(fileDb = true).run { app ->
         val token = tokenFor("ann")
         val c = createClient { install(WebSockets) }
@@ -146,17 +165,11 @@ class SyncTest {
             repeat(30) { app.ctx.changes.record("j1", "point", "p$it"); kotlinx.coroutines.delay(1) }
         }
         c.webSocket("/api/ws?token=$token") {
-            var hello = -1L
+            val hello = assertIs<ServerMessage.Hello>(next())
             val seen = mutableSetOf<Long>()
-            while (seen.size < 30 || hello < 0) {
-                when (val m = next()) {
-                    is ServerMessage.Hello -> hello = m.seq
-                    is ServerMessage.ChangeMsg -> seen += m.change.seq
-                    else -> {}
-                }
-                if (hello >= 0 && (1..30L).all { it <= hello || it in seen }) break
+            while (!(1..30L).all { it <= hello.seq || it in seen }) {
+                seen += assertIs<ServerMessage.ChangeMsg>(next()).change.seq
             }
-            assertTrue((1..30L).all { it <= hello || it in seen })
             close()
         }
         recorder.join()

@@ -23,9 +23,19 @@ class Hub {
 
     val size: Int get() = clients.size
 
-    fun add(session: DefaultWebSocketServerSession, user: User) {
+    private val lock = Any()
+
+    /**
+     * Registers the client. Under the same lock that [broadcast] uses, [hello] is built (it reads the head seq) and queued
+     * first, and only then is the client published. So Hello is always the first frame, and every change is either covered
+     * by Hello's seq or delivered by a later broadcast (a duplicate is harmless).
+     */
+    fun add(session: DefaultWebSocketServerSession, user: User, hello: () -> ServerMessage) {
         val client = Client(user)
-        clients[session] = client
+        synchronized(lock) {
+            client.outbox.trySend(FmxJson.encodeToString(ServerMessage.serializer(), hello()))
+            clients[session] = client
+        }
         val writer = session.launch(start = CoroutineStart.UNDISPATCHED) {
             try {
                 for (text in client.outbox) session.outgoing.send(Frame.Text(text))
@@ -40,12 +50,7 @@ class Hub {
 
     fun broadcast(msg: ServerMessage) {
         val text = FmxJson.encodeToString(ServerMessage.serializer(), msg)
-        for (c in clients.values) c.outbox.trySend(text)
-    }
-
-    /** Queues [msg] for one client only (ordered with broadcasts). */
-    fun sendTo(session: DefaultWebSocketServerSession, msg: ServerMessage) {
-        clients[session]?.outbox?.trySend(FmxJson.encodeToString(ServerMessage.serializer(), msg))
+        synchronized(lock) { for (c in clients.values) c.outbox.trySend(text) }
     }
 
     /** Closes every live socket of [userId] with 4401 (account disabled or password reset). */
