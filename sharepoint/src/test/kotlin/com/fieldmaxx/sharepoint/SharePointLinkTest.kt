@@ -107,7 +107,23 @@ class SharePointLinkTest {
             mock.calls.filter { "/folders/AddUsingPath" in it.path }.map { it.path },
         )
         d.ensureFolder("QUERY 1/Query_1-43") // existing folders are fine
-        assertEquals(listOf("mkdir QUERY 1 200", "mkdir QUERY 1/Query_1-43 200"), mock.log.filter { it.startsWith("mkdir") }.distinct())
+        assertEquals(
+            listOf("mkdir QUERY 1 200", "mkdir QUERY 1/Query_1-43 200", "mkdir QUERY 1 400", "mkdir QUERY 1/Query_1-43 400"),
+            mock.log.filter { it.startsWith("mkdir") },
+        )
+    }
+
+    @Test
+    fun ensureFolderAcceptsAlreadyExists() {
+        mock.folders += "$BUSINESS_ROOT/POLE"
+        business().ensureFolder("POLE/POLE_33") // a new point folder under an existing category
+        assertEquals(listOf("mkdir POLE 400", "mkdir POLE/POLE_33 200"), mock.log.filter { it.startsWith("mkdir") })
+        assertTrue("$BUSINESS_ROOT/POLE/POLE_33" in mock.folders)
+
+        mock.log.clear()
+        mock.existingFolderAnswers200 = true
+        business().ensureFolder("POLE/POLE_33")
+        assertEquals(listOf("mkdir POLE 200", "mkdir POLE/POLE_33 200"), mock.log.filter { it.startsWith("mkdir") })
     }
 
     @Test
@@ -174,7 +190,7 @@ class SharePointLinkTest {
         val f = tmpFile(9_000_000)
         val progress = mutableListOf<ChunkSession>()
         d.uploadChunked("POLE/p.jpg", f, CHUNK, null) { progress += it }
-        assertEquals(listOf(3_200_000L, 6_400_000L, 9_000_000L), progress.map { it.offset })
+        assertEquals(listOf(0L, 3_200_000L, 6_400_000L, 9_000_000L), progress.map { it.offset })
         assertEquals(1, progress.map { it.uploadId }.distinct().size)
         assertEquals(
             listOf(
@@ -208,7 +224,7 @@ class SharePointLinkTest {
             listOf("continue POLE/p.jpg @3200000 3200000 200", "finish POLE/p.jpg @6400000 2600000 200"),
             mock.log.filter { "p.jpg" in it },
         )
-        assertEquals(listOf(3_200_000L, 6_400_000L, 9_000_000L), progress.map { it.offset })
+        assertEquals(listOf(0L, 3_200_000L, 6_400_000L, 9_000_000L), progress.map { it.offset })
         assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/POLE/p.jpg"])
     }
 
@@ -227,6 +243,7 @@ class SharePointLinkTest {
         assertEquals(
             listOf(
                 "continue POLE/p.jpg @3200000 3200000 400",
+                "info POLE/p.jpg 200", // the partial file is not complete: restart it
                 "start POLE/p.jpg 3200000 200",
                 "continue POLE/p.jpg @3200000 3200000 200",
                 "finish POLE/p.jpg @6400000 2600000 200",
@@ -236,6 +253,53 @@ class SharePointLinkTest {
         assertEquals(listOf(3_200_000L, 6_400_000L, 9_000_000L), progress.map { it.offset })
         assertEquals(1, progress.map { it.uploadId }.distinct().size)
         assertNotEquals(last!!.uploadId, progress.first().uploadId)
+        assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/POLE/p.jpg"])
+    }
+
+    @Test
+    fun firstChunkDroppedResumesSameFile() {
+        business().ensureFolder("POLE")
+        val f = tmpFile(9_000_000)
+        val progress = mutableListOf<ChunkSession>()
+        mock.dropOnChunk(1) // the StartUpload with the first 3.2 MB
+        assertEquals(DestinationErrorCode.NETWORK, failure { business().uploadChunked("POLE/p.jpg", f, CHUNK, null) { progress += it } }.code)
+        assertEquals(1, progress.size)
+        assertEquals(0L, progress.single().offset, "a recovery point exists before the first chunk")
+
+        mock.log.clear()
+        business().uploadChunked("POLE/p.jpg", f, CHUNK, progress.single()) { progress += it }
+        assertEquals(
+            listOf(
+                "start POLE/p.jpg 3200000 200",
+                "continue POLE/p.jpg @3200000 3200000 200",
+                "finish POLE/p.jpg @6400000 2600000 200",
+            ),
+            mock.log.filter { "p.jpg" in it },
+        )
+        assertEquals(1, progress.map { it.uploadId }.distinct().size, "the same session id, no new file")
+        assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/POLE/p.jpg"])
+    }
+
+    @Test
+    fun finishedUploadIsNeverRewritten() {
+        business().ensureFolder("POLE")
+        val f = tmpFile(9_000_000)
+        var last: ChunkSession? = null
+        mock.loseAnswerOnChunk(3) // FinishUpload is applied, its answer never arrives
+        assertEquals(DestinationErrorCode.NETWORK, failure { business().uploadChunked("POLE/p.jpg", f, CHUNK, null) { last = it } }.code)
+        assertEquals(6_400_000L, last!!.offset)
+        assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/POLE/p.jpg"])
+
+        mock.log.clear()
+        val progress = mutableListOf<ChunkSession>()
+        business().uploadChunked("POLE/p.jpg", f, CHUNK, last) { progress += it }
+        assertEquals(listOf("finish POLE/p.jpg @6400000 2600000 400", "info POLE/p.jpg 200"), mock.log.filter { "p.jpg" in it })
+        assertEquals(emptyList(), progress)
+
+        // A resume at the full length (the last progress of a finished upload) is done too.
+        mock.log.clear()
+        business().uploadChunked("POLE/p.jpg", f, CHUNK, ChunkSession(last!!.uploadId, f.length())) {}
+        assertEquals(listOf("finish POLE/p.jpg @9000000 0 400", "info POLE/p.jpg 200"), mock.log.filter { "p.jpg" in it })
         assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/POLE/p.jpg"])
     }
 

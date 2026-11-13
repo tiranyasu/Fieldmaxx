@@ -16,7 +16,7 @@ java {
 
 dependencies {
     api(project(":core"))
-    implementation(libs.okhttp)
+    api(libs.okhttp) // OkHttpClient is part of the public API
     testImplementation(libs.okhttp.mockwebserver)
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)

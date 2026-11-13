@@ -73,14 +73,17 @@ class SharePointLinkDestination(
             r.json().field("value").jsonArray.map { it.jsonObject.field("Name").jsonPrimitive.content }.sorted()
         }
 
-    /** Creates each missing segment; SharePoint answers 200 for a folder that already exists. */
+    /** Creates each missing segment; a folder that already exists is fine (200, or a 400 "already exists"). */
     override fun ensureFolder(relPath: String) {
         var path = ""
         for (part in relPath.split('/').filter { it.isNotEmpty() }) {
             path = if (path.isEmpty()) part else "$path/$part"
             val current = path
             api(EMPTY_BODY, { "${it.site}/_api/web/folders/AddUsingPath(decodedurl='${spPathLiteral(it.path(current))}',overwrite=false)" }) { r ->
-                if (!r.isSuccessful) throw failure(r, current)
+                if (r.isSuccessful) return@api
+                val text = r.text()
+                if (r.code == 400 && text.contains("already exists", ignoreCase = true)) return@api
+                throw failure(r.code, text, current)
             }
         }
     }
@@ -98,10 +101,12 @@ class SharePointLinkDestination(
 
     /**
      * A file that fits in one chunk goes up in one request (no session, no progress). Otherwise, with no [resume]:
-     * create the empty file (EXISTS if the name is taken), then StartUpload / ContinueUpload / FinishUpload,
-     * reporting the confirmed offset after each chunk. With [resume]: carry on from its offset; if SharePoint has
-     * lost that session, restart the same (own, partial) file under a new upload id. UPLOAD_SESSION_LOST means the
-     * session was lost and not restarted in this call: retry later with the last reported [ChunkSession].
+     * create the empty file (EXISTS if the name is taken) and report `ChunkSession(id, 0)` at once, so a retry
+     * resumes this file instead of meeting it as EXISTS; then StartUpload / ContinueUpload / FinishUpload, reporting
+     * the confirmed offset after each chunk. With [resume]: carry on from its offset; if SharePoint has lost that
+     * session, the file is done when it already has the full size (a FinishUpload whose answer was lost), else the
+     * same (own, partial) file is restarted under a new upload id. UPLOAD_SESSION_LOST means the session was lost and
+     * not restarted in this call: retry later with the last reported [ChunkSession].
      */
     override fun uploadChunked(relPath: String, file: File, chunkBytes: Int, resume: ChunkSession?, onProgress: (ChunkSession) -> Unit) {
         require(chunkBytes > 0) { "chunkBytes must be positive" }
@@ -111,12 +116,15 @@ class SharePointLinkDestination(
                 resume == null && chunks.length <= chunkBytes -> create(relPath, chunks.read(0, chunks.length))
                 resume == null -> {
                     create(relPath, ByteArray(0))
-                    sendChunks(relPath, chunks, newUploadId(), 0, onProgress)
+                    val uploadId = newUploadId()
+                    onProgress(ChunkSession(uploadId, 0))
+                    sendChunks(relPath, chunks, uploadId, 0, onProgress)
                 }
                 else -> try {
                     sendChunks(relPath, chunks, resume.uploadId, resume.offset.coerceIn(0, chunks.length), onProgress)
                 } catch (e: DestinationException) {
                     if (e.code != DestinationErrorCode.UPLOAD_SESSION_LOST) throw e
+                    if (fileInfo(relPath)?.size == chunks.length) return // complete already: never rewrite it
                     sendChunks(relPath, chunks, newUploadId(), 0, onProgress)
                 }
             }

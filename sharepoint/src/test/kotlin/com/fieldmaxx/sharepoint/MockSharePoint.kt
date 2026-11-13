@@ -68,11 +68,19 @@ class MockSharePoint : Closeable {
     /** Every request's connection is dropped. */
     @Volatile var offline = false
 
+    /**
+     * `folders/AddUsingPath` on an existing folder: 400 "already exists" (seen live on the personal test link,
+     * 2026-11-13), or 200 when true (the business-link spike's note).
+     */
+    @Volatile var existingFolderAnswers200 = false
+
     private val lock = Any()
     private var cookie: String? = null
     private var cookiesIssued = 0
     private var chunkCalls = 0
     private var dropAt: Int? = null
+    private var loseAnswerAt: Int? = null
+    private var loseAnswer = false
     private val uploads = mutableMapOf<String, Upload>()
 
     private class Upload(val path: String, val data: ByteArrayOutputStream = ByteArrayOutputStream())
@@ -89,9 +97,18 @@ class MockSharePoint : Closeable {
     /** Drop the connection on the [n]th chunk request (Start/Continue/FinishUpload) from now; the chunk is not stored. */
     fun dropOnChunk(n: Int) = synchronized(lock) { dropAt = chunkCalls + n }
 
+    /** On the [n]th chunk request from now, store the chunk, then drop the connection before answering. */
+    fun loseAnswerOnChunk(n: Int) = synchronized(lock) { loseAnswerAt = chunkCalls + n }
+
     init {
         server.dispatcher = object : Dispatcher() {
-            override fun dispatch(request: RecordedRequest): MockResponse = synchronized(lock) { handle(request) }
+            override fun dispatch(request: RecordedRequest): MockResponse = synchronized(lock) {
+                val response = handle(request)
+                if (!loseAnswer) return@synchronized response
+                loseAnswer = false
+                log += "answer lost"
+                MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AFTER_REQUEST)
+            }
         }
         server.start()
     }
@@ -184,6 +201,10 @@ class MockSharePoint : Closeable {
             if (method != "POST") return status(405, "POST only")
             if (!inside(p)) return error(403, "-2147024891, System.UnauthorizedAccessException", "Access denied.")
             if (p.substringBeforeLast('/') !in folders) return notFound("mkdir ${rel(p)}")
+            if (p in folders && !existingFolderAnswers200) {
+                log += "mkdir ${rel(p)} 400"
+                return error(400, "-2130575257, Microsoft.SharePoint.SPException", "A file or folder with the name ${p.removePrefix("/")} already exists.")
+            }
             folders += p
             log += "mkdir ${rel(p)} 200"
             return json(buildJsonObject { put("Name", p.substringAfterLast('/')); put("ServerRelativeUrl", p) }.toString())
@@ -255,6 +276,10 @@ class MockSharePoint : Closeable {
 
     private fun dropChunk(): Boolean {
         chunkCalls++
+        if (loseAnswerAt == chunkCalls) {
+            loseAnswerAt = null
+            loseAnswer = true
+        }
         if (dropAt != chunkCalls) return false
         dropAt = null
         return true
