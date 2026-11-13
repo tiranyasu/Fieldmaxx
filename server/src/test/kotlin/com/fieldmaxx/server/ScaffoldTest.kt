@@ -5,6 +5,7 @@ import io.ktor.client.statement.bodyAsText
 import java.nio.file.Paths
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class ScaffoldTest {
@@ -59,5 +60,45 @@ class ScaffoldTest {
         assertEquals(90, c.sessionDays)
         val o = loadConfig(mapOf("PORT" to "9000", "FMX_DESTINATION" to "fake", "FMX_BUILD_ID" to "x", "FMX_DATA_DIR" to "/d", "FMX_PUBLIC_ORIGIN" to "https://f"))
         assertEquals(9000, o.port); assertEquals("fake", o.destination); assertEquals("https://f", o.publicOrigin)
+    }
+
+    private fun fileDb() = Db("jdbc:sqlite:${java.nio.file.Files.createTempDirectory("fmx-db").resolve("t.db")}")
+
+    @Test fun txRollsBackOnException() {
+        val db = fileDb()
+        try {
+            val ex = assertFailsWith<IllegalStateException> {
+                db.tx {
+                    createStatement().use { it.execute("INSERT INTO settings(key, value) VALUES ('k','v')") }
+                    throw IllegalStateException("boom")
+                }
+            }
+            assertEquals("boom", ex.message)
+            val n = db.read { createStatement().use { it.executeQuery("SELECT COUNT(*) FROM settings").use { rs -> rs.next(); rs.getInt(1) } } }
+            assertEquals(0, n)
+        } finally { db.close() }
+    }
+
+    @Test fun concurrentWriteTransactionsBothCommit() {
+        val db = fileDb()
+        try {
+            db.tx { createStatement().use { it.execute("INSERT INTO counters(name, value) VALUES ('c', 0)") } }
+            val errors = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
+            val threads = (1..8).map {
+                Thread {
+                    try {
+                        db.tx {
+                            val v = createStatement().use { st -> st.executeQuery("SELECT value FROM counters WHERE name='c'").use { rs -> rs.next(); rs.getInt(1) } }
+                            Thread.sleep(10)
+                            prepareStatement("UPDATE counters SET value = ? WHERE name='c'").use { ps -> ps.setInt(1, v + 1); ps.executeUpdate() }
+                        }
+                    } catch (e: Throwable) { errors.add(e) }
+                }.also { it.start() }
+            }
+            threads.forEach { it.join() }
+            assertTrue(errors.isEmpty(), "errors: $errors")
+            val v = db.read { createStatement().use { it.executeQuery("SELECT value FROM counters WHERE name='c'").use { rs -> rs.next(); rs.getInt(1) } } }
+            assertEquals(8, v)
+        } finally { db.close() }
     }
 }

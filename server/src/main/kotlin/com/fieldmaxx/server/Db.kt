@@ -24,14 +24,15 @@ class Db(private val url: String) : AutoCloseable {
         return c
     }
 
+    /** Write transaction: BEGIN IMMEDIATE takes the write lock up front, so busy_timeout applies and read-then-write can't hit SQLITE_BUSY_SNAPSHOT. */
     fun <T> tx(block: Connection.() -> T): T = open().use { c ->
-        c.autoCommit = false
+        c.createStatement().use { it.execute("BEGIN IMMEDIATE") }
         try {
             val r = c.block()
-            c.commit()
+            c.createStatement().use { it.execute("COMMIT") }
             r
         } catch (e: Throwable) {
-            runCatching { c.rollback() }
+            runCatching { c.createStatement().use { it.execute("ROLLBACK") } }
             throw e
         }
     }
