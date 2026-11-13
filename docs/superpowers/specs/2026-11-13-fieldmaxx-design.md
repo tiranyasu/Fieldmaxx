@@ -41,7 +41,7 @@ The admin also works from a laptop browser at times.
 ## 3. Goals, non-goals, anti-goals
 
 ### Goals (first version)
-1. **Reliable PDF import** of pole and query PDFs, with a check screen that
+1. **Reliable import** of pole and query files (PDF and Word .docx), with a check screen that
    accounts for every point found and every line it couldn't read.
 2. **Map** with satellite imagery and all job points, type filters with
    progress, live crew positions.
@@ -115,11 +115,32 @@ So the frontend must be wrappable with Capacitor later (see §7.4).
 - Producer is iLovePDF (the designer edits/annotates PDFs there), so other job
   PDFs may differ in layout. The importer must be tolerant (§6.2).
 
-### 5.2 Query PDFs
-The owner says query PDFs look "like the pole one". No sample yet. Cadastrus
-shows query points named like `Query 1-43` with a description such as
-`ped data . 39.48878665,-119.84297250`, and a "Client query · reference" panel
-with reference pictures.
+### 5.2 Query files: Word (.docx) as well as PDF
+Queries arrive as **.docx** as well as PDF (owner, 2026-11-13). Sample:
+`QUERY_1_-_A05K51V.docx` (job A05K51V, query list 1). Cadastrus names query
+points `Query 1-43` (= query list 1, item 43) and shows the item text as the
+description, with a "Client query · reference" panel of reference pictures.
+
+Structure of the sample (this is the importer's second test fixture):
+- A **numbered list of instructions**, one item per point, each followed by
+  its **reference image(s)**: marked-up map/aerial screenshots (0, 1 or 2
+  images per item).
+- **The item numbers are mostly not in the text.** They come from Word's
+  automatic list numbering: list A numbers items 1–11; items 12 and 13 are
+  typed by hand ("12. NO STREET VIEW…", "13.. NO STREET VIEW…", note the
+  double dot); list B **starts at 14** (Word `start=14`) and numbers 14–25;
+  the last item ("POLE DATA", no. 25) is followed by two coordinates in a
+  separate lettered list (`A-`, `B-`), i.e. one item with two points.
+- Coordinates are either on the item's own line after an en dash
+  (`VERIFY HH – 39.35535679, -119.81288376`) or in the next paragraph on
+  their own (`39.3591087,-119.8173345`).
+- Expected import: **26 points** = items 1–24 (one each) + item 25 as
+  `25A` and `25B`, each with its instruction text and its images.
+- Layer name comes from the file name: `QUERY_1_-_A05K51V` → `QUERY 1`.
+
+A reader that ignores Word's list numbering, or only looks for coordinates
+on the same line as the text, would mis-number or drop points here. That
+matches the owner's complaint about Cadastrus.
 
 ### 5.3 OneDrive Field Notes folder (from owner's screenshots)
 ```
@@ -134,7 +155,44 @@ with reference pictures.
 ```
 Category folder casing is inconsistent (`QUERY 1` vs `Query 3`). SharePoint
 names are case-insensitive, so match existing folders case-insensitively and
-create missing ones.
+create missing ones. (The screenshot shows only "b" poles under `POLE/`
+because it's an old job; normally `POLE_1`, `POLE_10`… are there too.)
+
+### 5.5 What the upload spike found (2026-11-13, owner-approved test)
+Against the shared link for job **A05J9XE** (`…/OSP FIELDING/NEVADA/
+A05J9XE_Additional fielding/Field Notes`):
+- The link is an "anyone" link: opening it with no sign-in redirects and sets
+  a guest `FedAuth` cookie. With that cookie the SharePoint REST API works:
+  `POST /_api/contextinfo` (request digest), list folders/files,
+  `folders/AddUsingPath` (nested folder creation), `Files/AddUsingPath`
+  (upload), and file metadata read-back (verify size).
+- A 9.3 MB test JPEG uploaded in **2.3 s** (~32 Mbit/s) from a US cloud
+  container; read-back length matched.
+- The link's effective permissions are View/Add/Edit/Open but **not
+  Delete**: deleting or recycling a file or folder returns 403. So the app
+  can never clean up after itself in OneDrive. Uploads must be idempotent
+  (check for an existing file with the same name and size before uploading,
+  and treat a match as confirmed). The test folder
+  `_FIELDMAXX_TEST_DELETE_ME/POLE_99/POLE_99_TEST_1.jpg` had to be left
+  for a person with full access to delete.
+- The link can't see above the Field Notes folder (parent returns 403).
+- **Existing layout in this job**: Field Notes holds folders named just
+  `1` … `7` (one per pole, likely pre-created by the office), not
+  `POLE/POLE_1`. Files inside are named by Cadastrus as
+  `POLE_1_39.636130_-119.691104_6018.jpg` =
+  `<TYPE>_<ID>_<lat 6dp>_<lon 6dp>_<counter>.jpg`.
+- **Cadastrus photos**: 3000×4000 JPEG, 1.4–6.7 MB, **EXIF stripped**
+  (no GPS/time in the file). Visible stamp, bottom-left, white text with dark
+  shadow, four lines:
+  ```
+  A05J9XE · POLE 1
+  39.636130, -119.691104
+  ±16 ft · alt 4430 ft
+  11/05/26 13:35:47
+  ```
+  No compass line. The sample was stamped 13:35 local and created in
+  OneDrive at 14:12 local (~37 min later); that job's 17 photos all landed
+  within 21 s of each other.
 
 ### 5.4 Cadastrus UI (from 7 saved page snapshots)
 Dark UI (slate-900 `#0f172a` bars, blue `#2563eb` accents), Leaflet map, Esri
@@ -152,17 +210,39 @@ familiar layout so the crew doesn't have to relearn it.
 - First admin account is created by the setup script on the server.
 
 ### 6.2 Jobs and PDF import
-**Creating a job.** "+ New job" → drop or pick one or more PDFs → the check
-screen → paste the **Field Notes link** → save. Job name defaults to the first
+**Accepted files:** PDF and Word (.docx). (Old-style .doc: convert on the
+server if it ever shows up, or ask for .docx; not required in v1.)
+
+**Creating a job.** "+ New job" → drop or pick one or more PDF/DOCX files →
+the check screen → paste the **Field Notes link** → save. Job name defaults to the first
 PDF's file name (`A05J9XE.pdf` → `A05J9XE`), editable. More PDFs (e.g. a query
 PDF that arrives later) can be added to an existing job through the same check
 screen. Any signed-in user can create a job or add PDFs; only admins can delete
 a job (owner's call to confirm; Cadastrus let techs create projects).
 
 **Where the importer reads text from** (all of them, then de-duplicates):
-1. Annotation contents (FreeText, Text/sticky notes, etc.).
-2. Form field values (the sample has an AcroForm).
-3. The page text layer.
+- PDF:
+  1. Annotation contents (FreeText, Text/sticky notes, etc.).
+  2. Form field values (the sample has an AcroForm).
+  3. The page text layer.
+- DOCX: the body in document order (paragraphs and table cells), with:
+  - **Word list numbering rendered** the way Word shows it: per list,
+    its start value (e.g. 14), number format (decimal / upper letter) and
+    level text (`%1.`, `%1-`), counting per list and level;
+  - **typed-in numbers** at the start of a paragraph (`12.`, `13..`)
+    recognised as the item number;
+  - embedded images, in order.
+
+**Query lists (numbered items).** An item starts at a numbered paragraph
+(auto or typed number) that has text. Coordinates on its line or in the
+following coordinate-only paragraphs belong to it; images that follow (until
+the next item) are its **reference images**. One coordinate = one point
+labelled `<Layer>-<n>` (`Query 1-14`); several = one point each with letter
+suffixes (`Query 1-25A`, `Query 1-25B`, using Word's letters when it has
+them). The item text is the point's description. An item with no
+coordinates is flagged on the check screen ("no coordinates"), not dropped.
+A query PDF exported from the same kind of document is read the same way,
+using text and image positions on the page to keep reading order.
 
 **How it reads points.** Normalize text first: treat `\r`, `\n`, `\t` and runs
 of spaces as separators; re-join a number split after `-` or `,` across a line
@@ -198,11 +278,13 @@ the check screen, defaulting from the label (`Query 1-43` → `Query 1`).
 - The importer never fails the whole file because of one bad line. If the
   PDF itself can't be opened, it says so plainly and nothing is saved.
 
-**Reference pages.** Every PDF page is rendered to an image at import and kept
-with the job. Each point links to the page(s) its text came from. For query
-points this is shown as the **"Client query · reference"** panel; for poles it
-is the route screenshot. If the query PDF sample shows a clearer per-item
-image layout, attach the item's own image instead (see §9).
+**Reference images.** For query items, the item's own images (from the DOCX,
+or from the PDF by position) are attached to its point(s) and shown as the
+**"Client query · reference"** panel, tap to zoom. In addition, every PDF
+page is rendered to an image at import and kept with the job; each point
+links to the page(s) its text came from (for poles this is the route
+screenshot). Reference images are stored on our server with the job, so
+they don't vanish like Cadastrus's did.
 
 **Job info** shows the job notes, the source PDFs (downloadable), the Field
 Notes link, and the crew working it.
@@ -284,13 +366,30 @@ ones and are marked "added by <tech>". Menu → "Points I added" lists them.
 **On the server:**
 5. Stores the file on disk, records it in the database, replies "received",
    and puts it on a durable delivery queue.
-6. A delivery worker uploads it into the job's Field Notes folder:
-   `<Category>/<PointFolder>/<FileName>`, creating folders as needed
-   (category matched case-insensitively to an existing folder).
-   - Point folder: `<TYPE>_<ID>`, e.g. `POLE_18`, `MH_10`, `POLE_14B`. Query
-     point folder naming to be confirmed (§9).
-   - File name: `<PointFolder>_<YYYYMMDD-HHMMSS>_<n>.jpg` (to be confirmed, §9).
-   - Never overwrites; on a name clash it appends a suffix.
+6. A delivery worker uploads it into the job's Field Notes folder, choosing
+   the point's folder like this (owner: "if there's no pole 33 folder it goes
+   to poles in Field Notes and makes a POLE_33 folder"):
+   1. **Use an existing folder for the point if there is one.** The office
+      sometimes pre-creates them, in different styles. Search Field Notes and
+      its category folders (two levels deep) for a folder whose name is the
+      point's id in any common form, case-insensitive: `1`, `POLE_1`,
+      `POLE 1`, `Pole1`, `P1`; for added poles `14B`/`POLE_14b`; for queries
+      `43`, `Query 1-43`, `QUERY_1-43`. Prefer a match inside the point's
+      category folder over one at the top level.
+   2. **Otherwise create** `<Category>/<TYPE>_<ID>`, e.g. `POLE/POLE_33`,
+      `MH/MH_10`, `QUERY 1/Query_1-43`. The category folder is matched
+      case-insensitively to an existing one (`POLE`, `QUERY 1`) or created.
+   3. The folder chosen for each point is stored, shown on the point screen
+      ("→ Field Notes/1"), and reused for every later photo of that point.
+      If a match is ambiguous (two candidate folders), the point screen asks
+      the tech/admin to pick once.
+   - **File name** matches Cadastrus:
+     `<TYPE>_<ID>_<lat 6dp>_<lon 6dp>_<counter>.jpg`, with the phone's
+     coordinates at capture and a server-wide counter.
+   - Never overwrites; on a name clash it bumps the counter. Before
+     uploading, it checks for an existing file of the same name and size and
+     treats that as already delivered (the link can't delete, so retries
+     must not create duplicates).
 7. After uploading it **verifies** by reading the file back from OneDrive
    (exists, byte size matches). Only then is it marked **confirmed**.
 8. Failures retry with backoff. After repeated failure the photo is marked
@@ -334,9 +433,9 @@ unofficial, so it's isolated behind a `PhotoDestination` interface
 (`ensureFolder`, `upload`, `verify`) so an official Microsoft Graph
 implementation (approach 2) can replace it later. **First implementation
 task is a spike against a test folder** to prove upload + folder creation +
-verify works through an anyone-link before building on it. If the link turns
-out to be org-only (requires sign-in), escalate to the owner before
-proceeding.
+verify works through an anyone-link before building on it. **Done:** the
+spike succeeded (§5.5); the implementation should follow the calls proven
+there.
 
 The Field Notes link is checked when entered (can we list the folder?) and
 the job shows a red banner if delivery to it starts failing.
@@ -347,14 +446,35 @@ structure, ready to drag into OneDrive. Photos stay on the server until
 confirmed, so nothing is lost while the route is down. The rest of the app is
 built in parallel with the upload spike; only the OneDrive uploader waits on it.
 
-**Location in photos:** if a photo's EXIF has no GPS (common with gallery
-picks on Android 10+ and iPhone Safari), the app writes its own GPS fix and
-time into the EXIF of the upload copy. Visible stamping on the image is
-pending the owner's answer (§9).
+**Photo stamp (owner requirement: time stamp, coordinates, compass, point
+name burned into the image).** Done on the phone when the upload copy is
+made (§6.6 step 1 / Speed), at full resolution. Same look as Cadastrus
+(bottom-left, white text, dark shadow, sized relative to the image), plus a
+compass line:
+```
+A05J9XE · POLE 1
+39.636130, -119.691104
+±16 ft · alt 4430 ft
+NE 47°  (compass)
+11/05/26 13:35:47
+```
+- Coordinates, accuracy and altitude come from the phone's GPS at the moment
+  the photo comes back from the camera (the freshest fix ≤ 10 s old;
+  otherwise the stamp says "GPS stale"). Gallery picks use the photo's own
+  EXIF GPS/time if present; otherwise the stamp is marked "from gallery".
+- **Compass**: taken from the camera's EXIF image direction when the camera
+  app records it; otherwise from the phone's compass reading when the photo
+  returns to the app (the tech is normally still facing the subject).
+  iPhone needs a one-time compass permission, asked on first photo. If this
+  proves not accurate enough in the field, the fix is an in-app camera with
+  a live compass, which is also a natural part of the Android app later.
+- Unlike Cadastrus, the upload copy **keeps EXIF** (GPS, time, direction),
+  written from the app's own fix when the camera didn't provide it.
+- The stamp is also shown on the thumbnail so the tech can see it's right.
 
 **Deleting a photo:** a tech can delete a photo that hasn't reached OneDrive
-yet. Once delivered, it stays in OneDrive (remove it there by hand if
-needed); the app hides it from the point and records who removed it and
+yet. Once delivered, it stays in OneDrive (the share link has no delete
+permission, see §5.5; remove it there by hand if needed); the app hides it from the point and records who removed it and
 when, so a removed photo is never mistaken for a lost one.
 
 **Server disk:** server copies are deleted 7 days after confirmation. If the
@@ -452,7 +572,7 @@ screens.
 
 **Owner decided:**
 - Replace Cadastrus because it's unreliable; do it better.
-- Job input is PDFs (poles; queries "like the pole one").
+- Job input is PDFs (poles; queries) and Word .docx files (queries).
 - Photos go into the job's Field Notes folder via its share link, in
   category/point folders, done by the app itself.
 - Multiple techs at once; everyone sees everyone's GPS; admin (owner) hands
@@ -462,11 +582,23 @@ screens.
 - Approach 1 now, maybe an Android app later.
 - Uploads must be fast at both hops; the server must have good upload and
   download speed.
+- Everyone sees every job (no per-job assignment). "Crew" on a job = who
+  has worked on it.
+- Folders are created where needed: a pole 33 with no folder goes to
+  `POLE/POLE_33` in Field Notes.
+- Upload test approved against the A05J9XE Field Notes link.
+- Stamps required on the images: time, coordinates, compass, point name.
 
 **My calls (owner may override):**
 - v1 scope and the deferred list in §3.
 - Point can only be "Done" with ≥1 photo; otherwise "Can't shoot" + reason.
 - Any user can create jobs; only admins delete.
+- Point folder lookup: reuse an existing folder in any common naming style
+  before creating `<Category>/<TYPE>_<ID>`; photo file names match
+  Cadastrus's pattern.
+- Stamp layout copies Cadastrus's plus a compass line; compass from camera
+  EXIF or the phone's compass when the photo returns; native camera (not an
+  in-app camera) in v1.
 - Photos re-saved at full resolution, high-quality JPEG, EXIF kept (about
   half the size) by default; admin can switch to untouched originals. No
   per-tech quality picker.
@@ -490,25 +622,13 @@ screens.
 - English only.
 - Stack and hosting in §7.
 
-## 9. Open items (asked of the owner)
-- **Folder filing rule.** In the F2_A05K51V screenshot, `POLE/` holds only
-  the added "b" poles (`POLE_10B`, `POLE_14b`…); no `POLE_1`, `POLE_10`
-  etc., which would sort just before them. So the PDF's own poles were filed
-  somewhere else (maybe `Aerial Fielding/`). Need the rule for every point
-  type → category folder, whether categories like Street images get a
-  subfolder per point, the query point folder name, and photo file names.
-  All of it sits behind one naming function; must be settled before the
-  first real job.
-- **Test upload**: permission to create (and afterwards delete) a throwaway
-  test folder inside a real job's Field Notes folder, which is the only test
-  that proves the route under EES's real sharing rules. Also: does the owner
-  have their own EES Microsoft login (relevant only to approach 2 later)?
-- **Photo stamping**: does AT&T/EES need anything stamped visibly on the
-  photos (time, coordinates, point name)? Did Cadastrus's photos have it?
-- **Job assignment**: does the admin assign techs to jobs (techs see only
-  their jobs), or does everyone see every active job?
-- **Query PDF sample**: needed to confirm label format and how reference
-  images map to query items. Importer design already tolerates variation.
+## 9. Open items
+- A **query PDF** sample would be a useful extra test fixture (the DOCX
+  sample settles the format).
+- **Leftover test folder**: `_FIELDMAXX_TEST_DELETE_ME` in the A05J9XE Field
+  Notes folder must be deleted by someone with full access (the link can't).
+- Whether the owner has their own EES Microsoft login (only matters for
+  approach 2 later).
 - **House-number source**: builder's call (e.g. OpenStreetMap addresses for
   the visible area at high zoom); not essential to v1.
 
@@ -516,7 +636,9 @@ screens.
 Exact visual styling within the Cadastrus-like layout; library versions;
 database access layer; chunked-upload protocol details; marker colours per
 type; clustering thresholds; test strategy (must include: importer unit tests
-with the A05J9XE fixture expecting exactly 7 POLE points, the line-break and
-spacing variants, DMS, swapped and unparseable lines; an end-to-end test of
+with the A05J9XE PDF fixture expecting exactly 7 POLE points and the
+QUERY_1_-_A05K51V DOCX fixture expecting exactly 26 points numbered 1–24,
+25A, 25B with their images; the line-break and spacing variants, DMS,
+swapped and unparseable lines; an end-to-end test of
 photo capture → server → stub destination → confirmed; an offline/resume test
 for the photo queue).
