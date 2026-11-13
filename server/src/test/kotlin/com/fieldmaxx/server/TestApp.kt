@@ -32,6 +32,7 @@ class MutableClock(var nowMs: Long = 1_762_000_000_000) : Clock() {
 class TestApp(
     val clock: MutableClock = MutableClock(),
     val destination: FakeDestination = FakeDestination(),
+    fileDb: Boolean = false, // a real file avoids shared-cache table locks when a test drives parallel requests
 ) {
     val ctx: Ctx
 
@@ -40,7 +41,10 @@ class TestApp(
         dataDir.toFile().deleteOnExit()
         val config = Config(dataDir, 0, "http://localhost", 90, "fake", "test")
         // Db keeps one connection open for its lifetime, so the shared-cache in-memory DB survives.
-        val db = Db("jdbc:sqlite:file:test${counter.incrementAndGet()}?mode=memory&cache=shared")
+        val db = Db(
+            if (fileDb) "jdbc:sqlite:${dataDir.resolve("test.db")}"
+            else "jdbc:sqlite:file:test${counter.incrementAndGet()}?mode=memory&cache=shared",
+        )
         ctx = Ctx(config, db, clock, { _ -> destination }, NoopChangeRecorder, NoopDeliveryKick)
     }
 

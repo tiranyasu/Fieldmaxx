@@ -29,20 +29,23 @@ fun Route.authRoutes(ctx: Ctx) {
         val req = call.receive<LoginRequest>()
         val username = req.username.trim()
         val now = ctx.clock.millis()
-        val failures = ctx.db.read {
-            prepareStatement("SELECT COUNT(*) FROM login_failures WHERE username = ? AND at > ?").use { ps ->
-                ps.setString(1, username.lowercase()); ps.setLong(2, now - WINDOW_MS)
+        val key = username.lowercase()
+        // Reserve an attempt row before the slow verify, so parallel logins cannot all slip under the limit.
+        val locked = ctx.db.tx {
+            val recent = prepareStatement("SELECT COUNT(*) FROM login_failures WHERE username = ? AND at > ?").use { ps ->
+                ps.setString(1, key); ps.setLong(2, now - WINDOW_MS)
                 ps.executeQuery().use { it.next(); it.getInt(1) }
             }
+            if (recent >= MAX_FAILURES) true else {
+                prepareStatement("INSERT INTO login_failures(username, at) VALUES (?, ?)").use {
+                    it.setString(1, key); it.setLong(2, now); it.executeUpdate()
+                }
+                false
+            }
         }
-        if (failures >= MAX_FAILURES) throw HttpError(HttpStatusCode.TooManyRequests, "Too many attempts. Try again in 15 minutes.")
+        if (locked) throw HttpError(HttpStatusCode.TooManyRequests, "Too many attempts. Try again in 15 minutes.")
         val found = ctx.db.read { findWithHash(username) }
         if (found == null || !verifyPassword(found.second, req.password)) {
-            ctx.db.tx {
-                prepareStatement("INSERT INTO login_failures(username, at) VALUES (?, ?)").use {
-                    it.setString(1, username.lowercase()); it.setLong(2, now); it.executeUpdate()
-                }
-            }
             throw HttpError(HttpStatusCode.Unauthorized, WRONG)
         }
         val user = found.first

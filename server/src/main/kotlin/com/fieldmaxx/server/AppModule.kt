@@ -27,6 +27,7 @@ fun Application.fieldmaxx(ctx: Ctx) {
     install(ContentNegotiation) { json(FmxJson) }
     install(WebSockets)
     install(StatusPages) {
+        status(HttpStatusCode.Unauthorized) { call, _ -> call.respond(HttpStatusCode.Unauthorized, ErrorBody("Sign in required")) }
         exception<HttpError> { call, e -> call.respond(e.status, ErrorBody(e.message ?: e.status.description)) }
         exception<IllegalArgumentException> { call, e ->
             call.respond(HttpStatusCode.BadRequest, ErrorBody(e.message ?: "Bad request"))

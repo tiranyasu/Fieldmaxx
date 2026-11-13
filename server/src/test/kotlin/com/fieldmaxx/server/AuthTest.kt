@@ -20,6 +20,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.coroutines.async
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -109,6 +110,26 @@ class AuthTest {
         val token = tokenFor("maria")
         app.clock.nowMs += 91 * day
         assertEquals(HttpStatusCode.Unauthorized, client.me(token).status)
+    }
+
+    @Test fun unauthenticated401HasJsonError() = TestApp().run { _ ->
+        val none = client.get("/api/auth/me")
+        assertEquals(HttpStatusCode.Unauthorized, none.status)
+        assertEquals("Sign in required", none.obj().getValue("error").jsonPrimitive.content)
+        val bad = client.me("garbage-token")
+        assertEquals(HttpStatusCode.Unauthorized, bad.status)
+        assertEquals("Sign in required", bad.obj().getValue("error").jsonPrimitive.content)
+    }
+
+    @Test fun parallelLoginsCannotExceedLockout() = TestApp(fileDb = true).run { app ->
+        createUser(app.ctx, "maria", "Maria", "secret-pass-1", Role.tech)
+        val statuses = kotlinx.coroutines.coroutineScope { val scope = this
+            (1..20).map { scope.async(kotlinx.coroutines.Dispatchers.Default) { client.login("maria", "bad-bad-bad").status } }
+                .map { it.await() }
+        }
+        assertEquals(10, statuses.count { it == HttpStatusCode.Unauthorized })
+        assertEquals(10, statuses.count { it == HttpStatusCode.TooManyRequests })
+        assertEquals(HttpStatusCode.TooManyRequests, client.login("maria", "secret-pass-1").status)
     }
 
     @Test fun noTokenIs401AndLogoutEndsSession() = TestApp().run { _ ->
