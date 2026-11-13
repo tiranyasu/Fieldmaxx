@@ -1,7 +1,10 @@
 package com.fieldmaxx.server
 
 import com.fieldmaxx.core.FmxJson
+import com.fieldmaxx.server.admin.adminRoutes
 import com.fieldmaxx.server.auth.authRoutes
+import com.fieldmaxx.server.release.releaseApiRoutes
+import com.fieldmaxx.server.release.releasePublicRoutes
 import com.fieldmaxx.server.auth.installAuth
 import com.fieldmaxx.server.jobs.importRoutes
 import com.fieldmaxx.server.jobs.jobRoutes
@@ -56,7 +59,10 @@ fun Application.fieldmaxx(ctx: Ctx) {
             opsRoutes(ctx)
             photoRoutes(ctx)
             exportRoutes(ctx)
+            adminRoutes(ctx)
+            releaseApiRoutes(ctx)
             get("/version") { call.respond(VersionBody(ctx.config.buildId)) }
         }
+        releasePublicRoutes(ctx)
     }
 }
