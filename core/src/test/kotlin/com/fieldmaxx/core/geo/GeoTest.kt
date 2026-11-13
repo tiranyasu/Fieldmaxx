@@ -13,5 +13,10 @@ class GeoTest {
     @Test fun swapped() { val m = findCoordinatePairs("-119.69104,39.63609").single(); assertEquals(39.63609, m.lat); assertEquals(-119.69104, m.lon); assertTrue(m.swapped) }
     @Test fun rejects() { assertTrue(findCoordinatePairs("1.5, 2.5").isEmpty()); assertTrue(findCoordinatePairs("123.4567, 200.1234").isEmpty()) }
     @Test fun enDashAndOrder() { val ms = findCoordinatePairs("VERIFY HH – 39.35535679, -119.81288376 and 39.1234,-119.5678"); assertEquals(listOf(39.35535679, 39.1234), ms.map { it.lat }); assertEquals("VERIFY HH – ".length, ms[0].start) }
+    @Test fun unicodeMinusAndNbsp() {
+        assertEquals(-119.6912, findCoordinatePairs(normalizeText("39.6361 ,\u2212119.6912")).single().lon)
+        assertEquals(-119.6912, findCoordinatePairs(normalizeText("39.6361,\u00A0\u202F-119.6912")).single().lon)
+        assertEquals("A \u2013 B", normalizeText("A \u2013 B"))
+    }
     @Test fun distanceAndFeet() { assertEquals(85.7, distanceMeters(LatLon(39.636, -119.691), LatLon(39.636, -119.690)), 0.5); assertEquals(16.0, metersToFeet(4.877), 0.5) }
 }

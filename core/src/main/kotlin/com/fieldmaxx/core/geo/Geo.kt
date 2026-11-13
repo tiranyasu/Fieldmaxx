@@ -26,12 +26,14 @@ private const val FEET_PER_METER = 3.280839895
 private val MULTI_SPACE = Regex(" {2,}")
 
 /**
- * Cleans text extracted from PDFs/DOCX: unifies line breaks, turns tabs into spaces, collapses
+ * Cleans text extracted from PDFs/DOCX: maps U+2212 (minus sign) to `-` and non-breaking spaces
+ * (U+00A0, U+202F) to spaces (the en dash U+2013 is left alone: it is a separator), unifies line breaks, turns tabs into spaces, collapses
  * runs of spaces, trims each line, and re-joins a number split across lines (a line ending in
  * `-` or `,` followed by a line starting with a digit or `-`).
  */
 fun normalizeText(raw: String): String {
-    val lines = raw.replace("\r\n", "\n").replace('\r', '\n').replace('\t', ' ')
+    val lines = raw.replace('\u2212', '-').replace('\u00A0', ' ').replace('\u202F', ' ')
+        .replace("\r\n", "\n").replace('\r', '\n').replace('\t', ' ')
         .split('\n')
         .map { MULTI_SPACE.replace(it, " ").trim() }
     val out = ArrayList<String>()
