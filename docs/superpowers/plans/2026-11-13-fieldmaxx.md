@@ -1,1216 +1,1423 @@
-# Fieldmaxx Implementation Plan
-
-> **SUPERSEDED (2026-11-13):** this plan is for the v1 web-app design. The owner switched to a native Android app (design v2). A new plan will replace this file; do not execute this one.
+# Fieldmaxx (Android) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build Fieldmaxx, an installable web app and server where a crew imports AT&T job files (PDF/DOCX), works the points on a satellite map, records pole data, and has stamped photos delivered reliably into each job's OneDrive "Field Notes" folder.
+**Goal:** Build Fieldmaxx: a native Android app plus a small Kotlin server. The crew imports AT&T job files (PDF/DOCX), works the points on a satellite map, records pole data, and takes stamped photos. The phone uploads those photos straight into each job's OneDrive "Field Notes" folder, and also backs them up to our server.
 
-**Architecture:** npm-workspaces monorepo with three packages: `shared` (types and pure logic used by both sides), `server` (Fastify + SQLite + WebSocket; importer, sync, photo intake, OneDrive delivery worker), and `web` (React PWA with Leaflet, Dexie offline store, photo pipeline). The phone keeps every photo until the server reports it confirmed in OneDrive; the server keeps its copy until OneDrive confirms. OneDrive access goes through a `PhotoDestination` interface whose first implementation uses the job's "anyone with the link" share URL.
+**Architecture:** One Gradle repo, Kotlin everywhere, with five modules:
+- `core`: shared models and pure rules.
+- `sharepoint`: the OneDrive share-link client and the folder rules; used by both the app and the server.
+- `importer`: PDF/DOCX reading; server only.
+- `server`: Ktor + SQLite + WebSocket.
+- `app`: Android, Compose, MapLibre, CameraX, Room, WorkManager.
 
-**Tech Stack:** Node.js 22, TypeScript (strict), Vitest, Fastify 5 (+ @fastify/websocket, @fastify/cookie, @fastify/static, @fastify/multipart), better-sqlite3, @node-rs/argon2, pdfjs-dist (legacy Node build) + @napi-rs/canvas, jszip + fast-xml-parser, exceljs, archiver, React 18 + Vite 5 + vite-plugin-pwa, react-leaflet 4 + leaflet 1.9 + leaflet.markercluster, Dexie 4 (+ dexie-react-hooks, fake-indexeddb for tests), suncalc, piexifjs, @testing-library/react, Playwright (preinstalled Chromium), pdf-lib (test fixtures only).
+Every photo moves through persisted steps on the phone (saved → stamped → registered → in OneDrive + backed up). The server keeps backups at least 3 days and delivers a photo itself if the phone hasn't within 30 minutes.
 
-**Spec:** `docs/superpowers/specs/2026-11-13-fieldmaxx-design.md`. Read it before starting any task: section numbers below (§) refer to it.
+**Tech Stack:** Kotlin 2.1, JDK 21 toolchain (JVM bytecode 17), Gradle 8.14.3, Android Gradle Plugin 8.10, compileSdk/targetSdk 35, minSdk 28.
+- **App:** Jetpack Compose (BOM 2025.05), Navigation Compose, Room 2.7 (KSP), WorkManager 2.10, DataStore 1.1, CameraX 1.4, MapLibre Native Android 11.8, Play Services Location 21.3, androidx.exifinterface 1.4, Coil 3.
+- **Shared / server:** kotlinx.serialization 1.8, kotlinx.coroutines 1.10, OkHttp 4.12 (+ MockWebServer), Ktor 3.1 (Netty, WebSockets, content negotiation, test host), xerial sqlite-jdbc 3.49, Bouncy Castle 1.80 (Argon2), Apache PDFBox 3.0, dhatim fastexcel 0.19, commons-suncalc 3.11.
+- **Tests:** JUnit 5 + kotlin.test (JVM modules); JUnit 4 + Robolectric 4.14 + Compose UI test + work-testing (app).
+
+Use these versions or newer patch releases; check each one resolves at the first build.
+
+**Spec:** `docs/superpowers/specs/2026-11-13-fieldmaxx-design.md` (v2, approved). Read it before any task; `§` below refers to it.
 
 ## Global Constraints
 
-- Node.js 22; TypeScript `strict: true` in every package; ES modules.
-- Accepted job files: PDF and Word `.docx` only. Anything else → HTTP 415 with message `Only PDF and Word (.docx) files`.
-- No point in a file is ever silently dropped: every coordinate either becomes a point or appears on the check screen as flagged/unread.
-- Never overwrite and never delete anything in OneDrive (the share link has no delete permission, §5.5). Check for an existing same-name same-size file before every upload.
-- Point folder: reuse an existing folder (any common naming style), otherwise create `<Category>/<TYPE>_<ID>` (e.g. `POLE/POLE_33`, `QUERY 1/Query_1-43`).
-- Photo file name: `<TYPE>_<ID>_<lat 6dp>_<lon 6dp>_<counter>.jpg`, e.g. `POLE_1_39.636130_-119.691104_6018.jpg`.
-- Stamp (bottom-left, white text, dark shadow, 5 lines): `A05J9XE · POLE 1` / `39.636130, -119.691104` / `±16 ft · alt 4430 ft` / `NE 47°` / `11/05/26 13:35:47`.
-- Upload copy: full resolution capped at 16,000,000 pixels; JPEG quality 0.85 (Standard) or 0.95 (Maximum, admin setting); EXIF kept/written (GPS, altitude, image direction, DateTimeOriginal).
-- Phone → server: 2–3 photos in parallel (use 3), resumable chunks. Server → OneDrive: 4 in parallel, starts on receipt.
-- Phone copies deleted 3 days after confirmation. Server copies deleted 7 days after confirmation; above 80% disk, oldest confirmed first down to 75%; unconfirmed never purged.
-- Sessions: cookie `fmx_session`, 90 days, sliding. Admin-created accounts only. Login lockout: 10 failures per username per 15 min → HTTP 429.
-- Crew positions: send when moved > 5 m or every 15 s; dots faded after 10 min, hidden after 1 h. Everyone sees every job and every tech.
-- Deletes of jobs and points are soft. Job: creator or admin may delete; admin restores within 30 days, purged after. Point: any user while none of its photos reached the server; otherwise admin only; admin restores.
-- Map: Esri World Imagery `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}`; street labels overlay `https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}` at opacity 0.9; map view remembered per user per job.
-- Colours from Cadastrus: bars `rgba(15,23,42,0.92)` (`#0f172a`), accent `#2563eb`, done `#22c55e`, warning `#fbbf24`.
-- English only. All frontend camera/GPS/compass/storage access goes through `web/src/platform/*` (Capacitor-swappable, §7.4).
-- Real customer files are never committed: tests use synthetic replicas; the real samples go in gitignored `server/test/fixtures-private/`.
+- Packages `com.fieldmaxx.<module>`; applicationId `com.fieldmaxx.app`; minSdk 28, targetSdk/compileSdk 35; `core` and `sharepoint` compile to JVM 17 bytecode (the app consumes them).
+- **Foreground-only location:** the manifest declares only `ACCESS_FINE_LOCATION` and `ACCESS_COARSE_LOCATION`. Never `ACCESS_BACKGROUND_LOCATION`, never a location foreground service. Location updates run only while the app is in the STARTED lifecycle state.
+- Accepted job files: PDF and `.docx` only. Anything else → HTTP 415 with message `Only PDF and Word (.docx) files`.
+- No point is ever silently dropped: every coordinate becomes a point or shows on the check screen as flagged/unread.
+- Never overwrite or delete anything in OneDrive (the share link has no delete permission, §5.5). Check for a same-name, same-size file before every upload. The only exception: a partial file this photo created in a lost chunked session may be restarted.
+- Point folder: reuse an existing folder (any common naming style, §6.6.1), else create `<Category>/<TYPE>_<ID>` (`POLE/POLE_33`, `QUERY 1/Query_1-43`).
+- Photo file name `<TYPE>_<ID>_<lat 6dp>_<lon 6dp>_<counter>.jpg`, e.g. `POLE_1_39.636130_-119.691104_6018.jpg`. The server assigns the counter.
+- Stamp (bottom-left, white bold, dark shadow, font = 2.8% of the shorter side, 5 lines): `A05J9XE · POLE 1` / `39.636130, -119.691104` / `±16 ft · alt 4430 ft` / `NE 47°` / `11/05/26 13:35:47`.
+- Stamped copy: JPEG quality 85 (Standard) or 95 (Maximum, admin setting); scaled down to ≤ 16,000,000 pixels; EXIF written (GPS, altitude, image direction, DateTimeOriginal, make/model).
+- Phone → OneDrive: chunked upload, up to 3 photos in parallel. Server backup runs alongside at lower priority.
+- Retries: 15 s doubling to a 30 min cap; "stuck" after 6 failed attempts, still retried every 30 min.
+- Server backups kept ≥ 3 days after arrival (admin setting, default 3, minimum 3), never deleted before OneDrive confirmation. The server delivers a backup itself if it is unconfirmed 30 min after arrival. Permanent ~320 px thumbnails.
+- The phone deletes its own copies 3 days after a photo is both confirmed and backed up. A gallery copy goes to album "Fieldmaxx" (setting, default on).
+- Sessions: bearer token, 90 days sliding, stored encrypted on the phone. Lockout: 10 failures per username per 15 min → HTTP 429.
+- Crew positions: send on > 5 m moved or every 15 s; on leaving the screen send `paused` once and stop. Dots: grey "app closed" when paused, faded after 10 min, hidden after 1 h.
+- Soft deletes. Job: deletable by its creator or an admin; admin restores within 30 days, then purge. Point: any user while no photo of it reached OneDrive, otherwise admin only; admin restores.
+- Map defaults served by `/api/config`: imagery `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}`, labels `https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}` (opacity 0.9), optional key.
+- Colours: bars `#0f172a` at 92% opacity, accent `#2563eb`, done `#22c55e`, warning `#fbbf24`, shot markers `#9ca3af` at 55% opacity.
+- English only. Secrets never committed: the live test link comes only from env `FMX_LIVE_TEST_LINK`; real sample files live in git-ignored `importer/src/test/resources/private/`; the release keystore and `keystore.properties` are git-ignored.
 
 ## Review Focus
 
-1. **A tech shoots dozens of photos with no signal, the phone kills the app, they reopen it hours later**: every photo uploads exactly once, none lost. Test: Task 25 `queue survives reload and uploads each photo once`.
-2. **Two techs change the same point at once** (one fills pole data, the other drags it): both changes survive. Test: Task 13 `concurrent field edits both persist`.
-3. **Field Notes link wrong, expired, or sign-in-only**: the check fails with a readable reason, photos wait on the server, and the job shows a banner. Tests: Task 12 `link check reports failure reason`, Task 17 `forbidden destination sets job deliveryProblem`.
-4. **48 MP camera photo on an iPhone** (canvas limit): scaled to ≤ 16 MP, never a blank image. Test: Task 25 `targetSize caps 48MP to 16MP keeping aspect`.
-5. **The same file imported twice into a job**: no doubled points. Test: Task 12 `duplicate import skips identical points`.
+1. **Phone dies or Android kills the app between any two photo steps** (after save, mid-stamp, mid-upload, before reporting): on restart the photo continues and lands in OneDrive exactly once. Test: Task 28 `pipelineSurvivesAKillAfterEveryStep`.
+2. **Signal drops halfway through a chunked upload, or the upload session expires overnight**: resume from the last confirmed offset, or restart cleanly with no duplicate file. Tests: Task 10 `resumesAtConfirmedOffset`, `lostSessionRestartsOnOwnPartialFile`.
+3. **Two techs change the same point at once** (one fills pole data, the other drags it): both changes survive. Test: Task 15 `concurrentFieldEditsBothPersist`.
+4. **Field Notes link wrong, expired or sign-in-only**: readable error at entry, red banner, photos wait on the phone and on the server. Tests: Task 14 `linkCheckReportsFailureReason`, Task 17 `forbiddenDestinationSetsJobDeliveryProblem`.
+5. **The same file imported twice into a job**: no doubled points. Test: Task 14 `duplicateImportSkipsIdenticalPoints`.
 
 ---
 
-## Milestone A: Foundation (`shared`)
+## Milestone A: Repo and `core`
 
-### Task 1: Workspace and coordinate parsing
+### Task 1: Gradle repo, Android SDK script, shared models, coordinate parsing
 
 **Files:**
-- Create: `package.json`, `tsconfig.base.json`, `vitest.config.ts`, `.gitignore`
-- Create: `shared/package.json`, `shared/tsconfig.json`, `shared/src/index.ts`, `shared/src/types.ts`, `shared/src/geo.ts`
-- Test: `shared/test/geo.test.ts`
+- Create: `settings.gradle.kts`, `build.gradle.kts`, `gradle/libs.versions.toml`, `gradle.properties`, `.gitignore`, `gradlew` (+ wrapper files), `tools/android-sdk.sh`
+- Create: `core/build.gradle.kts`, `core/src/main/kotlin/com/fieldmaxx/core/model/Models.kt`, `core/src/main/kotlin/com/fieldmaxx/core/Json.kt`, `core/src/main/kotlin/com/fieldmaxx/core/geo/Geo.kt`
+- Test: `core/src/test/kotlin/com/fieldmaxx/core/geo/GeoTest.kt`, `core/src/test/kotlin/com/fieldmaxx/core/model/JsonTest.kt`
 
 **Interfaces:**
-- Produces (`shared/src/geo.ts`):
-```ts
-export interface LatLon { lat: number; lon: number }
-export interface CoordMatch { lat: number; lon: number; index: number; length: number; swapped: boolean; format: 'decimal' | 'dms' }
-export function normalizeText(raw: string): string
-export function findCoordinatePairs(text: string): CoordMatch[]
-export function distanceMeters(a: LatLon, b: LatLon): number
-export function metersToFeet(m: number): number
+- Produces (`geo/Geo.kt`):
+```kotlin
+data class LatLon(val lat: Double, val lon: Double)
+enum class CoordFormat { DECIMAL, DMS }
+data class CoordMatch(val lat: Double, val lon: Double, val start: Int, val end: Int, val swapped: Boolean, val format: CoordFormat)
+fun normalizeText(raw: String): String
+fun findCoordinatePairs(text: String): List<CoordMatch>
+fun distanceMeters(a: LatLon, b: LatLon): Double
+fun metersToFeet(m: Double): Double
 ```
-- Produces (`shared/src/types.ts`): every shared type used below. Define them now exactly as written:
-```ts
-export type Role = 'admin' | 'tech';
-export interface User { id: string; username: string; displayName: string; role: Role; disabled: boolean }
-export type PointStatus = 'open' | 'done' | 'cant_shoot';
-export type CantShootReason = 'not_found' | 'no_access' | 'not_applicable' | 'other';
-export const POLE_TAGS = ['N/A', 'Carrier label', 'Grounding', 'No ground', 'No fiber', 'Damaged cable'] as const;
-export type PoleTag = typeof POLE_TAGS[number];
-export interface PoleData { lineHeightFt: number | null; anchor: boolean; attachment: 'self_supporting' | 'lashed' | null; tags: PoleTag[] }
-export type ImportFlag = 'swapped' | 'sign_mismatch' | 'far_from_job' | 'duplicate_label' | 'unlabelled' | 'no_coordinates';
-export interface DraftPoint { layer: string; type: string; num: string; label: string; lat: number | null; lon: number | null; description: string; flags: ImportFlag[]; sourcePage: number | null; refImageIds: string[]; rawText: string }
-export interface UnreadLine { text: string; sourcePage: number | null; reason: string }
-export interface RefImageInfo { id: string; kind: 'page' | 'item'; page: number | null }
-export interface ImportPreview { importId: string; fileName: string; kind: 'pdf' | 'docx'; layerSuggestion: string; notes: string; points: DraftPoint[]; unread: UnreadLine[]; refImages: RefImageInfo[] }
-export interface Job { id: string; name: string; notes: string; fieldNotesUrl: string | null; status: 'active' | 'finished'; createdBy: string; createdAt: number; finishedAt: number | null; deletedAt: number | null; deliveryProblem: string | null }
-export interface Point { id: string; jobId: string; layer: string; type: string; num: string; label: string; lat: number; lon: number; origLat: number | null; origLon: number | null; description: string; status: PointStatus; cantReason: CantShootReason | null; cantText: string | null; pole: PoleData | null; comment: string; folderPath: string | null; folderCandidates: string[] | null; refImageIds: string[]; flags: ImportFlag[]; addedBy: string | null; updatedAt: number; updatedBy: string | null; deletedAt: number | null }
-export type PhotoStatus = 'uploading' | 'received' | 'confirmed' | 'stuck' | 'removed';
-export interface PhotoInfo { id: string; jobId: string; pointId: string; userId: string; fileName: string | null; size: number; status: PhotoStatus; destPath: string | null; lastError: string | null; takenAt: number; receivedAt: number | null; confirmedAt: number | null; uploadMs: number | null; reusedFrom: string | null }
-export interface PhotoUploadMeta { id: string; jobId: string; pointId: string; size: number; sha256: string; takenAt: number; lat: number | null; lon: number | null; accuracyM: number | null; headingDeg: number | null }
-export interface CrewPosition { userId: string; displayName: string; lat: number; lon: number; accuracyM: number; at: number }
-export type Op =
-  | { kind: 'point.update'; opId: string; pointId: string; fields: Partial<{ pole: PoleData; comment: string }> }
-  | { kind: 'point.move'; opId: string; pointId: string; lat: number; lon: number }
-  | { kind: 'point.close'; opId: string; pointId: string; photoIds: string[] }
-  | { kind: 'point.cantShoot'; opId: string; pointId: string; reason: CantShootReason; text: string }
-  | { kind: 'point.reopen'; opId: string; pointId: string }
-  | { kind: 'point.add'; opId: string; jobId: string; pointId: string; layer: string; type: string; num: string; lat: number; lon: number }
-  | { kind: 'point.delete'; opId: string; pointId: string }
-  | { kind: 'point.restore'; opId: string; pointId: string }
-  | { kind: 'point.setFolder'; opId: string; pointId: string; folderPath: string }
-  | { kind: 'photo.reuse'; opId: string; photoId: string; fromPhotoId: string; pointId: string }
-  | { kind: 'photo.remove'; opId: string; photoId: string };
-export interface OpResult { opId: string; ok: boolean; error?: string }
-export interface Change { seq: number; jobId: string | null; entity: 'job' | 'point' | 'photo'; entityId: string; data: Job | Point | PhotoInfo; at: number }
-export type ServerMessage = { type: 'change'; change: Change } | { type: 'position'; pos: CrewPosition } | { type: 'hello'; seq: number };
-export type ClientMessage = { type: 'position'; lat: number; lon: number; accuracyM: number; altitudeM: number | null };
-export interface JobSnapshot { job: Job; points: Point[]; photos: PhotoInfo[]; refImages: RefImageInfo[]; files: Array<{ id: string; name: string; layer: string }>; crew: Array<{ userId: string; displayName: string }>; seq: number }
-export interface CreateJobInput { name: string; fieldNotesUrl: string | null; imports: JobImportInput[] }
-export interface JobImportInput { importId: string; layer: string; notes: string; points: DraftPoint[] }
-```
-
-- [ ] **Step 1: Scaffold the workspace.** Root `package.json` with `"private": true`, `"type": "module"`, `"workspaces": ["shared", "server", "web"]`, scripts `test` (`vitest run`), `typecheck` (`tsc -b`). `vitest.config.ts` uses `test.projects: ['shared', 'server', 'web']`. `.gitignore`: `node_modules/`, `dist/`, `data/`, `server/test/fixtures-private/`, `*.log`, `test-results/`, `playwright-report/`. `shared/package.json` name `@fieldmaxx/shared`, main `src/index.ts` (consumed as source by server and web).
-
-- [ ] **Step 2: Write the failing tests** in `shared/test/geo.test.ts`:
-```ts
-test('decimal pair, no space', () => { const [m] = findCoordinatePairs('39.63609452036168,-119.69104360818118'); expect([m.lat, m.lon]).toEqual([39.63609452036168, -119.69104360818118]); expect(m.format).toBe('decimal') });
-test('decimal pair, space after comma', () => expect(findCoordinatePairs('39.6361531972, -119.675338878')[0].lon).toBe(-119.675338878));
-test('number split after minus across a line break', () => expect(findCoordinatePairs(normalizeText('39.63612682461489,-\r119.68173217216633'))[0].lon).toBe(-119.68173217216633));
-test('label and coords separated by tab + CR', () => expect(normalizeText('POLE 1 = \t\r39.6,-119.6')).toBe('POLE 1 =\n39.6,-119.6'));
-test('DMS pair', () => { const [m] = findCoordinatePairs(`39°38'09.9"N 119°41'27.8"W`); expect(m.lat).toBeCloseTo(39.636083, 5); expect(m.lon).toBeCloseTo(-119.691056, 5); expect(m.format).toBe('dms') });
-test('swapped pair is corrected and flagged', () => { const [m] = findCoordinatePairs('-119.69104,39.63609'); expect([m.lat, m.lon, m.swapped]).toEqual([39.63609, -119.69104, true]) });
-test('rejects too few decimals and out of range', () => { expect(findCoordinatePairs('1.5, 2.5')).toEqual([]); expect(findCoordinatePairs('123.4567, 200.1234')).toEqual([]) });
-test('en dash separator and multiple pairs in order', () => { const ms = findCoordinatePairs('VERIFY HH – 39.35535679, -119.81288376 and 39.1234,-119.5678'); expect(ms.map(m => m.lat)).toEqual([39.35535679, 39.1234]); expect(ms[0].index).toBe('VERIFY HH – '.length) });
-test('distance and feet', () => { expect(distanceMeters({ lat: 39.636, lon: -119.691 }, { lat: 39.636, lon: -119.690 })).toBeCloseTo(85.7, 0); expect(metersToFeet(4.877)).toBeCloseTo(16, 0) });
+- Produces (`Json.kt`): `val FmxJson: Json` (`ignoreUnknownKeys = true`, `encodeDefaults = true`, `classDiscriminator = "kind"`).
+- Produces (`model/Models.kt`): all `@Serializable`; enum constants are lower-case so JSON matches the spec's wording.
+```kotlin
+enum class Role { admin, tech }
+data class User(val id: String, val username: String, val displayName: String, val role: Role, val disabled: Boolean)
+enum class PointStatus { open, done, cant_shoot }
+enum class CantShootReason { not_found, no_access, not_applicable, other }
+val POLE_TAGS: List<String> = listOf("N/A", "Carrier label", "Grounding", "No ground", "No fiber", "Damaged cable")
+enum class Attachment { self_supporting, lashed }
+data class PoleData(val lineHeightFt: Double? = null, val anchor: Boolean = false, val attachment: Attachment? = null, val tags: List<String> = emptyList())
+enum class ImportFlag { swapped, sign_mismatch, far_from_job, duplicate_label, unlabelled, no_coordinates }
+data class DraftPoint(val layer: String, val type: String, val num: String, val label: String, val lat: Double?, val lon: Double?, val description: String, val flags: List<ImportFlag>, val sourcePage: Int?, val refImageIds: List<String>, val rawText: String)
+data class UnreadLine(val text: String, val sourcePage: Int?, val reason: String)
+data class RefImageInfo(val id: String, val kind: String /* page|item */, val page: Int?)
+data class ImportPreview(val importId: String, val fileName: String, val kind: String /* pdf|docx */, val layerSuggestion: String, val notes: String, val points: List<DraftPoint>, val unread: List<UnreadLine>, val refImages: List<RefImageInfo>)
+data class Job(val id: String, val name: String, val notes: String, val fieldNotesUrl: String?, val status: String /* active|finished */, val createdBy: String, val createdAt: Long, val finishedAt: Long?, val deletedAt: Long?, val deliveryProblem: String?)
+data class JobListItem(val job: Job, val pointsTotal: Int, val pointsDone: Int)
+data class Point(val id: String, val jobId: String, val layer: String, val type: String, val num: String, val label: String, val lat: Double, val lon: Double, val origLat: Double?, val origLon: Double?, val description: String, val status: PointStatus, val cantReason: CantShootReason?, val cantText: String?, val pole: PoleData?, val comment: String, val folderPath: String?, val folderCandidates: List<String>?, val refImageIds: List<String>, val flags: List<ImportFlag>, val addedBy: String?, val updatedAt: Long, val updatedBy: String?, val deletedAt: Long?)
+enum class PhotoStatus { registered, confirmed, stuck, removed }
+data class PhotoInfo(val id: String, val jobId: String, val pointId: String, val userId: String, val fileName: String?, val size: Long, val status: PhotoStatus, val destPath: String?, val lastError: String?, val takenAt: Long, val lat: Double?, val lon: Double?, val backedUp: Boolean, val confirmedAt: Long?, val uploadMs: Long?, val reusedFrom: String?)
+data class PhotoRegistration(val id: String, val jobId: String, val pointId: String, val size: Long, val sha256: String, val takenAt: Long, val lat: Double?, val lon: Double?, val accuracyM: Double?, val headingDeg: Double?)
+data class RegisteredPhoto(val fileName: String, val status: PhotoStatus, val backupOffset: Long)
+data class CrewPosition(val userId: String, val displayName: String, val lat: Double, val lon: Double, val accuracyM: Double, val at: Long, val paused: Boolean)
+sealed interface Op { val opId: String
+  // nested data classes with @SerialName:
+  // "point.update" Op.PointUpdate(opId, pointId, pole: PoleData? = null, comment: String? = null)
+  // "point.move" Op.PointMove(opId, pointId, lat, lon)                "point.close" Op.PointClose(opId, pointId, photoIds: List<String>)
+  // "point.cantShoot" Op.PointCantShoot(opId, pointId, reason, text)  "point.reopen" Op.PointReopen(opId, pointId)
+  // "point.add" Op.PointAdd(opId, jobId, pointId, layer, type, num, lat, lon)
+  // "point.delete" Op.PointDelete(opId, pointId)                      "point.restore" Op.PointRestore(opId, pointId)
+  // "point.setFolder" Op.PointSetFolder(opId, pointId, folderPath)
+  // "photo.reuse" Op.PhotoReuse(opId, photoId, fromPhotoId, pointId)  "photo.remove" Op.PhotoRemove(opId, photoId)
+  // "photo.confirmed" Op.PhotoConfirmed(opId, photoId, destPath, uploadMs: Long)   "photo.failed" Op.PhotoFailed(opId, photoId, error, attempts: Int)
+}
+data class OpResult(val opId: String, val ok: Boolean, val error: String? = null)
+data class Change(val seq: Long, val jobId: String?, val entity: String /* job|point|photo */, val entityId: String, val job: Job? = null, val point: Point? = null, val photo: PhotoInfo? = null, val at: Long)
+sealed interface ServerMessage   // nested: "change" ServerMessage.ChangeMsg(change)  "position" ServerMessage.PositionMsg(pos)  "hello" ServerMessage.Hello(seq: Long)
+sealed interface ClientMessage   // nested: "position" ClientMessage.PositionUpdate(lat, lon, accuracyM, altitudeM: Double?)  "paused" object ClientMessage.Paused
+data class JobFileInfo(val id: String, val name: String, val layer: String)
+data class CrewMember(val userId: String, val displayName: String)
+data class JobSnapshot(val job: Job, val points: List<Point>, val photos: List<PhotoInfo>, val refImages: List<RefImageInfo>, val files: List<JobFileInfo>, val crew: List<CrewMember>, val seq: Long)
+data class JobImportInput(val importId: String, val layer: String, val notes: String, val points: List<DraftPoint>)
+data class CreateJobInput(val name: String, val fieldNotesUrl: String?, val imports: List<JobImportInput>)
+data class LinkCheck(val ok: Boolean, val rootName: String? = null, val error: String? = null)
+data class FinishResult(val finished: Boolean, val pointsLeft: Int = 0, val photosPending: Int = 0)
+data class AppConfig(val imageryUrl: String, val labelsUrl: String, val imageryKey: String?, val photoQuality: Int /* 85|95 */, val backupDays: Int)
+data class AdminSettings(val photoQuality: Int? = null, val backupDays: Int? = null, val imageryUrl: String? = null, val labelsUrl: String? = null, val imageryKey: String? = null)
+data class HealthReport(val diskUsedPct: Int, val photos: List<PhotoInfo>, val phoneToConfirmedMedianS: Long?, val uploadMedianS: Long?)
+data class ActivityItem(val at: Long, val user: String, val kind: String, val label: String?, val detail: String)
+data class AppRelease(val versionCode: Int, val versionName: String, val url: String, val sha256: String)
+data class ReuseCandidate(val photo: PhotoInfo, val pointLabel: String, val jobName: String, val distanceM: Double?)
 ```
 
-- [ ] **Step 3: Run to verify failure.** Run: `npx vitest run shared/test/geo.test.ts`. Expected: FAIL, `findCoordinatePairs` is not exported.
+- [ ] **Step 1: Scaffold the repo.**
+  - `settings.gradle.kts` includes `:core`, `:sharepoint`, `:importer`, `:server`, `:app`.
+  - Version catalog with the Tech Stack versions; the Kotlin JVM toolchain is 21.
+  - Generate the wrapper with `/opt/gradle-8.14.3/bin/gradle wrapper --gradle-version 8.14.3`.
+  - `.gitignore`: `build/`, `.gradle/`, `local.properties`, `*.keystore`, `keystore.properties`, `importer/src/test/resources/private/`, `data/`.
+  - `tools/android-sdk.sh` downloads `https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip` into `$HOME/android-sdk/cmdline-tools/latest`, accepts licences, installs `platform-tools`, `platforms;android-35` and `build-tools;35.0.0`, and writes `sdk.dir` into `local.properties`. Run it now.
 
-- [ ] **Step 4: Implement `shared/src/geo.ts` and `shared/src/types.ts`.** `normalizeText`: `\r\n`/`\r` → `\n`; `\t` → space; collapse runs of spaces; trim each line; join a `-` or `,` at end of line with a following line that starts with a digit (`-\n119` → `-119`, `,\n-119` → `,-119`). Decimal pairs: two signed numbers with 1–3 integer digits and ≥ 3 decimals, separated by a comma (optional spaces) or whitespace; both in range, or swapped (`|first| > 90` and `|second| ≤ 90`), else rejected. DMS: `D°M'S"[NS]` then `D°M'S"[EW]` (also `′ ″`). `distanceMeters`: haversine, R = 6371008.8.
-
-- [ ] **Step 5: Run to verify pass.** Run: `npx vitest run shared/test/geo.test.ts`. Expected: PASS (9 tests).
-
-- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(shared): workspace, shared types, coordinate parsing"`
-
-### Task 2: Naming rules (labels, folders, file names)
-
-**Files:**
-- Create: `shared/src/naming.ts`
-- Test: `shared/test/naming.test.ts`
-
-**Interfaces:**
-- Produces:
-```ts
-export const KNOWN_TYPES = ['POLE', 'PED', 'HH', 'MH', 'BU', 'SAI', 'PFP', 'MDU'] as const;
-export const ADD_CATEGORIES = ['POLE', 'PED', 'HH', 'MH', 'BU', 'SAI', 'PFP', 'MDU', 'CULVERT', 'Drainage', 'CREEK IMAGE', 'MAIL BOX IMAGES', 'Street images', 'Rear images', 'VACANT LOT', 'UTILITIES', 'Aerial Fielding', 'F3 BUILDING DATA'];
-export interface PointKey { layer: string; type: string; num: string; label: string }
-export function isQueryLayer(layer: string): boolean;               // /^query\s*\d+$/i
-export function pointLabel(layer: string, type: string, num: string): string;
-export function defaultFolderName(label: string): string;           // whitespace runs → '_'
-export function normalizeFolderName(name: string): string;          // lowercase, remove whitespace and '_'
-export function categoryMatches(folderName: string, layer: string): boolean;
-export function pointFolderMatches(folderName: string, p: PointKey, where: 'category' | 'top'): boolean;
-export function photoFileName(folderName: string, lat: number, lon: number, counter: number): string;
-export function markerCode(type: string): string;
-export function suggestAddedPoleNum(existingNums: string[], nearestNum: string): string;
-export function nextNum(existingNums: string[]): string;
+- [ ] **Step 2: Write the failing tests** in `GeoTest.kt` (kotlin.test, JUnit 5):
+```kotlin
+@Test fun decimalPairNoSpace() { val m = findCoordinatePairs("39.63609452036168,-119.69104360818118").single(); assertEquals(39.63609452036168, m.lat); assertEquals(-119.69104360818118, m.lon); assertEquals(CoordFormat.DECIMAL, m.format) }
+@Test fun spaceAfterComma() = assertEquals(-119.675338878, findCoordinatePairs("39.6361531972, -119.675338878").single().lon)
+@Test fun splitAfterMinusAcrossLineBreak() = assertEquals(-119.68173217216633, findCoordinatePairs(normalizeText("39.63612682461489,-\r119.68173217216633")).single().lon)
+@Test fun labelTabCr() = assertEquals("POLE 1 =\n39.6,-119.6", normalizeText("POLE 1 = \t\r39.6,-119.6"))
+@Test fun dms() { val m = findCoordinatePairs("39°38'09.9\"N 119°41'27.8\"W").single(); assertEquals(39.636083, m.lat, 1e-5); assertEquals(-119.691056, m.lon, 1e-5); assertEquals(CoordFormat.DMS, m.format) }
+@Test fun swapped() { val m = findCoordinatePairs("-119.69104,39.63609").single(); assertEquals(39.63609, m.lat); assertEquals(-119.69104, m.lon); assertTrue(m.swapped) }
+@Test fun rejects() { assertTrue(findCoordinatePairs("1.5, 2.5").isEmpty()); assertTrue(findCoordinatePairs("123.4567, 200.1234").isEmpty()) }
+@Test fun enDashAndOrder() { val ms = findCoordinatePairs("VERIFY HH – 39.35535679, -119.81288376 and 39.1234,-119.5678"); assertEquals(listOf(39.35535679, 39.1234), ms.map { it.lat }); assertEquals("VERIFY HH – ".length, ms[0].start) }
+@Test fun distanceAndFeet() { assertEquals(85.7, distanceMeters(LatLon(39.636, -119.691), LatLon(39.636, -119.690)), 0.5); assertEquals(16.0, metersToFeet(4.877), 0.5) }
 ```
+`JsonTest.kt`: `Op.PointMove` round-trips through `FmxJson` with `"kind":"point.move"`; `ServerMessage.Hello(5)` encodes to `{"kind":"hello","seq":5}`.
 
-- [ ] **Step 1: Write the failing tests** in `shared/test/naming.test.ts`:
-```ts
-const pole1 = { layer: 'POLE', type: 'POLE', num: '1', label: 'POLE 1' };
-const pole14b = { layer: 'POLE', type: 'POLE', num: '14B', label: 'POLE 14B' };
-const q43 = { layer: 'QUERY 1', type: 'QUERY 1', num: '43', label: 'Query 1-43' };
-test('labels', () => { expect(pointLabel('POLE', 'POLE', '14B')).toBe('POLE 14B'); expect(pointLabel('QUERY 1', 'QUERY 1', '25A')).toBe('Query 1-25A') });
-test('default folder names', () => { expect(defaultFolderName('POLE 14B')).toBe('POLE_14B'); expect(defaultFolderName('Query 1-43')).toBe('Query_1-43') });
-test('category match is case/space/underscore insensitive, plural allowed', () => { expect(categoryMatches('QUERY 1', 'Query 1')).toBe(true); expect(categoryMatches('Query_1', 'QUERY 1')).toBe(true); expect(categoryMatches('POLES', 'POLE')).toBe(true); expect(categoryMatches('Query 3', 'QUERY 1')).toBe(false) });
-test('point folder in category: bare number, prefixed, mixed case', () => { for (const n of ['1', 'POLE_1', 'Pole 1', 'pole1', 'P1']) expect(pointFolderMatches(n, pole1, 'category')).toBe(true); expect(pointFolderMatches('POLE_14b', pole14b, 'category')).toBe(true); expect(pointFolderMatches('10', pole1, 'category')).toBe(false) });
-test('top level: bare number only for POLE', () => { expect(pointFolderMatches('1', pole1, 'top')).toBe(true); expect(pointFolderMatches('43', q43, 'top')).toBe(false); expect(pointFolderMatches('Query 1-43', q43, 'top')).toBe(true); expect(pointFolderMatches('QUERY_1-43', q43, 'category')).toBe(true); expect(pointFolderMatches('43', q43, 'category')).toBe(true) });
-test('photo file name matches Cadastrus', () => expect(photoFileName('POLE_1', 39.63613, -119.691104, 6018)).toBe('POLE_1_39.636130_-119.691104_6018.jpg'));
-test('marker codes', () => { expect(markerCode('POLE')).toBe('P'); expect(markerCode('MH')).toBe('MH'); expect(markerCode('QUERY 1')).toBe('Q'); expect(markerCode('Street images')).toBe('ST') });
-test('added pole suggestions', () => { expect(suggestAddedPoleNum(['14'], '14')).toBe('14B'); expect(suggestAddedPoleNum(['14', '14B'], '14')).toBe('14C'); expect(suggestAddedPoleNum(['14', '14b'], '14')).toBe('14C') });
-test('next number', () => { expect(nextNum(['1', '2', '10'])).toBe('11'); expect(nextNum([])).toBe('1') });
-```
+- [ ] **Step 3: Run to verify failure.** Run: `./gradlew :core:test`. Expected: FAIL, compilation errors for the missing symbols.
 
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run shared/test/naming.test.ts`. Expected: FAIL (module not found).
+- [ ] **Step 4: Implement.**
+  - `normalizeText`: `\r\n`/`\r` → `\n`; `\t` → space; collapse spaces; trim lines; join a line ending in `-` or `,` with a following line that starts with a digit or `-`.
+  - Decimal pairs: two signed numbers with 1–3 integer digits and ≥ 3 decimals, separated by a comma (optional spaces) or by whitespace.
+  - Range check: both values in range; or swapped (`|first| > 90`, `|second| ≤ 90`); otherwise rejected.
+  - DMS: `D°M'S"[NS]` then `D°M'S"[EW]`, also accepting `′ ″`.
+  - Haversine with R = 6371008.8.
 
-- [ ] **Step 3: Implement `shared/src/naming.ts`.** `pointFolderMatches` normalizes the folder name (`normalizeFolderName`, keeps `-`) and compares against a candidate set: for non-query points `{num, type+num, firstLetterOfType+num}` (lowercased, e.g. `1`, `pole1`, `p1`); for query points `{num, 'query'+n+'-'+num, 'q'+n+'-'+num}`. At `where: 'top'` the bare `num` candidate is allowed only when `type === 'POLE'` (§6.6: the A05J9XE job has pole folders `1`…`7` at the top level). `markerCode`: KNOWN_TYPES map to `P` for POLE and themselves otherwise; query layers → `Q`; anything else → first two letters uppercased.
+- [ ] **Step 5: Run to verify pass.** Run: `./gradlew :core:test`. Expected: PASS.
 
-- [ ] **Step 4: Run to verify pass.** Run: `npx vitest run shared/test/naming.test.ts`. Expected: PASS.
+- [ ] **Step 6: Commit.** `git add -A && git commit -m "build: gradle repo, android sdk script, core models and coordinate parsing"`
 
-- [ ] **Step 5: Commit.** `git commit -am "feat(shared): point, folder and photo naming rules"`
+### Task 2: Naming rules
 
-### Task 3: Photo stamp text and layout
-
-**Files:**
-- Create: `shared/src/stamp.ts`
-- Test: `shared/test/stamp.test.ts`
+**Files:** Create `core/src/main/kotlin/com/fieldmaxx/core/naming/Naming.kt`; Test `core/src/test/kotlin/com/fieldmaxx/core/naming/NamingTest.kt`
 
 **Interfaces:**
 - Produces:
-```ts
-export interface StampMeta { jobName: string; pointLabel: string; lat: number | null; lon: number | null; accuracyM: number | null; altitudeM: number | null; headingDeg: number | null; takenAt: Date; gpsStale: boolean; fromGallery: boolean }
-export function compass8(deg: number): 'N' | 'NE' | 'E' | 'SE' | 'S' | 'SW' | 'W' | 'NW';
-export function formatStampTime(d: Date): string;   // local time, MM/DD/YY HH:MM:SS
-export function stampLines(m: StampMeta): string[];
-export function stampLayout(width: number, height: number, lineCount: number): { fontPx: number; x: number; firstBaselineY: number; lineHeightPx: number; shadowBlurPx: number };
+```kotlin
+val KNOWN_TYPES = listOf("POLE", "PED", "HH", "MH", "BU", "SAI", "PFP", "MDU")
+val ADD_CATEGORIES = listOf("POLE", "PED", "HH", "MH", "BU", "SAI", "PFP", "MDU", "CULVERT", "Drainage", "CREEK IMAGE", "MAIL BOX IMAGES", "Street images", "Rear images", "VACANT LOT", "UTILITIES", "Aerial Fielding", "F3 BUILDING DATA")
+data class PointKey(val layer: String, val type: String, val num: String, val label: String)
+enum class Where { CATEGORY, TOP }
+fun isQueryLayer(layer: String): Boolean                 // ^query\s*\d+$ (ignore case)
+fun pointLabel(layer: String, type: String, num: String): String
+fun defaultFolderName(label: String): String              // whitespace runs → "_"
+fun normalizeFolderName(name: String): String             // lowercase, drop whitespace and "_" (keep "-")
+fun categoryMatches(folderName: String, layer: String): Boolean
+fun pointFolderMatches(folderName: String, p: PointKey, where: Where): Boolean
+fun photoFileName(folderName: String, lat: Double, lon: Double, counter: Long): String
+fun markerCode(type: String): String
+fun suggestAddedPoleNum(existingNums: List<String>, nearestNum: String): String
+fun nextNum(existingNums: List<String>): String
 ```
 
-- [ ] **Step 1: Write the failing tests:**
-```ts
-const base = { jobName: 'A05J9XE', pointLabel: 'POLE 1', lat: 39.63613, lon: -119.691104, accuracyM: 4.877, altitudeM: 1350.26, headingDeg: 47, takenAt: new Date(2026, 10, 5, 13, 35, 47), gpsStale: false, fromGallery: false };
-test('full stamp', () => expect(stampLines(base)).toEqual(['A05J9XE · POLE 1', '39.636130, -119.691104', '±16 ft · alt 4430 ft', 'NE 47°', '11/05/26 13:35:47']));
-test('missing values', () => expect(stampLines({ ...base, lat: null, lon: null, accuracyM: null, altitudeM: null, headingDeg: null })).toEqual(['A05J9XE · POLE 1', 'No GPS', '', 'Compass n/a', '11/05/26 13:35:47'].filter(l => l !== '')));
-test('no altitude', () => expect(stampLines({ ...base, altitudeM: null })[2]).toBe('±16 ft'));
-test('stale GPS and gallery markers', () => { const l = stampLines({ ...base, gpsStale: true, fromGallery: true }); expect(l[1]).toBe('39.636130, -119.691104 (GPS stale)'); expect(l[4]).toBe('11/05/26 13:35:47 (from gallery)') });
-test('compass boundaries', () => { expect(compass8(0)).toBe('N'); expect(compass8(22.4)).toBe('N'); expect(compass8(22.5)).toBe('NE'); expect(compass8(359)).toBe('N'); expect(compass8(200)).toBe('S') });
-test('layout for 3000x4000, 5 lines', () => expect(stampLayout(3000, 4000, 5)).toEqual({ fontPx: 84, x: 84, firstBaselineY: 3496, lineHeightPx: 105, shadowBlurPx: 21 }));
+- [ ] **Step 1: Write the failing tests** (`pole1 = PointKey("POLE","POLE","1","POLE 1")`, `pole14b = PointKey("POLE","POLE","14B","POLE 14B")`, `q43 = PointKey("QUERY 1","QUERY 1","43","Query 1-43")`):
+```kotlin
+@Test fun labels() { assertEquals("POLE 14B", pointLabel("POLE","POLE","14B")); assertEquals("Query 1-25A", pointLabel("QUERY 1","QUERY 1","25A")) }
+@Test fun folderNames() { assertEquals("POLE_14B", defaultFolderName("POLE 14B")); assertEquals("Query_1-43", defaultFolderName("Query 1-43")) }
+@Test fun categories() { assertTrue(categoryMatches("QUERY 1","Query 1")); assertTrue(categoryMatches("Query_1","QUERY 1")); assertTrue(categoryMatches("POLES","POLE")); assertFalse(categoryMatches("Query 3","QUERY 1")) }
+@Test fun inCategory() { listOf("1","POLE_1","Pole 1","pole1","P1").forEach { assertTrue(pointFolderMatches(it, pole1, Where.CATEGORY), it) }; assertTrue(pointFolderMatches("POLE_14b", pole14b, Where.CATEGORY)); assertFalse(pointFolderMatches("10", pole1, Where.CATEGORY)) }
+@Test fun topLevel() { assertTrue(pointFolderMatches("1", pole1, Where.TOP)); assertFalse(pointFolderMatches("43", q43, Where.TOP)); assertTrue(pointFolderMatches("Query 1-43", q43, Where.TOP)); assertTrue(pointFolderMatches("QUERY_1-43", q43, Where.CATEGORY)); assertTrue(pointFolderMatches("43", q43, Where.CATEGORY)) }
+@Test fun fileName() = assertEquals("POLE_1_39.636130_-119.691104_6018.jpg", photoFileName("POLE_1", 39.63613, -119.691104, 6018))
+@Test fun codes() { assertEquals("P", markerCode("POLE")); assertEquals("MH", markerCode("MH")); assertEquals("Q", markerCode("QUERY 1")); assertEquals("ST", markerCode("Street images")) }
+@Test fun addedPoles() { assertEquals("14B", suggestAddedPoleNum(listOf("14"), "14")); assertEquals("14C", suggestAddedPoleNum(listOf("14","14B"), "14")); assertEquals("14C", suggestAddedPoleNum(listOf("14","14b"), "14")) }
+@Test fun nextNumber() { assertEquals("11", nextNum(listOf("1","2","10"))); assertEquals("1", nextNum(emptyList())) }
 ```
 
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run shared/test/stamp.test.ts`. Expected: FAIL.
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :core:test --tests '*NamingTest'`. Expected: FAIL.
 
-- [ ] **Step 3: Implement `shared/src/stamp.ts`.** Layout: `fontPx = round(min(w,h) * 0.028)`, `x = fontPx`, `lineHeightPx = round(fontPx * 1.25)`, `firstBaselineY = h - fontPx - lineHeightPx * (lineCount - 1)`, `shadowBlurPx = round(fontPx * 0.25)`. Feet rounded to whole numbers. When there is no GPS, line 2 is `No GPS` and the accuracy line is omitted.
+- [ ] **Step 3: Implement.**
+  - **Candidate names:** non-query points `{num, type+num, firstLetter(type)+num}`; query points `{num, "query"+n+"-"+num, "q"+n+"-"+num}`; all compared after `normalizeFolderName`.
+  - **Bare number:** at `Where.TOP` the bare `num` matches only when `type == "POLE"` (§6.6.1).
+  - **Coordinates in the file name:** formatted with `Locale.US`, 6 decimals.
+  - **Marker codes:** POLE → `P`, other known types → themselves, query layers → `Q`, anything else → first two letters uppercased.
 
 - [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 5: Commit.** `git commit -am "feat(shared): photo stamp lines and layout"`
+- [ ] **Step 5: Commit.** `git commit -am "feat(core): naming rules"`
+
+### Task 3: Stamp text, layout, compass
+
+**Files:** Create `core/src/main/kotlin/com/fieldmaxx/core/stamp/Stamp.kt`; Test `core/src/test/kotlin/com/fieldmaxx/core/stamp/StampTest.kt`
+
+**Interfaces:**
+- Produces:
+```kotlin
+data class StampMeta(val jobName: String, val pointLabel: String, val lat: Double?, val lon: Double?, val accuracyM: Double?, val altitudeM: Double?, val headingDeg: Double?, val takenAtMs: Long, val zone: java.time.ZoneId, val gpsStale: Boolean, val fromGallery: Boolean)
+fun compass8(deg: Double): String            // N NE E SE S SW W NW
+fun formatStampTime(ms: Long, zone: java.time.ZoneId): String   // MM/dd/yy HH:mm:ss
+fun stampLines(m: StampMeta): List<String>
+data class StampLayout(val fontPx: Int, val x: Int, val firstBaselineY: Int, val lineHeightPx: Int, val shadowBlurPx: Int)
+fun stampLayout(width: Int, height: Int, lineCount: Int): StampLayout
+```
+
+- [ ] **Step 1: Write the failing tests** (`base` = A05J9XE, POLE 1, 39.63613, -119.691104, accuracy 4.877 m, altitude 1350.26 m, heading 47.0, `2026-11-05T13:35:47` in `America/Los_Angeles`):
+```kotlin
+@Test fun full() = assertEquals(listOf("A05J9XE · POLE 1", "39.636130, -119.691104", "±16 ft · alt 4430 ft", "NE 47°", "11/05/26 13:35:47"), stampLines(base))
+@Test fun noGps() = assertEquals(listOf("A05J9XE · POLE 1", "No GPS", "Compass n/a", "11/05/26 13:35:47"), stampLines(base.copy(lat = null, lon = null, accuracyM = null, altitudeM = null, headingDeg = null)))
+@Test fun noAltitude() = assertEquals("±16 ft", stampLines(base.copy(altitudeM = null))[2])
+@Test fun staleAndGallery() { val l = stampLines(base.copy(gpsStale = true, fromGallery = true)); assertEquals("39.636130, -119.691104 (GPS stale)", l[1]); assertEquals("11/05/26 13:35:47 (from gallery)", l[4]) }
+@Test fun compass() { assertEquals("N", compass8(0.0)); assertEquals("N", compass8(22.4)); assertEquals("NE", compass8(22.5)); assertEquals("N", compass8(359.0)); assertEquals("S", compass8(200.0)) }
+@Test fun layout() = assertEquals(StampLayout(84, 84, 3496, 105, 21), stampLayout(3000, 4000, 5))
+```
+
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :core:test --tests '*StampTest'`. Expected: FAIL.
+
+- [ ] **Step 3: Implement.**
+  - **Layout:** `fontPx = round(min(w,h) * 0.028)`, `x = fontPx`, `lineHeightPx = round(fontPx * 1.25)`, `firstBaselineY = h - fontPx - lineHeightPx * (lineCount - 1)`, `shadowBlurPx = round(fontPx * 0.25)`.
+  - **Feet:** whole numbers.
+  - **No GPS:** the accuracy line is omitted.
+
+- [ ] **Step 4: Run to verify pass.** Expected: PASS.
+
+- [ ] **Step 5: Commit.** `git commit -am "feat(core): stamp lines, layout and compass"`
 
 ---
 
-## Milestone B: Importer (`server/src/import`)
+## Milestone B: `importer` (server-side job file reader)
 
-### Task 4: Server package and labelled-point parser
+Test helpers live in `importer/src/testFixtures/kotlin/com/fieldmaxx/importer/` (Gradle `java-test-fixtures` plugin) so `server` tests can reuse them.
 
-**Files:**
-- Create: `server/package.json`, `server/tsconfig.json`
-- Create: `server/src/import/labelled.ts`, `server/src/import/sanity.ts`
-- Test: `server/test/import/labelled.test.ts`
+### Task 4: Labelled-point parser and sanity flags
 
-**Interfaces:**
-- Consumes: `normalizeText`, `findCoordinatePairs`, `CoordMatch` (Task 1); `pointLabel`, `KNOWN_TYPES` (Task 2); `DraftPoint` (Task 1).
-- Produces:
-```ts
-export interface TextGroup { source: 'annotation' | 'field' | 'pageText' | 'docx'; page: number | null; text: string }
-export interface LabelledResult { points: DraftPoint[]; unlabelled: CoordMatch[]; leftoverText: string }
-export function extractLabelledPoints(group: TextGroup): LabelledResult;
-export function addSanityFlags(points: DraftPoint[]): void;   // mutates flags
-```
-
-- [ ] **Step 1: Create `server/package.json`** (name `@fieldmaxx/server`, `type: module`, deps from the Tech Stack for the server, dev deps `vitest`, `tsx`, `pdf-lib`, `@types/*`; scripts `dev` `tsx watch src/index.ts`, `build` `tsc -p .`, `start` `node dist/index.js`). Run `npm install` at the root.
-
-- [ ] **Step 2: Write the failing tests.** The A05J9XE replica uses the spec's exact text shape (§5.1) with these synthetic coordinates: `const AERIAL = 'POLE 1 = \t\r39.10000000000001,-119.10000000000001\rPOLE 2 = \t\r39.20000000000002,-119.20000000000002\rPOLE 3 = 39.30000000000003,-119.30000000000003\rPOLE 4 = 39.40000000000004,-119.40000000000004\rPOLE 5 = \t\r39.5000000005, -119.500000005\rPOLE 6 = 39.6000000006, -119.600000006\rPOLE 7 = 39.70000000000007,-119.70000000000007'` (put it in `server/test/fixtures/replicas.ts` for reuse).
-```ts
-test('aerial replica → 7 POLE points, nothing left over', () => { const r = extractLabelledPoints({ source: 'annotation', page: 1, text: AERIAL }); expect(r.points.map(p => p.label)).toEqual(['POLE 1','POLE 2','POLE 3','POLE 4','POLE 5','POLE 6','POLE 7']); expect(r.points[4]).toMatchObject({ layer: 'POLE', type: 'POLE', num: '5', lat: 39.5000000005, lon: -119.500000005, sourcePage: 1 }); expect(r.unlabelled).toEqual([]); expect(r.leftoverText.trim()).toBe('') });
-test('suffix letter is uppercased', () => expect(extractLabelledPoints({ source: 'docx', page: null, text: 'POLE 14b = 39.1234,-119.1234' }).points[0].label).toBe('POLE 14B'));
-test('mixed-case known type, colon, DMS', () => expect(extractLabelledPoints({ source: 'pageText', page: 2, text: `Pole 3: 39°38'09.9"N 119°41'27.8"W` }).points[0]).toMatchObject({ label: 'POLE 3', sourcePage: 2 }));
-test('trailing text is the description', () => expect(extractLabelledPoints({ source: 'pageText', page: 1, text: 'MH 2 = 39.1234,-119.1234 existing 40ft\nMH 3 = 39.2234,-119.2234' }).points[0].description).toBe('existing 40ft'));
-test('coordinates without a label are returned as unlabelled', () => expect(extractLabelledPoints({ source: 'pageText', page: 1, text: 'see 39.1234,-119.1234' }).unlabelled).toHaveLength(1));
-test('sanity flags', () => { const pts = [p('POLE 1', 39.1, -119.1), p('POLE 2', 39.11, 119.11), p('POLE 3', 39.12, -119.12), p('POLE 4', 41.5, -119.1), p('POLE 1', 39.2, -119.2)]; addSanityFlags(pts); expect(pts[1].flags).toContain('sign_mismatch'); expect(pts[3].flags).toContain('far_from_job'); expect(pts[0].flags).toContain('duplicate_label'); expect(pts[4].flags).toContain('duplicate_label'); expect(pts[2].flags).toEqual([]) });
-```
-(`p(label, lat, lon)` is a local helper building a `DraftPoint` with empty flags.)
-
-- [ ] **Step 3: Run to verify failure.** Run: `npx vitest run server/test/import/labelled.test.ts`. Expected: FAIL.
-
-- [ ] **Step 4: Implement.** Normalize the text, find coordinate pairs, and for each pair test the slice between the previous pair's end and this pair's start against the label pattern anchored at the slice end: `(?:^|[^A-Za-z])(TYPE)\s*#?\s*(\d{1,4}[A-Za-z]?)\s*[=:\-–]?\s*$`, where TYPE is a KNOWN_TYPES word (case-insensitive) or else any `[A-Z]{2,8}` (case-sensitive). Text after a point's coordinates, up to the next label, is its description (trimmed). Swapped pairs get the `swapped` flag. `addSanityFlags`: `sign_mismatch` when the longitude sign differs from the majority; `far_from_job` when more than 50 km from the median lat/lon; `duplicate_label` on every point sharing a label with different coordinates (> 1 m apart).
-
-- [ ] **Step 5: Run to verify pass.** Expected: PASS.
-
-- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(import): labelled point parser with sanity flags"`
-
-### Task 5: DOCX to ordered blocks, with Word list numbering
-
-**Files:**
-- Create: `server/src/import/blocks.ts`, `server/src/import/docx.ts`
-- Create: `server/test/helpers/make-docx.ts`
-- Test: `server/test/import/docx.test.ts`
+**Files:** Create `importer/build.gradle.kts` (with `java-test-fixtures`), `importer/src/main/kotlin/com/fieldmaxx/importer/Labelled.kt`, `importer/src/main/kotlin/com/fieldmaxx/importer/Sanity.kt`, `importer/src/testFixtures/kotlin/com/fieldmaxx/importer/Replicas.kt`; Test `importer/src/test/kotlin/com/fieldmaxx/importer/LabelledTest.kt`
 
 **Interfaces:**
+- Consumes: `normalizeText`, `findCoordinatePairs`, `CoordMatch` (Task 1); `pointLabel`, `KNOWN_TYPES` (Task 2); `DraftPoint`, `ImportFlag`.
 - Produces:
-```ts
-// blocks.ts
-export type DocBlock = { kind: 'para'; text: string; listLabel: string | null; page: number | null } | { kind: 'image'; imageId: string; page: number | null };
-export interface ExtractedImage { id: string; mime: 'image/png' | 'image/jpeg'; data: Buffer }
-export class ImportError extends Error { constructor(public code: 'unreadable_pdf' | 'unreadable_docx' | 'unsupported_type', message: string) { super(message) } }
-// docx.ts
-export async function docxToBlocks(buf: Buffer): Promise<{ blocks: DocBlock[]; images: ExtractedImage[] }>;
-export function renderListLabel(lvlText: string, levels: Array<{ value: number; fmt: string }>): string;
-// test helper
-export interface DocxSpec { lists: Array<{ numId: number; start: number; fmt: 'decimal' | 'upperLetter'; lvlText: string }>; body: Array<{ text: string; numId?: number; ilvl?: number; styleNumId?: number } | { image: Buffer } | { table: string[][] }> }
-export async function makeDocx(spec: DocxSpec): Promise<Buffer>;
+```kotlin
+enum class GroupSource { ANNOTATION, FIELD, PAGE_TEXT, DOCX }
+data class TextGroup(val source: GroupSource, val page: Int?, val text: String)
+data class LabelledResult(val points: List<DraftPoint>, val unlabelled: List<CoordMatch>, val leftoverText: String)
+fun extractLabelledPoints(group: TextGroup): LabelledResult
+fun addSanityFlags(points: List<DraftPoint>): List<DraftPoint>
 ```
 
-- [ ] **Step 1: Write `makeDocx`** with jszip: `[Content_Types].xml`, `_rels/.rels`, `word/document.xml` (paragraphs with `w:numPr`; image paragraphs with `a:blip r:embed`; tables `w:tbl/w:tr/w:tc/w:p`), `word/numbering.xml` (one `w:abstractNum` per list with `w:start`, `w:numFmt`, `w:lvlText`, plus `w:num` pointing at it), `word/styles.xml` (style `NumberedStyle` carrying `w:numPr` for `styleNumId`), `word/_rels/document.xml.rels` and `word/media/imageN.png`.
+- [ ] **Step 1: Write `Replicas.kt`.** It holds `const val AERIAL`, the §5.1 text shape with synthetic coordinates: `"POLE 1 = \t\r39.10000000000001,-119.10000000000001\rPOLE 2 = \t\r39.20000000000002,-119.20000000000002\rPOLE 3 = 39.30000000000003,-119.30000000000003\rPOLE 4 = 39.40000000000004,-119.40000000000004\rPOLE 5 = \t\r39.5000000005, -119.500000005\rPOLE 6 = 39.6000000006, -119.600000006\rPOLE 7 = 39.70000000000007,-119.70000000000007"`.
 
 - [ ] **Step 2: Write the failing tests:**
-```ts
-test('decimal list numbers', async () => { const { blocks } = await docxToBlocks(await makeDocx({ lists: [{ numId: 1, start: 1, fmt: 'decimal', lvlText: '%1.' }], body: [{ text: 'a', numId: 1 }, { text: 'b', numId: 1 }, { text: 'c', numId: 1 }] })); expect(paras(blocks).map(b => b.listLabel)).toEqual(['1.', '2.', '3.']) });
-test('list starting at 14', async () => expect(labels(await doc([{ numId: 4, start: 14, fmt: 'decimal', lvlText: '%1.' }], ['x', 'y'].map(t => ({ text: t, numId: 4 }))))).toEqual(['14.', '15.']));
-test('upper-letter list', async () => expect(labels(await doc([{ numId: 3, start: 1, fmt: 'upperLetter', lvlText: '%1-' }], [{ text: '39.1,-119.1', numId: 3 }, { text: '39.2,-119.2', numId: 3 }]))).toEqual(['A-', 'B-']));
-test('typed number stays in text, no list label', async () => { const b = paras(await blocksOf({ lists: [], body: [{ text: '12. NO STREET VIEW' }] })); expect(b[0]).toMatchObject({ text: '12. NO STREET VIEW', listLabel: null }) });
-test('images in order with bytes', async () => { const png = tinyPng(); const { blocks, images } = await docxToBlocks(await makeDocx({ lists: [], body: [{ text: 'one' }, { image: png }, { text: 'two' }] })); expect(blocks.map(b => b.kind)).toEqual(['para', 'image', 'para']); expect(images[0].data.equals(png)).toBe(true); expect(images[0].mime).toBe('image/png') });
-test('numbering inherited from paragraph style', async () => expect(labels(await doc([{ numId: 2, start: 1, fmt: 'decimal', lvlText: '%1.' }], [{ text: 'a', styleNumId: 2 }]))).toEqual(['1.']));
-test('table cell paragraphs are emitted in order', async () => expect(paras(await blocksOf({ lists: [], body: [{ text: 'before' }, { table: [['c1', 'c2']] }, { text: 'after' }] })).map(b => b.text)).toEqual(['before', 'c1', 'c2', 'after']));
-test('garbage buffer', async () => await expect(docxToBlocks(Buffer.from('nope'))).rejects.toMatchObject({ code: 'unreadable_docx' }));
+```kotlin
+@Test fun aerialReplica() { val r = extractLabelledPoints(TextGroup(GroupSource.ANNOTATION, 1, AERIAL)); assertEquals((1..7).map { "POLE $it" }, r.points.map { it.label }); with(r.points[4]) { assertEquals("POLE", layer); assertEquals("5", num); assertEquals(39.5000000005, lat); assertEquals(-119.500000005, lon); assertEquals(1, sourcePage) }; assertTrue(r.unlabelled.isEmpty()); assertTrue(r.leftoverText.isBlank()) }
+@Test fun suffixUppercased() = assertEquals("POLE 14B", extractLabelledPoints(TextGroup(GroupSource.DOCX, null, "POLE 14b = 39.1234,-119.1234")).points.single().label)
+@Test fun mixedCaseColonDms() = assertEquals("POLE 3", extractLabelledPoints(TextGroup(GroupSource.PAGE_TEXT, 2, "Pole 3: 39°38'09.9\"N 119°41'27.8\"W")).points.single().label)
+@Test fun trailingDescription() = assertEquals("existing 40ft", extractLabelledPoints(TextGroup(GroupSource.PAGE_TEXT, 1, "MH 2 = 39.1234,-119.1234 existing 40ft\nMH 3 = 39.2234,-119.2234")).points[0].description)
+@Test fun unlabelledReturned() = assertEquals(1, extractLabelledPoints(TextGroup(GroupSource.PAGE_TEXT, 1, "see 39.1234,-119.1234")).unlabelled.size)
+@Test fun sanity() { val out = addSanityFlags(listOf(p("POLE 1", 39.1, -119.1), p("POLE 2", 39.11, 119.11), p("POLE 3", 39.12, -119.12), p("POLE 4", 41.5, -119.1), p("POLE 1", 39.2, -119.2))); assertContains(out[1].flags, ImportFlag.sign_mismatch); assertContains(out[3].flags, ImportFlag.far_from_job); assertContains(out[0].flags, ImportFlag.duplicate_label); assertContains(out[4].flags, ImportFlag.duplicate_label); assertTrue(out[2].flags.isEmpty()) }
 ```
-(`paras`, `labels`, `doc`, `blocksOf`, `tinyPng` are small local helpers in the test file.)
 
-- [ ] **Step 3: Run to verify failure.** Run: `npx vitest run server/test/import/docx.test.ts`. Expected: FAIL.
+- [ ] **Step 3: Run to verify failure.** Run: `./gradlew :importer:test --tests '*LabelledTest'`. Expected: FAIL.
 
-- [ ] **Step 4: Implement `docx.ts`.** Parse with jszip + fast-xml-parser (`preserveOrder: true, ignoreAttributes: false`). Walk `w:body` in order (paragraphs, and paragraphs inside `w:tbl` cells). Numbering, which is not determined by the tests alone:
-```
-numPr = paragraph pPr numPr ?? numPr of the paragraph's style (styles.xml)
-if numPr missing or numId == '0' → listLabel = null
-lvl = abstractNum(num(numId)).levels[ilvl]; start = num.lvlOverride[ilvl].startOverride ?? lvl.start ?? 1
-counters[numId] ??= []
-counters[numId][ilvl] = counters[numId][ilvl] === undefined ? start : counters[numId][ilvl] + 1
-counters[numId].length = ilvl + 1                 // reset deeper levels
-listLabel = renderListLabel(lvl.lvlText, levels 0..ilvl with their counters and numFmt)
-```
-`renderListLabel` replaces `%k` with level k-1's value in its format (`decimal`, `upperLetter` A…Z then AA…, `lowerLetter`, `upperRoman`, `lowerRoman`). Image ids are `img-<n>` in order of appearance.
+- [ ] **Step 4: Implement.**
+  - Normalize, find coordinate pairs, then for each pair test the slice since the previous pair's end against the label pattern anchored at the slice end: `(?:^|[^A-Za-z])(TYPE)\s*#?\s*(\d{1,4}[A-Za-z]?)\s*[=:\-–]?\s*$`.
+  - `TYPE` is a `KNOWN_TYPES` word (ignore case); otherwise any `[A-Z]{2,8}` (case-sensitive).
+  - A point's description is the text after its coordinates, up to the next label.
+  - Sanity flags:
+    - `sign_mismatch`: longitude sign differs from the majority.
+    - `far_from_job`: more than 50 km from the median.
+    - `duplicate_label`: the same label more than 1 m apart.
 
 - [ ] **Step 5: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(import): DOCX blocks with Word list numbering and images"`
+- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(importer): labelled point parser and sanity flags"`
+
+### Task 5: DOCX to ordered blocks with Word list numbering
+
+**Files:** Create `importer/src/main/kotlin/com/fieldmaxx/importer/Blocks.kt`, `importer/src/main/kotlin/com/fieldmaxx/importer/Docx.kt`, `importer/src/testFixtures/kotlin/com/fieldmaxx/importer/MakeDocx.kt`; Test `importer/src/test/kotlin/com/fieldmaxx/importer/DocxTest.kt`
+
+**Interfaces:**
+- Produces:
+```kotlin
+sealed interface DocBlock { val page: Int? }
+data class ParaBlock(val text: String, val listLabel: String?, override val page: Int?) : DocBlock
+data class ImageBlock(val imageId: String, override val page: Int?) : DocBlock
+class ExtractedImage(val id: String, val mime: String /* image/png|image/jpeg */, val bytes: ByteArray)
+class ImportException(val code: String /* unreadable_pdf|unreadable_docx|unsupported_type */, message: String) : Exception(message)
+data class DocxExtract(val blocks: List<DocBlock>, val images: List<ExtractedImage>)
+fun docxToBlocks(bytes: ByteArray): DocxExtract
+fun renderListLabel(lvlText: String, levels: List<Pair<Int, String /* numFmt */>>): String
+// test fixture
+data class DocxList(val numId: Int, val start: Int, val fmt: String /* decimal|upperLetter */, val lvlText: String)
+sealed interface DocxItem { data class Para(val text: String, val numId: Int? = null, val ilvl: Int = 0, val styleNumId: Int? = null) : DocxItem; class Image(val png: ByteArray) : DocxItem; data class Table(val cells: List<List<String>>) : DocxItem }
+fun makeDocx(lists: List<DocxList>, body: List<DocxItem>): ByteArray
+```
+
+- [ ] **Step 1: Write `makeDocx`** with `java.util.zip.ZipOutputStream`. It produces `[Content_Types].xml`, `_rels/.rels`, `word/document.xml`, `word/numbering.xml` (one `w:abstractNum` per list carrying `w:start`, `w:numFmt` and `w:lvlText`, plus a `w:num` pointing at it), `word/styles.xml` (style `NumberedStyle<N>` with a `w:numPr`), `word/_rels/document.xml.rels` and `word/media/imageN.png`.
+
+- [ ] **Step 2: Write the failing tests:**
+  - `decimalList`: three paras in `numId 1, start 1, "%1."` → labels `1.`, `2.`, `3.`.
+  - `startsAt14` → `14.`, `15.`.
+  - `upperLetter` with `"%1-"` → `A-`, `B-`.
+  - `typedNumberStaysText`: `"12. NO STREET VIEW"` with no list → `listLabel == null` and the text unchanged.
+  - `imagesInOrderWithBytes` → block kinds `[Para, Image, Para]`, the image bytes equal the input, mime `image/png`.
+  - `numberingFromStyle` → `1.`.
+  - `tableCellsInOrder` → `before, c1, c2, after`.
+  - `garbage`: `ImportException` with code `unreadable_docx`.
+
+- [ ] **Step 3: Run to verify failure.** Run: `./gradlew :importer:test --tests '*DocxTest'`. Expected: FAIL.
+
+- [ ] **Step 4: Implement** with `ZipInputStream` + a namespace-aware DOM parser. Walk `w:body` in order (including paragraphs inside `w:tbl` cells). Numbering, which the tests don't fully determine:
+```
+numPr = paragraph pPr numPr ?: numPr of the paragraph's style
+numPr missing or numId == 0 → listLabel = null
+lvl = abstractNum(num(numId)).levels[ilvl]; start = num.lvlOverride[ilvl].startOverride ?: lvl.start ?: 1
+counters[numId][ilvl] = if unset then start else +1; clear deeper levels
+listLabel = renderListLabel(lvl.lvlText, levels 0..ilvl as (value, numFmt))
+```
+`renderListLabel` supports `decimal`, `upperLetter` (A…Z, AA…), `lowerLetter`, `upperRoman`, `lowerRoman`. Image ids are `img-<n>` in order.
+
+- [ ] **Step 5: Run to verify pass.** Expected: PASS.
+
+- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(importer): docx blocks with Word list numbering"`
 
 ### Task 6: Query-item parser
 
-**Files:**
-- Create: `server/src/import/query.ts`
-- Modify: `server/test/fixtures/replicas.ts` (add `QUERY_BLOCKS` and `QUERY_DOCX_SPEC`)
-- Test: `server/test/import/query.test.ts`
+**Files:** Create `importer/src/main/kotlin/com/fieldmaxx/importer/Query.kt`; Modify `Replicas.kt` (add `QUERY_LISTS`, `QUERY_BODY`, `QUERY_BLOCKS`); Test `importer/src/test/kotlin/com/fieldmaxx/importer/QueryTest.kt`
 
 **Interfaces:**
-- Consumes: `DocBlock` (Task 5), `findCoordinatePairs` (Task 1), `pointLabel` (Task 2).
 - Produces:
-```ts
-export function layerFromFileName(fileName: string): string;   // 'QUERY_1_-_A05K51V.docx' → 'QUERY 1'; 'A05J9XE.pdf' → 'A05J9XE'
-export interface QueryResult { points: DraftPoint[]; notes: string[]; unattachedImageIds: string[] }
-export function extractQueryItems(blocks: DocBlock[], layer: string): QueryResult;
+```kotlin
+fun layerFromFileName(fileName: String): String   // "QUERY_1_-_A05K51V.docx" → "QUERY 1"; "A05J9XE.pdf" → "A05J9XE"
+data class QueryResult(val points: List<DraftPoint>, val notes: List<String>, val unattachedImageIds: List<String>)
+fun extractQueryItems(blocks: List<DocBlock>, layer: String): QueryResult
 ```
 
-- [ ] **Step 1: Add the replica of the sample query file** to `replicas.ts`, matching §5.2 exactly in structure, with synthetic coordinates (`39.3500xxxx, -119.8100xxxx` style; values of your choice, ≥ 7 decimals) and the same text: list A (`numId 1, start 1, '%1.'`) holding 10 `VERIFY …` items and `NO STREET VIEW PROVIDE ALL UTILITY DETAILS – <coords>`, each followed by one image; typed `12. NO STREET VIEW PROVIDE ALL UTILITY DETAILS  - <coords>` and `13.. NO STREET VIEW … – <coords>` (no list), each with an image; list B (`numId 4, start 14, '%1.'`) holding the 12 instruction items from §5.2 in order, each with its coordinates in the **next** unnumbered paragraph and images as in the sample (items 14, 18, 19, 20, 21, 24 one image; item 23 two images; items 15, 16, 17, 22 none); item 25 `POLE DATA` followed by two coordinate-only paragraphs in list C (`numId 3, '%1-'` upper letters) and one image. Export both `QUERY_DOCX_SPEC` (for `makeDocx`) and `QUERY_BLOCKS` (the `DocBlock[]` that `docxToBlocks` should produce).
+- [ ] **Step 1: Add the query replica** to `Replicas.kt`. It mirrors §5.2's structure with synthetic coordinates (≥ 7 decimals) and the same instruction text:
+  - **List A** (`numId 1`, start 1, `"%1."`): 10 `VERIFY …` items and `NO STREET VIEW PROVIDE ALL UTILITY DETAILS – <coords>`, one image each.
+  - **Typed items:** `12. NO STREET VIEW PROVIDE ALL UTILITY DETAILS  - <coords>` and `13.. NO STREET VIEW … – <coords>`, each with an image.
+  - **List B** (`numId 4`, start 14): the 12 instruction items from §5.2, each with coordinates in the next unnumbered paragraph. Images: one each for items 14, 18, 19, 20, 21 and 24; two for item 23; none for items 15, 16, 17 and 22.
+  - **Item 25:** `POLE DATA`, followed by two coordinate-only paragraphs in list C (`numId 3`, `"%1-"` upperLetter) and one image.
+  - Export `QUERY_LISTS`/`QUERY_BODY` for `makeDocx`, and `QUERY_BLOCKS`, the blocks `docxToBlocks` produces from them.
 
 - [ ] **Step 2: Write the failing tests:**
-```ts
-test('file name → layer', () => { expect(layerFromFileName('QUERY_1_-_A05K51V.docx')).toBe('QUERY 1'); expect(layerFromFileName('query 2.pdf')).toBe('QUERY 2'); expect(layerFromFileName('A05J9XE.pdf')).toBe('A05J9XE') });
-test('replica → 26 points with Cadastrus-style labels', () => { const r = extractQueryItems(QUERY_BLOCKS, 'QUERY 1'); expect(r.points.map(p => p.num)).toEqual([...Array.from({ length: 24 }, (_, i) => String(i + 1)), '25A', '25B']); expect(r.points[0].label).toBe('Query 1-1'); expect(r.points[25].label).toBe('Query 1-25B') });
-test('description strips coordinates and dash', () => { const r = extractQueryItems(QUERY_BLOCKS, 'QUERY 1'); expect(r.points[0].description).toBe('VERIFY HH'); expect(r.points[11].description).toBe('NO STREET VIEW PROVIDE ALL UTILITY DETAILS'); expect(r.points[13].description).toBe('PROVIDE WIDE ANGLE IMAGES FROM POLE 5 TO POLE 4') });
-test('coordinates on the next paragraph belong to the item', () => expect(extractQueryItems(QUERY_BLOCKS, 'QUERY 1').points[13].lat).not.toBeNull());
-test('images attach to the preceding item', () => { const pts = extractQueryItems(QUERY_BLOCKS, 'QUERY 1').points; expect(pts[0].refImageIds).toHaveLength(1); expect(pts[22].refImageIds).toHaveLength(2); expect(pts[15].refImageIds).toHaveLength(0); expect(pts[24].refImageIds).toEqual(pts[25].refImageIds) });
-test('item without coordinates is flagged, not dropped', () => { const r = extractQueryItems([{ kind: 'para', text: 'CHECK SOMETHING', listLabel: '1.', page: null }], 'QUERY 1'); expect(r.points[0]).toMatchObject({ lat: null, lon: null, flags: ['no_coordinates'] }) });
-test('unnumbered text+coords continues numbering, flagged', () => { const r = extractQueryItems([{ kind: 'para', text: 'A – 39.1234,-119.1234', listLabel: '1.', page: null }, { kind: 'para', text: 'B – 39.2234,-119.2234', listLabel: null, page: null }], 'QUERY 1'); expect(r.points[1]).toMatchObject({ num: '2', flags: ['unlabelled'] }) });
-test('plain text after an item without coords extends its description', () => expect(extractQueryItems([{ kind: 'para', text: 'POLE DATA', listLabel: '1.', page: null }, { kind: 'para', text: 'near the creek', listLabel: null, page: null }, { kind: 'para', text: '39.1234,-119.1234', listLabel: null, page: null }], 'QUERY 1').points[0]).toMatchObject({ description: 'POLE DATA near the creek', lat: 39.1234 }));
+```kotlin
+@Test fun layers() { assertEquals("QUERY 1", layerFromFileName("QUERY_1_-_A05K51V.docx")); assertEquals("QUERY 2", layerFromFileName("query 2.pdf")); assertEquals("A05J9XE", layerFromFileName("A05J9XE.pdf")) }
+@Test fun replica26() { val r = extractQueryItems(QUERY_BLOCKS, "QUERY 1"); assertEquals((1..24).map { "$it" } + listOf("25A", "25B"), r.points.map { it.num }); assertEquals("Query 1-1", r.points[0].label); assertEquals("Query 1-25B", r.points[25].label) }
+@Test fun descriptions() { val p = extractQueryItems(QUERY_BLOCKS, "QUERY 1").points; assertEquals("VERIFY HH", p[0].description); assertEquals("NO STREET VIEW PROVIDE ALL UTILITY DETAILS", p[11].description); assertEquals("PROVIDE WIDE ANGLE IMAGES FROM POLE 5 TO POLE 4", p[13].description) }
+@Test fun coordsOnNextParagraph() = assertNotNull(extractQueryItems(QUERY_BLOCKS, "QUERY 1").points[13].lat)
+@Test fun imagesAttach() { val p = extractQueryItems(QUERY_BLOCKS, "QUERY 1").points; assertEquals(1, p[0].refImageIds.size); assertEquals(2, p[22].refImageIds.size); assertEquals(0, p[15].refImageIds.size); assertEquals(p[24].refImageIds, p[25].refImageIds) }
+@Test fun noCoordinatesFlagged() { val p = extractQueryItems(listOf(ParaBlock("CHECK SOMETHING", "1.", null)), "QUERY 1").points.single(); assertNull(p.lat); assertEquals(listOf(ImportFlag.no_coordinates), p.flags) }
+@Test fun unnumberedContinues() { val p = extractQueryItems(listOf(ParaBlock("A – 39.1234,-119.1234", "1.", null), ParaBlock("B – 39.2234,-119.2234", null, null)), "QUERY 1").points; assertEquals("2", p[1].num); assertEquals(listOf(ImportFlag.unlabelled), p[1].flags) }
+@Test fun textExtendsDescription() { val p = extractQueryItems(listOf(ParaBlock("POLE DATA", "1.", null), ParaBlock("near the creek", null, null), ParaBlock("39.1234,-119.1234", null, null)), "QUERY 1").points.single(); assertEquals("POLE DATA near the creek", p.description); assertEquals(39.1234, p.lat) }
 ```
 
-- [ ] **Step 3: Run to verify failure.** Run: `npx vitest run server/test/import/query.test.ts`. Expected: FAIL.
+- [ ] **Step 3: Run to verify failure.** Run: `./gradlew :importer:test --tests '*QueryTest'`. Expected: FAIL.
 
-- [ ] **Step 4: Implement `query.ts`.** The algorithm, which the tests don't fully pin down:
+- [ ] **Step 4: Implement** (the tests don't fully pin this algorithm):
 ```
-typed = /^\s*(\d{1,4})\s*\.+\s*(.*)$/s
-for block in blocks:
-  image → current item ? current.images.push : unattached.push
-  para  → number = listLabel digits (if numeric) ?? typed number ?? null; letter = listLabel letters (if alphabetic) ?? null
-          body = text without typed number; coords = findCoordinatePairs(body); words = body minus coords minus [–-:,] has letters?
-          if words && (number || coords.length) → new item(num = number ?? prev+1 with flag 'unlabelled' when number null, text = words, coords)
-          elif !words && coords.length && current → current.coords.push(...coords with letter)
-          elif words && current && current.coords.length == 0 → current.text += ' ' + words
-          elif words → notes.push(text)
-points: 0 coords → one point lat/lon null flag no_coordinates; 1 → num; n>1 → num + (letter ?? 'A','B',…)
+typed = ^\s*(\d{1,4})\s*\.+\s*(.*)$
+image → current item?.images += id ?: unattached += id
+para  → number = numeric listLabel digits ?: typed number ?: null; letter = alphabetic listLabel letters ?: null
+        body = text minus typed number; coords = findCoordinatePairs(body); words = body minus coords minus [–-:,] has letters
+        words && (number != null || coords.any()) → new item(num = number ?: prev+1 flagged unlabelled, text = words, coords)
+        !words && coords.any() && current != null → current.coords += coords (with letter)
+        words && current != null && current.coords.isEmpty() → current.text += " " + words
+        words → notes += text
+points: 0 coords → one point (lat/lon null, no_coordinates); 1 → num; n > 1 → num + (letter ?: A, B, …); all share the item's images
 ```
-All points of one item share its images.
 
 - [ ] **Step 5: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(import): numbered query item parser"`
+- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(importer): numbered query items"`
 
-### Task 7: PDF to groups (annotations, fields, page text, images, page renders)
+### Task 7: PDF groups via PDFBox
 
-**Files:**
-- Create: `server/src/import/pdf.ts`
-- Create: `server/test/helpers/make-pdf.ts`
-- Test: `server/test/import/pdf.test.ts`
+**Files:** Create `importer/src/main/kotlin/com/fieldmaxx/importer/Pdf.kt`, `importer/src/testFixtures/kotlin/com/fieldmaxx/importer/MakePdf.kt`; Test `importer/src/test/kotlin/com/fieldmaxx/importer/PdfTest.kt`
 
 **Interfaces:**
-- Consumes: `DocBlock`, `ExtractedImage`, `ImportError` (Task 5).
 - Produces:
-```ts
-export interface PdfGroup { source: 'annotation' | 'field' | 'pageText'; page: number; blocks: DocBlock[] }
-export async function pdfToGroups(buf: Buffer, opts?: { renderScale?: number }): Promise<{ groups: PdfGroup[]; images: ExtractedImage[]; pageRenders: ExtractedImage[] }>;   // pageRenders ids 'page-<n>', PNG
-// test helper (pdf-lib)
-export interface PdfSpec { pages: Array<{ lines?: Array<{ text: string; x: number; y: number }>; images?: Array<{ png: Buffer; x: number; y: number; w: number; h: number }>; freeText?: string[] }> }
-export async function makePdf(spec: PdfSpec): Promise<Buffer>;
+```kotlin
+data class PdfGroup(val source: GroupSource, val page: Int, val blocks: List<DocBlock>)
+class PdfExtract(val groups: List<PdfGroup>, val images: List<ExtractedImage>, val pageRenders: List<ExtractedImage> /* ids "page-<n>", PNG */)
+fun pdfToGroups(bytes: ByteArray, renderDpi: Float = 144f): PdfExtract
+// test fixture (built with PDFBox)
+data class PdfPageSpec(val lines: List<Triple<String, Float, Float>> = emptyList(), val images: List<PdfImageSpec> = emptyList(), val freeText: List<String> = emptyList())
+class PdfImageSpec(val png: ByteArray, val x: Float, val y: Float, val w: Float, val h: Float)
+fun makePdf(pages: List<PdfPageSpec>): ByteArray
 ```
 
-- [ ] **Step 1: Write `makePdf`** with pdf-lib: text via `drawText`, images via `embedPng` + `drawImage`, FreeText annotations as raw dicts (`/Type /Annot /Subtype /FreeText /Rect … /Contents (…)`, plus a `/DA` string) appended to the page's `/Annots`.
+- [ ] **Step 1: Write the failing tests:**
+  - `freeTextIsItsOwnGroup` (AERIAL annotation → `ANNOTATION` group on page 1 with ≥ 7 para blocks);
+  - `pageTextTopToBottom` (lines at y 600 "second" and y 700 "first" → `first, second`);
+  - `imageBetweenLines` (lines at y 700 and 400, image at y 500 → kinds `Para, Image, Para`; one extracted image);
+  - `pngRenderPerPage` (2 pages → ids `page-1`, `page-2`, PNG signature);
+  - `garbage` (code `unreadable_pdf`).
 
-- [ ] **Step 2: Write the failing tests:**
-```ts
-test('FreeText annotation becomes its own group, one block per line', async () => { const { groups } = await pdfToGroups(await makePdf({ pages: [{ freeText: [AERIAL] }] })); const g = groups.find(g => g.source === 'annotation')!; expect(g.page).toBe(1); expect(g.blocks.filter(b => b.kind === 'para').length).toBeGreaterThanOrEqual(7) });
-test('page text lines top-to-bottom', async () => { const { groups } = await pdfToGroups(await makePdf({ pages: [{ lines: [{ text: 'second', x: 50, y: 600 }, { text: 'first', x: 50, y: 700 }] }] })); expect(paraTexts(groups.find(g => g.source === 'pageText')!)).toEqual(['first', 'second']) });
-test('image placed between the lines it sits between', async () => { const { groups, images } = await pdfToGroups(await makePdf({ pages: [{ lines: [{ text: 'item one', x: 50, y: 700 }, { text: 'item two', x: 50, y: 400 }], images: [{ png: tinyPng(), x: 50, y: 500, w: 100, h: 100 }] }] })); expect(groups.find(g => g.source === 'pageText')!.blocks.map(b => b.kind)).toEqual(['para', 'image', 'para']); expect(images).toHaveLength(1) });
-test('one PNG render per page', async () => { const { pageRenders } = await pdfToGroups(await makePdf({ pages: [{}, {}] })); expect(pageRenders.map(r => r.id)).toEqual(['page-1', 'page-2']); expect(pageRenders[0].data.subarray(1, 4).toString()).toBe('PNG') });
-test('garbage buffer', async () => await expect(pdfToGroups(Buffer.from('nope'))).rejects.toMatchObject({ code: 'unreadable_pdf' }));
-```
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :importer:test --tests '*PdfTest'`. Expected: FAIL.
 
-- [ ] **Step 3: Run to verify failure.** Run: `npx vitest run server/test/import/pdf.test.ts`. Expected: FAIL.
+- [ ] **Step 3: Implement** with PDFBox 3 (`Loader.loadPDF`):
+  - **Annotations:** `PDAnnotation.contents` split on `\r|\n` into para blocks.
+  - **Form fields:** `PDAcroForm` field values (`valueAsString`) → `FIELD` groups.
+  - **Page text:** a `PDFTextStripper` subclass collects `TextPosition`s into lines (baseline within 2 pt), sorted top-down then by x.
+  - **Images:** a `PDFStreamEngine` subclass handles `Do` for `PDImageXObject`, taking the y position from the current transformation matrix and the image via `image.image` → PNG.
+  - **Order:** interleave images into the lines by y.
+  - **Renders:** `PDFRenderer.renderImageWithDPI(i, renderDpi)` → PNG.
 
-- [ ] **Step 4: Implement `pdf.ts`** with `pdfjs-dist/legacy/build/pdf.mjs`, rendering through `@napi-rs/canvas`. Annotation text: `contentsObj?.str ?? contents`, split on `\r|\n` into para blocks. Widget annotations with a `fieldValue` become `field` groups. Page text: group `getTextContent()` items into lines when their baselines are within 2 pt, sort lines by descending y, then items by x. Images: walk `getOperatorList()` tracking the CTM through `save`/`restore`/`transform`; at `paintImageXObject` take the image's top y; fetch pixels with `page.objs.get(name)` and encode PNG via `@napi-rs/canvas`. Interleave images into the line order by y. Render scale defaults to 2.
+- [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 5: Run to verify pass.** Expected: PASS.
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(importer): pdf annotations, fields, text, images, renders"`
 
-- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(import): PDF groups, images and page renders"`
+### Task 8: `importFile` orchestration and real-file checks
 
-### Task 8: `importFile`: orchestrate a file into an import preview
-
-**Files:**
-- Create: `server/src/import/index.ts`
-- Test: `server/test/import/importFile.test.ts`, `server/test/import/real-fixtures.test.ts`
+**Files:** Create `importer/src/main/kotlin/com/fieldmaxx/importer/Importer.kt`; Test `importer/src/test/kotlin/com/fieldmaxx/importer/ImporterTest.kt`, `importer/src/test/kotlin/com/fieldmaxx/importer/RealFilesTest.kt`
 
 **Interfaces:**
 - Consumes: Tasks 4–7.
 - Produces:
-```ts
-export interface ImportResult { fileName: string; kind: 'pdf' | 'docx'; layerSuggestion: string; notes: string; points: DraftPoint[]; unread: UnreadLine[]; images: ExtractedImage[]; refImages: RefImageInfo[] }
-export async function importFile(fileName: string, buf: Buffer): Promise<ImportResult>;
+```kotlin
+class ImportResult(val fileName: String, val kind: String, val layerSuggestion: String, val notes: String, val points: List<DraftPoint>, val unread: List<UnreadLine>, val images: List<ExtractedImage>, val refImages: List<RefImageInfo>)
+fun importFile(fileName: String, bytes: ByteArray): ImportResult
 ```
 
-- [ ] **Step 1: Write the failing tests:**
-```ts
-const aerialPdf = () => makePdf({ pages: [{ freeText: ['     NOTE FOR AERIAL PATH\r1. IDENTIFY THE FEASIBILITY OF ATTACHING FIBER ON POLES THROUGHOUT THE PROPOSED CABLE ROUTE ON POLE.\r2. PLEASE MARK THE POLES IN BETWEEN THE CABLE PATH IN CASE IF WE HAVE MISSED ANY OF THEM.', AERIAL], images: [{ png: tinyPng(), x: 0, y: 200, w: 595, h: 186 }] }] });
-test('aerial PDF → 7 poles + notes, nothing unread', async () => { const r = await importFile('A05J9XE.pdf', await aerialPdf()); expect(r.points.map(p => p.label)).toEqual(['POLE 1','POLE 2','POLE 3','POLE 4','POLE 5','POLE 6','POLE 7']); expect(r.notes).toContain('NOTE FOR AERIAL PATH'); expect(r.unread).toEqual([]); expect(r.points[0].refImageIds).toContain('page-1'); expect(r.layerSuggestion).toBe('POLE') });
-test('query DOCX → 26 points, layer from file name', async () => { const r = await importFile('QUERY_1_-_A05K51V.docx', await makeDocx(QUERY_DOCX_SPEC)); expect(r.points).toHaveLength(26); expect(r.layerSuggestion).toBe('QUERY 1'); expect(r.points[22].refImageIds).toHaveLength(2) });
-test.skipIf(!hasSoffice())('query DOCX converted to PDF gives the same labels', async () => { const pdf = await sofficeToPdf(await makeDocx(QUERY_DOCX_SPEC)); const r = await importFile('QUERY_1_-_A05K51V.pdf', pdf); expect(r.points.map(p => p.label)).toEqual((await importFile('QUERY_1_-_A05K51V.docx', await makeDocx(QUERY_DOCX_SPEC))).points.map(p => p.label)) });
-test('unparseable point line is reported', async () => { const r = await importFile('x.pdf', await makePdf({ pages: [{ freeText: ['POLE 8 = 39.6361,-119.69\rPOLE 9 = 39.63,abc'] }] })); expect(r.points).toHaveLength(1); expect(r.unread).toEqual([expect.objectContaining({ text: 'POLE 9 = 39.63,abc', sourcePage: 1 })]) });
-test('stray coordinates become flagged unlabelled points', async () => expect((await importFile('x.pdf', await makePdf({ pages: [{ lines: [{ text: 'see 39.1234,-119.1234', x: 50, y: 700 }] }] }))).points[0].flags).toContain('unlabelled'));
-test('same point in annotation and page text is not doubled', async () => expect((await importFile('x.pdf', await makePdf({ pages: [{ freeText: ['POLE 1 = 39.1234,-119.1234'], lines: [{ text: 'POLE 1 = 39.1234,-119.1234', x: 50, y: 700 }] }] }))).points).toHaveLength(1));
-test('unsupported type', async () => await expect(importFile('job.xlsx', Buffer.from(''))).rejects.toMatchObject({ code: 'unsupported_type' }));
-```
-`real-fixtures.test.ts` uses `describe.skipIf(!existsSync(dir))` over `server/test/fixtures-private/`: `A05J9XE.pdf` → the 7 labels with the exact coordinates listed in spec §5.1 (`POLE 1` = 39.63609452036168, -119.69104360818118 … `POLE 7` = 39.63616773905345, -119.67284033048661); `QUERY_1_-_A05K51V.docx` → 26 points, `points[0]` = `Query 1-1` at 39.35535679, -119.81288376, last two `Query 1-25A` (39.3548480, -119.8126657) and `Query 1-25B` (39.3540205, -119.8126599); and, if soffice exists, the same DOCX converted to PDF → the same 26 labels.
+- [ ] **Step 1: Copy the owner's samples** (git-ignored): `mkdir -p importer/src/test/resources/private && cp /root/.claude/uploads/ba4638bf-5ef8-5958-b902-cca747642d63/958958f7-A05J9XE.pdf importer/src/test/resources/private/A05J9XE.pdf && cp "/root/.claude/uploads/ba4638bf-5ef8-5958-b902-cca747642d63/a4755df1-QUERY_1_-_A05K51V.docx" importer/src/test/resources/private/QUERY_1_-_A05K51V.docx`. Confirm `git status` doesn't list them.
 
-- [ ] **Step 2: Copy the owner's samples** (not committed): `mkdir -p server/test/fixtures-private && cp /root/.claude/uploads/ba4638bf-5ef8-5958-b902-cca747642d63/958958f7-A05J9XE.pdf server/test/fixtures-private/A05J9XE.pdf && cp "/root/.claude/uploads/ba4638bf-5ef8-5958-b902-cca747642d63/a4755df1-QUERY_1_-_A05K51V.docx" server/test/fixtures-private/QUERY_1_-_A05K51V.docx`. Then confirm `git status` doesn't list them.
+- [ ] **Step 2: Write the failing tests.** `ImporterTest`:
+  - `aerialPdf`: notes annotation `"     NOTE FOR AERIAL PATH\r1. IDENTIFY THE FEASIBILITY OF ATTACHING FIBER ON POLES THROUGHOUT THE PROPOSED CABLE ROUTE ON POLE.\r2. PLEASE MARK THE POLES IN BETWEEN THE CABLE PATH IN CASE IF WE HAVE MISSED ANY OF THEM."`, plus AERIAL, plus an image. Expect labels `POLE 1`…`POLE 7`, notes contain `NOTE FOR AERIAL PATH`, `unread` empty, every point's `refImageIds` contains `page-1`, `layerSuggestion == "POLE"`.
+  - `queryDocx` → 26 points, `layerSuggestion == "QUERY 1"`, `points[22].refImageIds.size == 2`.
+  - `queryDocxAsPdfSameLabels` (skipped unless `soffice` is on PATH; convert with `soffice --headless --convert-to pdf --outdir <tmp>`).
+  - `unparseableLineReported`: `"POLE 8 = 39.6361,-119.69\rPOLE 9 = 39.63,abc"` → 1 point, and `unread` holds `POLE 9 = 39.63,abc` on page 1.
+  - `strayCoordinatesFlaggedUnlabelled`.
+  - `annotationAndPageTextNotDoubled`.
+  - `unsupportedType`: `job.xlsx` → `ImportException("unsupported_type")`.
 
-- [ ] **Step 3: Run to verify failure.** Run: `npx vitest run server/test/import/`. Expected: the new tests FAIL.
+  `RealFilesTest` (`@EnabledIf` the private files exist):
+  - `A05J9XE.pdf` gives the 7 labels with the exact §5.1 coordinates (POLE 1 = 39.63609452036168, -119.69104360818118 … POLE 7 = 39.63616773905345, -119.67284033048661);
+  - `QUERY_1_-_A05K51V.docx` gives 26 points: `Query 1-1` at 39.35535679, -119.81288376; `Query 1-25A` at 39.3548480, -119.8126657; `Query 1-25B` at 39.3540205, -119.8126599;
+  - if `soffice` exists, the DOCX converted to PDF gives the same 26 labels.
 
-- [ ] **Step 4: Implement `importFile`.** Pick the kind from the extension (`.pdf` / `.docx`, case-insensitive), else `ImportError('unsupported_type')`. Groups are the PDF groups, or the single DOCX group. For each group:
-  - a group with no coordinate pairs → its text goes to `notes`;
-  - otherwise run `extractLabelledPoints` on the group text; if it found no labelled points, run `extractQueryItems` on the group's blocks with layer `layerFromFileName(fileName)`;
-  - leftover coordinates → points with type/layer = file-name layer, num by sequence, flag `unlabelled`;
-  - leftover lines matching `/\b(POLE|PED|HH|MH|BU|SAI|PFP|MDU)\b\s*\d/i` or `/\d{1,3}\.\d{3,}/` → `unread`, with reason `type and number without readable coordinates` or `number that looks like a coordinate`.
-  Then de-duplicate (same label, coordinates within 1e-7). Add `page-<p>` to each point's `refImageIds` (PDF), run `addSanityFlags`, and set `layerSuggestion` to the most common layer. `refImages` lists page renders (`kind 'page'`) and item images (`kind 'item'`).
+- [ ] **Step 3: Run to verify failure.** Run: `./gradlew :importer:test`. Expected: the new tests FAIL.
 
-- [ ] **Step 5: Run to verify pass.** Run: `npx vitest run server/test/import/`. Expected: PASS, including the real-fixture tests on this machine.
+- [ ] **Step 4: Implement `importFile`:**
+  - **Kind:** from the extension; otherwise `ImportException("unsupported_type")`.
+  - **Per group:**
+    - a group with no coordinate pairs → notes;
+    - otherwise run `extractLabelledPoints`; if it finds no labelled points, run `extractQueryItems` with `layerFromFileName(fileName)`.
+  - **Leftover coordinates** → flagged `unlabelled` points.
+  - **Leftover lines** matching `\b(POLE|PED|HH|MH|BU|SAI|PFP|MDU)\b\s*\d` (ignore case) or `\d{1,3}\.\d{3,}` → `unread`, with reason `type and number without readable coordinates` or `number that looks like a coordinate`.
+  - **Cleanup:** de-duplicate (same label, coordinates within 1e-7); add `page-<p>` to PDF points; `addSanityFlags`.
+  - **Layer suggestion:** the most common layer.
 
-- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(import): importFile orchestration with real-file checks"`
+- [ ] **Step 5: Run to verify pass.** Run: `./gradlew :importer:test`. Expected: PASS, including the real-file tests on this machine.
+
+- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(importer): importFile with real-file checks"`
 
 ---
 
-## Milestone C: Server core
+## Milestone C: `sharepoint` (used by app and server)
 
-### Task 9: Config, database, app factory, destination interface
+### Task 9: Destination interface, fake destination, folder resolver
 
-**Files:**
-- Create: `server/src/config.ts`, `server/src/clock.ts`, `server/src/db/index.ts`, `server/src/db/migrations/001_init.sql`, `server/src/app.ts`, `server/src/context.ts`, `server/src/index.ts`, `server/src/delivery/destination.ts`
-- Test: `server/test/app.test.ts`, `server/test/helpers/test-app.ts`
+**Files:** Create `sharepoint/build.gradle.kts`, `sharepoint/src/main/kotlin/com/fieldmaxx/sharepoint/Destination.kt`, `sharepoint/src/main/kotlin/com/fieldmaxx/sharepoint/FakeDestination.kt` (in `main`, used by server and app tests), `sharepoint/src/main/kotlin/com/fieldmaxx/sharepoint/FolderResolver.kt`; Test `sharepoint/src/test/kotlin/com/fieldmaxx/sharepoint/FolderResolverTest.kt`
+
+**Interfaces:**
+- Consumes: `PointKey`, `Where`, `categoryMatches`, `pointFolderMatches`, `defaultFolderName` (Task 2).
+- Produces (paths are relative to Field Notes, `/`-separated, `""` = root):
+```kotlin
+data class FileInfo(val size: Long)
+data class ChunkSession(val uploadId: String, val offset: Long)
+enum class DestinationErrorCode { REQUIRES_SIGN_IN, FORBIDDEN, NOT_FOUND, EXISTS, NETWORK, UPLOAD_SESSION_LOST, UNEXPECTED }
+class DestinationException(val code: DestinationErrorCode, message: String) : Exception(message)
+interface PhotoDestination {
+  fun rootName(): String
+  fun listFolders(relPath: String): List<String>
+  fun ensureFolder(relPath: String)
+  fun fileInfo(relPath: String): FileInfo?
+  fun upload(relPath: String, bytes: ByteArray)                                   // small files (exports)
+  fun uploadChunked(relPath: String, file: java.io.File, chunkBytes: Int, resume: ChunkSession?, onProgress: (ChunkSession) -> Unit)
+  fun download(relPath: String, out: java.io.OutputStream)
+}
+typealias DestinationFactory = (fieldNotesUrl: String) -> PhotoDestination
+class FakeDestination(private val root: String = "Field Notes") : PhotoDestination {
+  val folders: MutableSet<String>; val files: MutableMap<String, ByteArray>; val calls: MutableList<String>
+  fun failNext(n: Int, code: DestinationErrorCode); var uploadDelayMs: Long; var dropChunkAfter: Int?   // simulate a dropped connection
+}
+sealed interface FolderResolution { data class Found(val path: String) : FolderResolution; data class Created(val path: String) : FolderResolution; data class Ambiguous(val candidates: List<String>) : FolderResolution }
+class FolderResolver(private val dest: PhotoDestination) { fun resolve(p: PointKey): FolderResolution }
+```
+
+- [ ] **Step 1: Write the failing tests:**
+  - `a05j9xeTopLevel`: folders `1`, `2`, `3` + POLE 1 → `Found("1")`.
+  - `categoryMixedCase`: `POLE`, `POLE/POLE_14b` → `Found("POLE/POLE_14b")`.
+  - `nothingCreatesPole33`: → `Created("POLE/POLE_33")`, and the folder exists in the fake.
+  - `queryCategoryExists`: → `Created("QUERY 1/Query_1-43")`.
+  - `queryNeverMatchesTopLevelPoleFolder`.
+  - `categoryPreferredOverTop`.
+  - `twoCandidatesAmbiguous`.
+  - `existingCategorySpellingReused` (`Query 3` stays `Query 3`).
+  - `listingsCachedPerResolver` (`listFolders("")` called once for two points).
+
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :sharepoint:test --tests '*FolderResolverTest'`. Expected: FAIL.
+
+- [ ] **Step 3: Implement.**
+  - **Resolver order (§6.6.1):** the category folder's subfolders, then the top level, otherwise create `<existing-or-new category>/<defaultFolderName(label)>`. Invalidate the cached listing for a folder after creating inside it.
+  - **Fake rules:** `upload` throws `EXISTS` if the path exists and `NOT_FOUND` if the parent is missing. `uploadChunked` honours `resume` and `dropChunkAfter` (throws `NETWORK` after N chunks, having reported progress).
+
+- [ ] **Step 4: Run to verify pass.** Expected: PASS.
+
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(sharepoint): destination interface, fake, folder resolver"`
+
+### Task 10: SharePoint share-link client
+
+**Files:** Create `sharepoint/src/main/kotlin/com/fieldmaxx/sharepoint/SharePointLinkDestination.kt`, `sharepoint/src/test/kotlin/com/fieldmaxx/sharepoint/MockSharePoint.kt`; Test `sharepoint/src/test/kotlin/com/fieldmaxx/sharepoint/SharePointLinkTest.kt`, `sharepoint/src/test/kotlin/com/fieldmaxx/sharepoint/SharePointLiveTest.kt`
 
 **Interfaces:**
 - Produces:
-```ts
-// config.ts
-export interface Config { dataDir: string; port: number; publicOrigin: string; sessionDays: number; destination: 'sharepoint' | 'fake'; buildId: string; testRoutes: boolean }
-export function loadConfig(env?: NodeJS.ProcessEnv): Config;   // FMX_DATA_DIR (./data), PORT (8080), FMX_PUBLIC_ORIGIN, FMX_DESTINATION ('sharepoint'), FMX_BUILD_ID (git sha or 'dev'), FMX_TEST_ROUTES ('1' enables); sessionDays 90
-// clock.ts
-export interface Clock { now(): number }
-export const systemClock: Clock;
-export class FakeClock implements Clock { constructor(t?: number); now(): number; advance(ms: number): void }
-// db/index.ts
-export type DB = import('better-sqlite3').Database;
-export function openDb(file: string): DB;          // WAL, foreign_keys ON, runs migrations in order, records user_version
-// delivery/destination.ts
-export interface PhotoDestination { rootName(): Promise<string>; listFolders(relPath: string): Promise<string[]>; ensureFolder(relPath: string): Promise<void>; fileInfo(relPath: string): Promise<{ size: number } | null>; upload(relPath: string, data: Buffer): Promise<void> }
-export type DestinationErrorCode = 'requires_sign_in' | 'forbidden' | 'not_found' | 'exists' | 'network' | 'unexpected';
-export class DestinationError extends Error { constructor(public code: DestinationErrorCode, message: string) { super(message) } }
-export type DestinationFactory = (fieldNotesUrl: string) => PhotoDestination;
-// context.ts
-export interface ChangeRecorder { record(c: { jobId: string | null; entity: Change['entity']; entityId: string; data: Change['data'] }): Change }
-export interface Ctx { config: Config; db: DB; clock: Clock; destinations: DestinationFactory; changes: ChangeRecorder /* ChangeLog from Task 11 implements it; a no-op recorder until then */; delivery: { kick(): void } /* DeliveryWorker from Task 17; no-op until then */ }
-// app.ts
-export async function buildApp(ctx: Ctx): Promise<import('fastify').FastifyInstance>;
-// test helper
-export async function testApp(opts?: { clock?: FakeClock; destination?: PhotoDestination }): Promise<{ app: FastifyInstance; ctx: Ctx; login(username: string): Promise<string /* cookie */>; seedUser(u: { username: string; role: Role; password?: string }): Promise<User> }>;
+```kotlin
+class SharePointLinkDestination(shareUrl: String, client: okhttp3.OkHttpClient, clock: java.time.Clock = java.time.Clock.systemUTC()) : PhotoDestination
+fun spPathLiteral(serverRelativePath: String): String   // doubles ', percent-encodes each segment, keeps "/"
+fun sharePointDestinations(client: okhttp3.OkHttpClient): DestinationFactory   // one cached instance per URL for 30 min
 ```
-`relPath` values are relative to the Field Notes folder, using `/` separators (`''` = the root).
 
-- [ ] **Step 1: Write `001_init.sql`.** Times are INTEGER ms since epoch; JSON columns are TEXT. Tables:
+- [ ] **Step 1: Write `MockSharePoint`** (OkHttp `MockWebServer` + `Dispatcher`) emulating the calls proven in §5.5 and §5.6, recording requests. It supports both link shapes:
+  - **Business:** `/:f:/g/personal/u/TOKEN?e=x` → 302 to `/personal/u/_layouts/15/onedrive.aspx?id=%2Fpersonal%2Fu%2FDocuments%2FOSP%20FIELDING%2FField%20Notes&ga=1`, with `Set-Cookie: FedAuth=abc`.
+  - **Personal:** `/f/c/cid/TOKEN?e=x` → 301 to `/:f:/g/personal/CID/TOKEN?...` → 302 to `/?id=…&spopath=%2Fpersonal%2Fcid%2FDocuments%2FFieldmaxx&listurl=…`, with the cookie.
+  - **API calls:**
+    - `POST <site>/_api/contextinfo` → `{FormDigestValue, FormDigestTimeoutSeconds: 1800}`;
+    - `GET …/GetFolderByServerRelativePath(decodedurl='…')/Folders?$select=Name`;
+    - `POST …/folders/AddUsingPath(decodedurl='…',overwrite=false)`;
+    - `GET …/GetFileByServerRelativePath(decodedurl='…')?$select=Length` → 200 or 404;
+    - `POST …/Files/AddUsingPath(decodedurl='name',overwrite=false)` → 200, or 400 `already exists`;
+    - `StartUpload(uploadId=guid'…')`, `ContinueUpload(uploadId=guid'…',fileOffset=N)`, `FinishUpload(uploadId=guid'…',fileOffset=N)`; an unknown or expired uploadId → 400;
+    - `GET …/GetFileByServerRelativePath(decodedurl='…')/$value`.
+  - **Switches:** cookie expiry (403 `Access denied` until the share URL is fetched again); a sign-in-only link (302 to `https://login.microsoftonline.com/...`); drop the connection on chunk N; expire upload sessions.
+
+- [ ] **Step 2: Write the failing tests:**
+  - `businessLinkRootName` → `Field Notes`.
+  - `personalLinkUsesSpopath` → root path `/personal/cid/Documents/Fieldmaxx` and site `<host>/personal/cid`.
+  - `listFoldersEncodesPath`.
+  - `pathLiteral` (`spPathLiteral("/a/O'Brien St/x") == "/a/O''Brien%20St/x"`).
+  - `ensureFolderCreatesEachSegment`.
+  - `uploadSendsDigestAndNoOverwrite`.
+  - `fileInfoNullOn404`.
+  - `existingNameThrowsExists`.
+  - `chunkedUploadCompletes` (3 chunks; final size equals the file length; `onProgress` offsets 3200000, 6400000, …).
+  - `resumesAtConfirmedOffset` (drop on chunk 2, then `uploadChunked(resume = lastProgress)` sends only the remaining chunks).
+  - `lostSessionRestartsOnOwnPartialFile` (expired uploadId with `resume` given → a new `StartUpload` on the same path, no `EXISTS`).
+  - `signInRedirect` → `REQUIRES_SIGN_IN` `"This link needs a Microsoft sign-in"`.
+  - `digestRefreshedAfterTimeout`.
+  - `cookieExpiryReResolvesOnce`.
+  - `persistent403` → `FORBIDDEN` `"The link no longer allows uploads"`.
+  - `networkFailure` → `NETWORK`.
+  - `downloadStreamsBytes`.
+
+  `SharePointLiveTest` (`@EnabledIfEnvironmentVariable(named = "FMX_LIVE_TEST_LINK", matches = ".+")`) runs against the owner's test folder under `_fieldmaxx_it/<timestamp>/`: ensure folder, chunked upload of 9 MB, `fileInfo` size matches, duplicate refused, download equals upload.
+
+- [ ] **Step 3: Run to verify failure.** Run: `./gradlew :sharepoint:test --tests '*SharePointLinkTest'`. Expected: FAIL.
+
+- [ ] **Step 4: Implement.**
+  - **Resolve:** follow redirects manually with a browser User-Agent (`Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36`), keeping cookies (OkHttp `CookieJar`). Root path = the `spopath` query parameter if present, else the `id` parameter of the `onedrive.aspx` URL. Site = Location origin + `/personal/<segment>`.
+  - **Every request:** send `Accept: application/json;odata=nometadata`.
+  - **Digest:** cached until 60 s before its timeout.
+  - **Auth errors:** on 401/403 re-resolve once, then retry.
+  - **Chunked upload:**
+    - if `resume == null`: create an empty file (`EXISTS` propagates), then `StartUpload` with the first chunk;
+    - then `ContinueUpload` for each middle chunk, reporting `ChunkSession` after each;
+    - `FinishUpload` for the last chunk;
+    - on an expired-session error while resuming: restart with a new uploadId on the same path.
+
+- [ ] **Step 5: Run to verify pass.** Expected: PASS. Then run the live test once: `FMX_LIVE_TEST_LINK='<owner test link>' ./gradlew :sharepoint:test --tests '*SharePointLiveTest'` (the link is in the session conversation, never committed). Expected: PASS.
+
+- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(sharepoint): share-link client with chunked resumable upload"`
+
+---
+
+## Milestone D: `server` (Ktor)
+
+### Task 11: Server scaffold, database, config, test harness
+
+**Files:** Create `server/build.gradle.kts`, `server/src/main/kotlin/com/fieldmaxx/server/{Main.kt, Config.kt, Db.kt, AppModule.kt, Ctx.kt}`, `server/src/main/resources/migrations/001_init.sql`; Test `server/src/test/kotlin/com/fieldmaxx/server/{TestApp.kt, ScaffoldTest.kt}`
+
+**Interfaces:**
+- Produces:
+```kotlin
+data class Config(val dataDir: java.nio.file.Path, val port: Int, val publicOrigin: String, val sessionDays: Int, val destination: String /* sharepoint|fake */, val buildId: String)
+fun loadConfig(env: Map<String, String> = System.getenv()): Config   // FMX_DATA_DIR(./data) PORT(8080) FMX_PUBLIC_ORIGIN FMX_DESTINATION(sharepoint) FMX_BUILD_ID(dev); sessionDays 90
+class Db(url: String) { fun <T> tx(block: java.sql.Connection.() -> T): T; fun <T> read(block: java.sql.Connection.() -> T): T }   // WAL, foreign_keys, runs migrations
+interface ChangeRecorder { fun record(jobId: String?, entity: String, entityId: String, job: Job? = null, point: Point? = null, photo: PhotoInfo? = null): Change }
+interface DeliveryKick { fun kick() }
+class Ctx(val config: Config, val db: Db, val clock: java.time.Clock, val destinations: DestinationFactory, var changes: ChangeRecorder, var delivery: DeliveryKick)
+fun io.ktor.server.application.Application.fieldmaxx(ctx: Ctx)
+// test harness
+class MutableClock(var nowMs: Long = 1_762_000_000_000) : java.time.Clock()
+class TestApp(val clock: MutableClock = MutableClock(), val destination: FakeDestination = FakeDestination()) { val ctx: Ctx; fun run(block: suspend ApplicationTestBuilder.(TestApp) -> Unit); suspend fun ApplicationTestBuilder.tokenFor(username: String, role: Role = Role.tech): String }
+```
+
+- [ ] **Step 1: Write `001_init.sql`.** Times are INTEGER ms since epoch; JSON is TEXT. Tables:
   - `users(id, username UNIQUE COLLATE NOCASE, display_name, password_hash, role, disabled, created_at)`
   - `sessions(token_hash PK, user_id, created_at, expires_at)`
   - `login_failures(username, at)`
   - `jobs(id, name, notes, field_notes_url, status, created_by, created_at, finished_at, deleted_at, deleted_by, delivery_problem)`
-  - `job_files(id, job_id, kind, original_name, stored_path, sha256, layer, uploaded_by, created_at)`
+  - `job_files(id, job_id, kind, original_name, stored_path, layer, uploaded_by, created_at)`
   - `imports(id, user_id, file_name, kind, stored_path, result_json, created_at)`
   - `ref_images(id, job_id, import_id, kind, page, stored_path, mime)`
   - `points(id, job_id, layer, type, num, label, lat, lon, orig_lat, orig_lon, description, status, cant_reason, cant_text, pole_json, comment, folder_path, folder_candidates_json, ref_image_ids_json, flags_json, source_file_id, source_page, added_by, created_at, updated_at, updated_by, deleted_at, deleted_by)`
-  - `photos(id, job_id, point_id, user_id, file_name, size, sha256, taken_at, lat, lon, accuracy_m, heading_deg, status, received_bytes, stored_path, dest_path, attempts, next_attempt_at, last_error, received_at, confirmed_at, upload_ms, reused_from, purged_at, removed_at, removed_by)`
+  - `photos(id, job_id, point_id, user_id, file_name, size, sha256, taken_at, lat, lon, accuracy_m, heading_deg, status, dest_path, last_error, attempts, next_attempt_at, backup_path, backup_offset, backup_received_at, backup_purged_at, thumb_path, confirmed_at, upload_ms, reused_from, source_kind, removed_at, removed_by, created_at)`
   - `counters(name PK, value)`, `settings(key PK, value)`
   - `ops_done(op_id PK, user_id, at, result_json)`
   - `changes(seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id, entity, entity_id, data_json, at)`
-  - `positions(user_id PK, lat, lon, accuracy_m, altitude_m, at)`
+  - `positions(user_id PK, lat, lon, accuracy_m, altitude_m, at, paused)`
   - `events(id INTEGER PRIMARY KEY AUTOINCREMENT, job_id, user_id, kind, data_json, at)`
-  Indexes: `points(job_id)`, `photos(point_id)`, `photos(status, next_attempt_at)`, `changes(job_id)`.
+  - `app_releases(version_code PK, version_name, file_path, sha256, created_at)`
+  Indexes on `points(job_id)`, `photos(point_id)`, `photos(status, next_attempt_at)`, `photos(lat, lon)`, `changes(job_id)`.
 
-- [ ] **Step 2: Write the failing tests:**
-```ts
-test('migrations create all tables', () => { const db = openDb(':memory:'); const names = db.prepare("select name from sqlite_master where type='table'").all().map((r: any) => r.name); for (const t of ['users','sessions','jobs','points','photos','changes','positions','events','ops_done','imports','ref_images','job_files','counters','settings','login_failures']) expect(names).toContain(t) });
-test('migrations are idempotent', () => { const f = tmpFile(); openDb(f).close(); expect(() => openDb(f)).not.toThrow() });
-test('GET /api/version', async () => { const { app } = await testApp(); const r = await app.inject('/api/version'); expect(r.json()).toEqual({ build: 'test' }) });
-test('config defaults', () => expect(loadConfig({})).toMatchObject({ port: 8080, sessionDays: 90, destination: 'sharepoint', testRoutes: false }));
-```
+- [ ] **Step 2: Write the failing tests:** `migrationsCreateAllTables`, `migrationsIdempotent`, `versionEndpointReturnsBuild` (`GET /api/version` → `{"build":"test"}`), `configDefaults`.
 
-- [ ] **Step 3: Run to verify failure.** Run: `npx vitest run server/test/app.test.ts`. Expected: FAIL.
+- [ ] **Step 3: Run to verify failure.** Run: `./gradlew :server:test --tests '*ScaffoldTest'`. Expected: FAIL.
 
-- [ ] **Step 4: Implement** the files above. `buildApp` registers cookie, websocket, multipart (limit 60 MB) and the routes added by later tasks; `@fastify/static` serves `web/dist` with SPA fallback to `index.html` for non-`/api` paths when the directory exists. `index.ts` loads config, opens `<dataDir>/fieldmaxx.db`, builds the context, starts the app and the delivery worker. `testApp` uses `:memory:`, a temp `dataDir`, buildId `test`, and a `FakeDestination` (Task 15) once it exists; until then a stub that throws.
+- [ ] **Step 4: Implement.** Ktor with Netty, `ContentNegotiation(FmxJson)`, `WebSockets`, and `StatusPages` mapping exceptions to `{error}` JSON. `Main.kt` wires real collaborators: `sharePointDestinations`, `ChangeLog` (Task 13), `DeliveryWorker` (Task 17); until those exist, use no-op implementations. `TestApp` uses in-memory SQLite (`jdbc:sqlite:file:test<N>?mode=memory&cache=shared`), a temp `dataDir`, buildId `test` and a `FakeDestination`.
 
 - [ ] **Step 5: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(server): config, sqlite schema, app factory, destination interface"`
+- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(server): scaffold, schema, config, test harness"`
 
-### Task 10: Accounts, sessions, admin user management
+### Task 12: Accounts and sessions
 
-**Files:**
-- Create: `server/src/auth/passwords.ts`, `server/src/auth/sessions.ts`, `server/src/auth/plugin.ts`, `server/src/auth/routes.ts`, `server/src/users/service.ts`, `server/src/users/routes.ts`, `server/src/cli.ts`
-- Test: `server/test/auth.test.ts`, `server/test/users.test.ts`
+**Files:** Create `server/src/main/kotlin/com/fieldmaxx/server/auth/{Passwords.kt, Sessions.kt, AuthPlugin.kt, AuthRoutes.kt}`, `server/src/main/kotlin/com/fieldmaxx/server/users/{UserService.kt, UserRoutes.kt}`, `server/src/main/kotlin/com/fieldmaxx/server/Cli.kt`; Test `server/src/test/kotlin/com/fieldmaxx/server/AuthTest.kt`
 
 **Interfaces:**
 - Produces:
-```ts
-export async function hashPassword(pw: string): Promise<string>;
-export async function verifyPassword(hash: string, pw: string): Promise<boolean>;
-export function createSession(ctx: Ctx, userId: string): string;                 // returns raw token; stores sha256(token)
-export function sessionUser(ctx: Ctx, token: string): User | null;               // slides expiry to now + sessionDays
-export async function createUser(ctx: Ctx, input: { username: string; displayName: string; password: string; role: Role }): Promise<User>;
-// Fastify: request.user (User); preHandlers requireUser, requireAdmin (exported from auth/plugin.ts)
-// Routes: POST /api/auth/login {username,password} → {user}; POST /api/auth/logout; GET /api/auth/me → {user}; POST /api/auth/password {current,next}
-//         GET /api/admin/users; POST /api/admin/users {username,displayName,password,role}; PATCH /api/admin/users/:id {displayName?,role?,disabled?,password?}
-// CLI: `node dist/cli.js create-admin <username> "<Display Name>"` reads the password from FMX_ADMIN_PASSWORD
+```kotlin
+fun hashPassword(pw: String): String; fun verifyPassword(hash: String, pw: String): Boolean   // Argon2id (Bouncy Castle), encoded with salt and params
+fun createSession(ctx: Ctx, userId: String): String          // raw token (32 random bytes, base64url); stores sha256
+fun sessionUser(ctx: Ctx, token: String): User?               // slides expires_at to now + sessionDays
+fun createUser(ctx: Ctx, username: String, displayName: String, password: String, role: Role): User
+// Ktor: `authenticate("bearer")` → call.user(): User; requireAdmin()
+// Routes: POST /api/auth/login {username,password} → {token,user}; POST /api/auth/logout; GET /api/auth/me; POST /api/auth/password {current,next}
+//         GET/POST /api/admin/users; PATCH /api/admin/users/{id} {displayName?, role?, disabled?, password?}
+// CLI: `java -jar server.jar create-admin <username> "<Display Name>"` (password from FMX_ADMIN_PASSWORD)
 ```
 
 - [ ] **Step 1: Write the failing tests:**
-```ts
-test('login sets fmx_session cookie (httpOnly, 90 days)', async () => { const { app, seedUser } = await testApp(); await seedUser({ username: 'free.walters', role: 'tech', password: 'pw123456' }); const r = await app.inject({ method: 'POST', url: '/api/auth/login', payload: { username: 'Free.Walters', password: 'pw123456' } }); expect(r.statusCode).toBe(200); const c = r.cookies.find(c => c.name === 'fmx_session')!; expect(c.httpOnly).toBe(true); expect(c.maxAge).toBe(90 * 86400) });
-test('wrong password → 401 "Wrong username or password"', …);
-test('11th failure within 15 min → 429', …);
-test('disabled user → 403', …);
-test('session slides: valid after 89 days idle, then 89 more', …);   // FakeClock
-test('session expires after 91 days idle', …);
-test('tech cannot list users (403); admin can', …);
-test('admin creates user, resets password, disables; usernames unique case-insensitively (409)', …);
-test('change own password requires current password', …);
-test('create-admin CLI creates an admin', …);   // call the exported cli function directly
-```
+  - `loginReturnsTokenCaseInsensitiveUsername`
+  - `wrongPassword401WithMessage` (`"Wrong username or password"`)
+  - `eleventhFailure429`
+  - `disabledUser403`
+  - `sessionSlidesAfter89Days`
+  - `sessionExpiresAfter91IdleDays`
+  - `techCannotListUsers`
+  - `adminCreatesResetsDisables`
+  - `duplicateUsername409`
+  - `changePasswordNeedsCurrent`
+  - `cliCreatesAdmin`
 
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run server/test/auth.test.ts server/test/users.test.ts`. Expected: FAIL.
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :server:test --tests '*AuthTest'`. Expected: FAIL.
 
-- [ ] **Step 3: Implement.** argon2id via `@node-rs/argon2`. Cookie: `httpOnly`, `sameSite: 'lax'`, `secure` when `publicOrigin` starts with `https`, `path: '/'`. Ids: `crypto.randomUUID()`. Lockout counts rows in `login_failures` for the username in the last 15 min; clear them on success.
-
-- [ ] **Step 4: Run to verify pass.** Expected: PASS.
-
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(server): accounts, sessions, admin user management"`
-
-### Task 11: Change log, WebSocket hub, crew positions
-
-**Files:**
-- Create: `server/src/sync/changes.ts`, `server/src/sync/hub.ts`, `server/src/sync/routes.ts`, `server/src/positions/service.ts`
-- Test: `server/test/sync.test.ts`
-
-**Interfaces:**
-- Produces:
-```ts
-export class ChangeLog implements ChangeRecorder { constructor(db: DB, clock: Clock, hub: Hub); record(c: { jobId: string | null; entity: Change['entity']; entityId: string; data: Change['data'] }): Change; since(seq: number, limit?: number): { changes: Change[]; seq: number } }
-export class Hub { add(socket: WebSocket, user: User): void; broadcast(msg: ServerMessage): void; size(): number }
-export function savePosition(ctx: Ctx, user: User, m: ClientMessage): CrewPosition;
-export function listPositions(ctx: Ctx): CrewPosition[];   // omits positions older than 1 h
-// Routes: GET /api/changes?since=N → {changes, seq}; GET /api/positions; WS /api/ws (cookie auth; sends {type:'hello', seq} on open)
-```
-
-- [ ] **Step 1: Write the failing tests:** `seq increases and since() filters`; `since() caps at limit and returns latest seq`; `ws rejects without session (close code 4401)`; `ws hello carries current seq`; `change broadcast reaches all connected clients`; `position message is stored and broadcast to others with displayName`; `positions older than 1 h are not listed`. Run the server with `app.listen({ port: 0 })` and use the `ws` client package.
-
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run server/test/sync.test.ts`. Expected: FAIL.
-
-- [ ] **Step 3: Implement.** `record` inserts into `changes` and broadcasts `{type:'change'}`. Positions are upserted per user and broadcast; they are not written to `changes`.
+- [ ] **Step 3: Implement** (ids via `UUID.randomUUID()`; the lockout counts `login_failures` rows from the last 15 min and clears them on success).
 
 - [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(server): change log, websocket hub, crew positions"`
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(server): accounts, bearer sessions, admin users, cli"`
 
-### Task 12: Imports and jobs API
+### Task 13: Change log, WebSocket hub, crew positions
 
-**Files:**
-- Create: `server/src/imports/routes.ts`, `server/src/jobs/service.ts`, `server/src/jobs/routes.ts`, `server/src/links/routes.ts`
-- Test: `server/test/jobs.test.ts`
+**Files:** Create `server/src/main/kotlin/com/fieldmaxx/server/sync/{ChangeLog.kt, Hub.kt, SyncRoutes.kt}`, `server/src/main/kotlin/com/fieldmaxx/server/positions/Positions.kt`; Test `server/src/test/kotlin/com/fieldmaxx/server/SyncTest.kt`
 
 **Interfaces:**
-- Consumes: `importFile` (Task 8), `ChangeLog` (Task 11), `DestinationFactory` (Task 9), `pointLabel`, `defaultFolderName` (Task 2).
+- Produces: `class ChangeLog(db: Db, clock: Clock, hub: Hub) : ChangeRecorder { fun since(seq: Long, limit: Int = 1000): Pair<List<Change>, Long> }`; `class Hub { fun add(session: DefaultWebSocketServerSession, user: User); fun broadcast(msg: ServerMessage) }`; `fun savePosition(ctx: Ctx, user: User, m: ClientMessage): CrewPosition`; `fun listPositions(ctx: Ctx): List<CrewPosition>` (omits positions older than 1 h). Routes: `GET /api/changes?since=N` → `{changes, seq}`; `GET /api/positions`; `WS /api/ws?token=…` (sends `Hello(seq)` on open).
+
+- [ ] **Step 1: Write the failing tests:** `seqIncreasesAndSinceFilters`, `sinceCapsAtLimit`, `wsRejectsBadToken` (close code 4401), `wsHelloCarriesSeq`, `changeBroadcastToAll`, `positionStoredAndBroadcastWithName`, `pausedMarksPositionPaused`, `positionsOlderThanHourHidden`.
+
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :server:test --tests '*SyncTest'`. Expected: FAIL.
+
+- [ ] **Step 3: Implement.** `record` inserts into `changes` and broadcasts a `ChangeMsg`. Positions are upserted and broadcast, and never written to `changes`. `Paused` keeps the last coordinates, with `paused = true` and `at = now`.
+
+- [ ] **Step 4: Run to verify pass.** Expected: PASS.
+
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(server): change log, websocket hub, positions"`
+
+### Task 14: Imports and jobs API
+
+**Files:** Create `server/src/main/kotlin/com/fieldmaxx/server/jobs/{ImportRoutes.kt, JobService.kt, JobRoutes.kt, Rows.kt}`, `server/src/main/kotlin/com/fieldmaxx/server/links/LinkRoutes.kt`; Test `server/src/test/kotlin/com/fieldmaxx/server/JobsTest.kt` (test dependency `testFixtures(project(":importer"))`)
+
+**Interfaces:**
+- Consumes: `importFile` (Task 8), `ChangeRecorder`, `DestinationFactory`.
 - Produces:
-```ts
-export function createJob(ctx: Ctx, user: User, input: CreateJobInput): { job: Job; skippedDuplicates: string[] };
-export function addImportToJob(ctx: Ctx, user: User, jobId: string, imp: JobImportInput): { points: Point[]; skippedDuplicates: string[] };
-export function deleteJob(ctx: Ctx, user: User, jobId: string): void;
-export function restoreJob(ctx: Ctx, user: User, jobId: string): void;
-export function purgeDeletedJobs(ctx: Ctx): number;
-export function jobSnapshot(ctx: Ctx, jobId: string): JobSnapshot;
-export function rowToJob(r: any): Job; export function rowToPoint(r: any): Point;   // reused by later tasks
-// Routes:
-// POST /api/imports (multipart 'file') → ImportPreview          GET /api/imports/:importId/ref/:refId → image
-// POST /api/jobs CreateJobInput → {job, skippedDuplicates}       POST /api/jobs/:id/imports JobImportInput → {points, skippedDuplicates}
-// GET /api/jobs?include=finished|deleted → Job[] (with counts: {pointsTotal, pointsDone})   GET /api/jobs/:id/snapshot → JobSnapshot
-// PATCH /api/jobs/:id {name?, fieldNotesUrl?, notes?} (a new fieldNotesUrl clears deliveryProblem and calls ctx.delivery.kick())   DELETE /api/jobs/:id   POST /api/jobs/:id/restore
-// GET /api/jobs/:id/ref/:refId → image   GET /api/jobs/:id/files/:fileId → original PDF/DOCX   POST /api/links/check {url} → {ok:true, rootName} | {ok:false, error}
-// snapshot.crew = distinct users with events on the job; snapshot.files = job_files
+```kotlin
+fun createJob(ctx: Ctx, user: User, input: CreateJobInput): Pair<Job, List<String> /* skippedDuplicates */>
+fun addImportToJob(ctx: Ctx, user: User, jobId: String, imp: JobImportInput): Pair<List<Point>, List<String>>
+fun deleteJob(ctx: Ctx, user: User, jobId: String); fun restoreJob(ctx: Ctx, user: User, jobId: String); fun purgeDeletedJobs(ctx: Ctx): Int
+fun jobSnapshot(ctx: Ctx, jobId: String): JobSnapshot
+fun java.sql.ResultSet.toJob(): Job; fun java.sql.ResultSet.toPoint(): Point   // Rows.kt, reused later
+// Routes: POST /api/imports (multipart "file") → ImportPreview;  GET /api/imports/{importId}/ref/{refId}
+//         POST /api/jobs; POST /api/jobs/{id}/imports; GET /api/jobs?include=finished,deleted → List<JobListItem>
+//         GET /api/jobs/{id}/snapshot; PATCH /api/jobs/{id} {name?, fieldNotesUrl?, notes?} (new link clears deliveryProblem, calls ctx.delivery.kick())
+//         DELETE /api/jobs/{id}; POST /api/jobs/{id}/restore; GET /api/jobs/{id}/ref/{refId}; GET /api/jobs/{id}/files/{fileId}
+//         POST /api/links/check {url} → LinkCheck
 ```
 
 - [ ] **Step 1: Write the failing tests:**
-```ts
-test('upload → preview with 7 poles and stored ref images', …);              // multipart with aerialPdf()
-test('upload of .xlsx → 415 "Only PDF and Word (.docx) files"', …);
-test('create job from preview: points open, origLat null, label kept', …);
-test('draft point without coordinates is rejected (400 lists labels)', …);
-test('every signed-in user sees every active job', …);
-test('snapshot returns job, points, photos, refImages, files, crew, seq', …);
-test('setting the Field Notes link clears deliveryProblem and kicks delivery', …);
-test('creator deletes own job; other tech 403; admin may', …);
-test('admin restores within 30 days; 410 after; purge removes after 30 days', …);   // FakeClock
-test('duplicate import skips identical points', async () => { /* add same preview twice → second call skippedDuplicates has 7 labels, job still has 7 points */ });
-test('same label with different coordinates is added and flagged duplicate_label', …);
-test('link check ok with fake destination returns rootName', …);
-test('link check reports failure reason', async () => { /* destination.rootName throws DestinationError('requires_sign_in', 'This link needs a Microsoft sign-in') → {ok:false, error:'This link needs a Microsoft sign-in'} */ });
-test('creating a job records a change', …);
-```
+  - `uploadReturnsPreviewAndRefImages` (multipart with the aerial PDF built by `makePdf`)
+  - `xlsxRejected415`
+  - `createJobFromPreview`
+  - `draftWithoutCoordinates400ListsLabels`
+  - `everyUserSeesEveryActiveJob`
+  - `snapshotHasFilesAndCrew`
+  - `newLinkClearsProblemAndKicks`
+  - `creatorDeletesOtherTech403AdminMay`
+  - `adminRestoresWithin30DaysThen410`
+  - `purgeAfter30Days`
+  - `duplicateImportSkipsIdenticalPoints` (adding the same preview twice → 7 skipped, the job still has 7)
+  - `sameLabelDifferentCoordsFlagged`
+  - `linkCheckOkReturnsRootName`
+  - `linkCheckReportsFailureReason` (destination throws `REQUIRES_SIGN_IN` → `LinkCheck(ok=false, error="This link needs a Microsoft sign-in")`)
+  - `jobCreationRecordsChange`
 
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run server/test/jobs.test.ts`. Expected: FAIL.
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :server:test --tests '*JobsTest'`. Expected: FAIL.
 
-- [ ] **Step 3: Implement.** Store uploaded files under `<dataDir>/imports/<importId>/`, and images under `<dataDir>/refs/`. On job creation, move the source file to `<dataDir>/jobs/<jobId>/files/`, and link `ref_images` and the point `ref_image_ids` to the job. A duplicate is the same label within 1 m. Imports unused after 24 h are deleted by an hourly sweep, alongside `purgeDeletedJobs`.
+- [ ] **Step 3: Implement.** Files go under `<dataDir>/imports/<id>/`, `<dataDir>/jobs/<jobId>/files/` and `<dataDir>/refs/`. A duplicate is the same label within 1 m. An hourly sweep deletes imports unused for 24 h and runs `purgeDeletedJobs`.
 
 - [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
 - [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(server): imports, jobs, link check"`
 
-### Task 13: Point operations (offline-safe, idempotent)
+### Task 15: Idempotent operations
 
-**Files:**
-- Create: `server/src/points/ops.ts`, `server/src/points/routes.ts`
-- Test: `server/test/ops.test.ts`
+**Files:** Create `server/src/main/kotlin/com/fieldmaxx/server/ops/{Ops.kt, OpsRoutes.kt}`; Test `server/src/test/kotlin/com/fieldmaxx/server/OpsTest.kt`
 
 **Interfaces:**
-- Consumes: `Op`, `OpResult` (Task 1), `ChangeLog`, `rowToPoint` (Task 12).
-- Produces: `export function applyOps(ctx: Ctx, user: User, ops: Op[]): OpResult[]`. Route `POST /api/ops {ops}` → `{results}`. Photo ops (`photo.reuse`, `photo.remove`) are dispatched to Task 14's functions; until then they return `{ok:false, error:'unsupported'}`.
+- Produces: `fun applyOps(ctx: Ctx, user: User, ops: List<Op>): List<OpResult>`; route `POST /api/ops {ops}` → `{results}`. `Op.PhotoReuse`, `Op.PhotoRemove`, `Op.PhotoConfirmed` and `Op.PhotoFailed` are dispatched to Task 16 functions; until then they return `ok=false, error="unsupported"`.
 
 - [ ] **Step 1: Write the failing tests:**
-```ts
-test('replaying an opId returns the stored result and records no new change', …);
-test('point.update sets only the given fields', …);
-test('concurrent field edits both persist', async () => { /* tech A point.update {pole}, tech B point.move → point has A's pole and B's lat/lon */ });
-test('first move keeps original coordinates; later moves keep the first original', …);
-test('point.close without photoIds → error needs_photo; with photoIds → done', …);
-test('point.cantShoot needs a reason; "other" needs text', …);
-test('reopen returns point to open and clears cant fields', …);
-test('point.add creates label from pointLabel and addedBy', …);
-test('tech may delete a point with no received photos; blocked with photos_uploaded once one is received; admin may', …);
-test('point.restore is admin only', …);
-test('point.setFolder stores folderPath and clears candidates', …);
-test('ops on a deleted job → error job_deleted', …);
-test('each successful op records one change and one event', …);
-```
+  - `replayReturnsStoredResultNoNewChange`
+  - `updateSetsOnlyGivenFields`
+  - `concurrentFieldEditsBothPersist` (tech A `PointUpdate(pole)`, tech B `PointMove` → both present)
+  - `firstMoveKeepsOriginal`
+  - `closeNeedsPhotoIds` (`error == "needs_photo"`)
+  - `cantShootNeedsReasonOtherNeedsText`
+  - `reopenClearsCant`
+  - `addBuildsLabelAndAddedBy`
+  - `techDeleteAllowedUntilConfirmedThenAdminOnly` (`error == "photos_delivered"`)
+  - `restoreAdminOnly`
+  - `setFolderStoresPathClearsCandidates`
+  - `opsOnDeletedJob` (`error == "job_deleted"`)
+  - `eachOpOneChangeOneEvent`
 
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run server/test/ops.test.ts`. Expected: FAIL.
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :server:test --tests '*OpsTest'`. Expected: FAIL.
 
-- [ ] **Step 3: Implement** in one SQLite transaction per op. Store the result in `ops_done`. Set `updated_at`/`updated_by` on each change. The delete check for "received" photos is any status other than `uploading`/`removed`.
+- [ ] **Step 3: Implement.** One transaction per op; the result is stored in `ops_done`; `updated_at`/`updated_by` set on every change. The delete rule checks for photos with `status = confirmed`.
 
 - [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(server): idempotent point operations"`
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(server): idempotent point and photo operations"`
 
----
+### Task 16: Photo registry, backups, thumbnails, reuse search
 
-## Milestone D: Photos and delivery
-
-### Task 14: Photo intake (resumable chunked upload)
-
-**Files:**
-- Create: `server/src/photos/service.ts`, `server/src/photos/routes.ts`
-- Modify: `server/src/points/ops.ts` (dispatch photo ops)
-- Test: `server/test/photos.test.ts`
+**Files:** Create `server/src/main/kotlin/com/fieldmaxx/server/photos/{PhotoService.kt, PhotoRoutes.kt, Thumbs.kt}`; Modify `ops/Ops.kt`; Test `server/src/test/kotlin/com/fieldmaxx/server/PhotosTest.kt`
 
 **Interfaces:**
-- Consumes: `photoFileName`, `defaultFolderName` (Task 2), `ChangeLog`, `ctx.delivery.kick()`.
 - Produces:
-```ts
-export function createOrResume(ctx: Ctx, user: User, meta: PhotoUploadMeta): { offset: number; status: PhotoStatus };
-export async function appendChunk(ctx: Ctx, user: User, photoId: string, offset: number, body: Buffer): Promise<{ offset: number; status: PhotoStatus }>;
-export function reusePhoto(ctx: Ctx, user: User, op: Extract<Op, { kind: 'photo.reuse' }>): OpResult;
-export function removePhoto(ctx: Ctx, user: User, op: Extract<Op, { kind: 'photo.remove' }>): OpResult;
-export function nextCounter(ctx: Ctx, name: string): number;
-export function rowToPhoto(r: any): PhotoInfo;
-// Routes: POST /api/photos PhotoUploadMeta → {offset,status}; PUT /api/photos/:id/data?offset=N (application/octet-stream, ≤ 2 MB) → {offset,status}
-//         GET /api/photos/:id → PhotoInfo; GET /api/photos/:id/file → JPEG while the server copy exists (404 after purge)
+```kotlin
+fun registerPhoto(ctx: Ctx, user: User, reg: PhotoRegistration): RegisteredPhoto      // file name via photoFileName(defaultFolderName(point.label), lat ?: point.lat, lon ?: point.lon, nextCounter("photo"))
+fun renamePhoto(ctx: Ctx, user: User, photoId: String): RegisteredPhoto              // new counter after a same-name/different-size clash
+fun appendBackupChunk(ctx: Ctx, user: User, photoId: String, offset: Long, bytes: ByteArray): Pair<Long /* offset */, Boolean /* complete */>
+fun reusePhoto(ctx: Ctx, user: User, op: Op.PhotoReuse): OpResult; fun removePhoto(ctx: Ctx, user: User, op: Op.PhotoRemove): OpResult
+fun markConfirmed(ctx: Ctx, user: User, op: Op.PhotoConfirmed): OpResult; fun markFailed(ctx: Ctx, user: User, op: Op.PhotoFailed): OpResult
+fun nearbyPhotos(ctx: Ctx, lat: Double, lon: Double, radiusM: Double = 150.0, excludePointId: String?): List<ReuseCandidate>
+fun nextCounter(ctx: Ctx, name: String): Long
+fun java.sql.ResultSet.toPhoto(): PhotoInfo
+// Routes: POST /api/photos/register; POST /api/photos/{id}/rename; PUT /api/photos/{id}/backup?offset=N (octet-stream ≤ 2 MB) → {offset, complete}
+//         GET /api/photos/{id}; GET /api/photos/{id}/thumb; GET /api/photos/{id}/file (backup while kept, else 404)
+//         GET /api/photos/nearby?lat&lon&radiusM&excludePointId; GET /api/jobs/{id}/photos → List<ReuseCandidate> (this job)
 ```
 
 - [ ] **Step 1: Write the failing tests:**
-```ts
-test('create returns offset 0, status uploading', …);
-test('two chunks complete the upload → received, file name POLE_1_<lat>_<lon>_<n>.jpg, delivery kicked', …);
-test('resume returns current offset', …);
-test('wrong offset → 409 with current offset', …);
-test('sha256 mismatch → 422 and the upload restarts at 0', …);
-test('photo larger than 40 MB rejected (413)', …);
-test('photo for a deleted point → 410', …);
-test('no GPS uses the point coordinates in the file name', …);
-test('photo.reuse makes a new received photo sharing the stored file, reusedFrom set', …);
-test('photo.remove by its owner before delivery deletes the server copy; after confirmation it only hides (status removed)', …);
-test('photo.remove by another tech → forbidden; admin allowed', …);
-```
+  - `registerAssignsCadastrusName` (`POLE_1_<lat>_<lon>_<n>.jpg`)
+  - `registerIsIdempotentPerId`
+  - `noGpsUsesPointCoords`
+  - `backupChunksCompleteWithShaCheck`
+  - `wrongOffset409WithCurrent`
+  - `shaMismatch422ResetsBackup`
+  - `backupOver40MB413`
+  - `thumbnailMadeOnBackupComplete` (≤ 320 px on the long side)
+  - `confirmedOpSetsDestAndTimingsAndChange`
+  - `failedOpRecordsErrorStuckAt6`
+  - `nearbyReturnsOtherJobsWithin150mSortedByDistance`
+  - `reuseCreatesRegisteredPhotoWithOriginalCoordsAndKicksDelivery`
+  - `removeBeforeConfirmDeletesBackupAfterOnlyHides`
+  - `removeByOtherTechForbiddenAdminAllowed`
+  - `renameAssignsNewCounter`
 
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run server/test/photos.test.ts`. Expected: FAIL.
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :server:test --tests '*PhotosTest'`. Expected: FAIL.
 
-- [ ] **Step 3: Implement.** Write chunks to `<dataDir>/photos/<id>.part`, `fsync`, rename to `<id>.jpg` on completion. Folder name for the file name = `defaultFolderName(point.label)`; counter from `nextCounter('photo')` (starts at 1). Every status change records a change.
-
-- [ ] **Step 4: Run to verify pass.** Expected: PASS.
-
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(server): resumable photo intake, reuse and removal"`
-
-### Task 15: Fake destination and folder resolver
-
-**Files:**
-- Create: `server/src/delivery/fake.ts`, `server/src/delivery/folder-resolver.ts`
-- Modify: `server/test/helpers/test-app.ts` (use `FakeDestination`)
-- Test: `server/test/delivery/folder-resolver.test.ts`
-
-**Interfaces:**
-- Consumes: `PhotoDestination`, `DestinationError` (Task 9); `categoryMatches`, `pointFolderMatches`, `defaultFolderName`, `PointKey` (Task 2).
-- Produces:
-```ts
-export class FakeDestination implements PhotoDestination { constructor(root?: string /* 'Field Notes' */); folders: Set<string>; files: Map<string, Buffer>; calls: string[]; failNext(n: number, code: DestinationErrorCode): void; uploadDelayMs: number }
-export type FolderResolution = { kind: 'found' | 'created'; path: string } | { kind: 'ambiguous'; candidates: string[] };
-export class FolderResolver { constructor(dest: PhotoDestination); resolve(p: PointKey): Promise<FolderResolution> }
-```
-
-- [ ] **Step 1: Write the failing tests** (FakeDestination pre-seeded with folders):
-```ts
-test('A05J9XE layout: top-level "1" for POLE 1', async () => expect(await resolver(['1','2','3']).resolve(pole1)).toEqual({ kind: 'found', path: '1' }));
-test('category folder with mixed-case added pole', async () => expect(await resolver(['POLE', 'POLE/POLE_14b']).resolve(pole14b)).toEqual({ kind: 'found', path: 'POLE/POLE_14b' }));
-test('nothing exists → creates POLE/POLE_33', async () => { const d = fake([]); expect(await new FolderResolver(d).resolve(pole33)).toEqual({ kind: 'created', path: 'POLE/POLE_33' }); expect(d.folders.has('POLE/POLE_33')).toBe(true) });
-test('existing QUERY 1 category, missing item → QUERY 1/Query_1-43', …);
-test('query point never matches a top-level pole folder "3"', …);
-test('category match preferred over top-level', …);
-test('two candidates in category → ambiguous with both paths', …);
-test('existing category name casing is reused (Query 3 stays Query 3)', …);
-test('folder listings are cached per resolver', async () => { /* resolve two points; listFolders('') called once */ });
-```
-
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run server/test/delivery/folder-resolver.test.ts`. Expected: FAIL.
-
-- [ ] **Step 3: Implement** the resolver order from spec §6.6 step 6: category subfolders first, then the top level, else create `<existing-or-new category>/<defaultFolderName(label)>`. Invalidate the cached listing of a folder after creating inside it. `FakeDestination.upload` throws `DestinationError('exists')` if the path exists, and requires the parent folder to exist (`not_found`).
+- [ ] **Step 3: Implement.** Backups are written to `<dataDir>/photos/<id>.part`, fsynced, then renamed to `.jpg`. Thumbnails use `javax.imageio` with quality 0.8 into `<dataDir>/thumbs/<id>.jpg`. A reuse photo has `source_kind = "backup"` when the original's backup still exists, else `"onedrive"` (copied later by Task 17). Every status change records a change.
 
 - [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(delivery): fake destination and folder resolver"`
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(server): photo registry, backups, thumbnails, reuse search"`
 
-### Task 16: SharePoint share-link destination
+### Task 17: Server delivery worker, takeover, retention
 
-**Files:**
-- Create: `server/src/delivery/sharepoint-link.ts`
-- Test: `server/test/delivery/sharepoint-link.test.ts`, `server/test/helpers/mock-sharepoint.ts`
+**Files:** Create `server/src/main/kotlin/com/fieldmaxx/server/delivery/{DeliveryWorker.kt, Retention.kt}`; Test `server/src/test/kotlin/com/fieldmaxx/server/DeliveryTest.kt`
 
 **Interfaces:**
+- Consumes: `FolderResolver`, `PhotoDestination` (Tasks 9–10), `toPhoto`, `toPoint`.
 - Produces:
-```ts
-export class SharePointLinkDestination implements PhotoDestination { constructor(shareUrl: string, opts?: { fetch?: typeof fetch; clock?: Clock }) }
-export function spPathLiteral(serverRelativePath: string): string;   // doubles ' then percent-encodes each segment, keeps '/'
-export function sharePointDestinations(): DestinationFactory;         // caches one instance per URL for 30 min
+```kotlin
+fun nextDelayMs(attempts: Int): Long                     // 15s, 30s, 60s, 2m, 4m, 8m, 16m, then 30m
+class DeliveryWorker(ctx: Ctx, concurrency: Int = 4) : DeliveryKick { fun start(); fun stop(); override fun kick(); fun runOnce(): Int }
+fun retryPhoto(ctx: Ctx, admin: User, photoId: String)
+fun purgeBackups(ctx: Ctx): Int                           // backup older than settings.backupDays (min 3) AND confirmed
+fun diskUsedPct(dir: java.nio.file.Path): Int
 ```
 
-- [ ] **Step 1: Write the mock server** (`node:http`) emulating the calls proven in spec §5.5, recording every request:
-  - `GET /:f:/g/personal/u/TOKEN?e=x` → `302`, `Location: /personal/u/_layouts/15/onedrive.aspx?id=%2Fpersonal%2Fu%2FDocuments%2FOSP%20FIELDING%2FField%20Notes&ga=1`, `Set-Cookie: FedAuth=abc`;
-  - `POST /personal/u/_api/contextinfo` → `{FormDigestValue, FormDigestTimeoutSeconds: 1800}`;
-  - `GET …/GetFolderByServerRelativePath(decodedurl='…')/Folders?$select=Name` → `{value:[{Name}]}`;
-  - `POST …/folders/AddUsingPath(decodedurl='…',overwrite=false)`;
-  - `GET …/GetFileByServerRelativePath(decodedurl='…')?$select=Length` → 200 or 404;
-  - `POST …/GetFolderByServerRelativePath(decodedurl='…')/Files/AddUsingPath(decodedurl='name',overwrite=false)` → 200, or 400 with `already exists` when present.
-  Switches simulate cookie expiry (403 `Access denied` until the share URL is fetched again) and a sign-in-only link (302 to `https://login.microsoftonline.com/...`).
+- [ ] **Step 1: Write the failing tests** (FakeDestination, MutableClock):
+  - `backupNotTakenOverBefore30Min`
+  - `takeoverAfter30MinDeliversAndConfirms` (path `POLE/POLE_1/<fileName>`)
+  - `reusePhotoDeliveredImmediatelyFromBackup`
+  - `reuseFromOneDriveDownloadsOriginalThenUploads`
+  - `sameNameSameSizeCountsAsDelivered`
+  - `retriesFollowNextDelay`
+  - `stuckAfter6AdminRetryResets`
+  - `maxFourInFlight`
+  - `ambiguousFolderWaitsWithCandidates`
+  - `forbiddenDestinationSetsJobDeliveryProblem` (cleared on next success)
+  - `noLinkSetsAddLinkProblem` (`"Add the Field Notes link"`)
+  - `purgeKeepsUnconfirmedAndRespectsMinimum3Days` (setting 2 is treated as 3)
+  - `diskOver80WarnsNeverPurgesEarly`
 
-- [ ] **Step 2: Write the failing tests:** `rootName is "Field Notes"`; `listFolders('POLE') requests the encoded server-relative path`; `apostrophes are doubled and spaces encoded` (`spPathLiteral("/a/O'Brien St/x")` → `/a/O''Brien%20St/x`); `ensureFolder creates each missing segment in order`; `upload sends X-RequestDigest, octet-stream body, overwrite=false`; `fileInfo returns {size} or null on 404`; `upload of an existing name → DestinationError exists`; `sign-in redirect → DestinationError requires_sign_in "This link needs a Microsoft sign-in"`; `digest refreshed after its timeout`; `cookie expiry: one re-resolve then success`; `persistent 403 → DestinationError forbidden "The link no longer allows uploads"`; `network failure → DestinationError network`. Also add `sharepoint-link.live.test.ts` with `describe.skipIf(!process.env.FMX_LIVE_SHARE_URL)`: rootName + listFolders('') only. It must be read-only, because the link can't delete test files.
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :server:test --tests '*DeliveryTest'`. Expected: FAIL.
 
-- [ ] **Step 3: Run to verify failure.** Run: `npx vitest run server/test/delivery/sharepoint-link.test.ts`. Expected: FAIL.
-
-- [ ] **Step 4: Implement.** Resolve with `fetch(shareUrl, { redirect: 'manual' })`: site URL = Location origin + path up to `/_layouts`; root path = the decoded `id` query parameter; cookies from `headers.getSetCookie()`. Send `Accept: application/json;odata=nometadata` everywhere. Cache the digest until 60 s before its timeout. On any 401/403, re-resolve once and retry.
-
-- [ ] **Step 5: Run to verify pass.** Expected: PASS.
-
-- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(delivery): SharePoint share-link destination"`
-
-### Task 17: Delivery worker, retries, purge and disk guard
-
-**Files:**
-- Create: `server/src/delivery/worker.ts`, `server/src/delivery/purge.ts`
-- Modify: `server/src/index.ts` (start worker; hourly purge), `server/src/context.ts`
-- Test: `server/test/delivery/worker.test.ts`, `server/test/delivery/purge.test.ts`
-
-**Interfaces:**
-- Consumes: `FolderResolver` (Task 15), `PhotoDestination` (Task 9), `rowToPhoto` (Task 14), `ChangeLog`.
-- Produces:
-```ts
-export function nextDelay(attempts: number): number;   // 15s, 30s, 60s, 2m, 4m, 8m, 16m, then 30m cap
-export class DeliveryWorker { constructor(ctx: Ctx, opts?: { concurrency?: number /* 4 */ }); start(): void; stop(): Promise<void>; kick(): void; runOnce(): Promise<number> }
-export function retryPhoto(ctx: Ctx, user: User, photoId: string): void;   // admin: attempts=0, next_attempt_at=now
-export async function purgeConfirmed(ctx: Ctx, usage?: () => Promise<number /* used % */>): Promise<{ deleted: number }>;
-export async function diskUsedPct(dir: string): Promise<number>;           // fs.statfs
-```
-
-- [ ] **Step 1: Write the failing tests** (FakeDestination, FakeClock):
-```ts
-test('received photo is delivered to POLE/POLE_1 and confirmed with timings', …);
-test('existing same-size file counts as delivered without uploading again', …);
-test('existing different-size file → counter bumped, new name uploaded', …);
-test('3 failures then success: delays 15s, 30s, 60s; confirmed', …);
-test('6 failures → stuck with last_error; still retried every 30 min; admin retry resets', …);
-test('never more than 4 uploads in flight', async () => { /* 10 photos, uploadDelayMs 50, track max concurrent */ });
-test('ambiguous folder: not uploaded, point gets folderCandidates; after point.setFolder it delivers', …);
-test('forbidden destination sets job deliveryProblem; next success clears it', …);
-test('job without field notes link: photos wait, job deliveryProblem "Add the Field Notes link"', …);
-test('point folder chosen once is reused for later photos', …);
-test('purge: confirmed > 7 days deleted, unconfirmed kept regardless of age', …);
-test('disk guard: at 85% deletes oldest confirmed until usage ≤ 75%, never unconfirmed', …);
-```
-
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run server/test/delivery/`. Expected: FAIL.
-
-- [ ] **Step 3: Implement.** Due photos: status `received` or `stuck` with `next_attempt_at <= now`, ordered by `received_at`, with stored file present. Per photo:
-  1. Resolve the folder (store `folder_path` on the point, record a change).
-  2. Check `fileInfo(dest)`.
-  3. Upload if needed, then verify the size.
-  4. Mark `confirmed` with `confirmed_at` and `upload_ms`, and record a change.
-  On error: `attempts++`; `next_attempt_at = now + nextDelay(attempts)`; `stuck` once attempts ≥ 6. Errors coded `requires_sign_in`/`forbidden` set `jobs.delivery_problem` to the error message and record a job change. `kick()` triggers an immediate run; otherwise poll every 5 s. Cache one resolver per job for 10 min.
+- [ ] **Step 3: Implement.**
+  - **Due photos:** status `registered`/`stuck` and either (a) backup complete and `backup_received_at + 30 min <= now`, or (b) `reused_from != null`; also `next_attempt_at <= now`.
+  - **Folder:** use `point.folder_path`, else resolve it (store it, record a change; on `Ambiguous` store the candidates and skip).
+  - **Upload:** `fileInfo` check, then `uploadChunked` from the backup file (or from the OneDrive download for reuse), verify, `confirmed`.
+  - **Errors:** `REQUIRES_SIGN_IN`/`FORBIDDEN` set `jobs.delivery_problem`.
+  - **Schedule:** poll every 5 s; `kick()` runs immediately; one resolver per job cached for 10 min.
 
 - [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(delivery): worker with retries, verification, purge, disk guard"`
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(server): delivery takeover, retries, backup retention"`
 
-### Task 18: Pole data export, photo ZIP, finish job
+### Task 18: Exports and finishing a job
 
-**Files:**
-- Create: `server/src/exports/pole-data.ts`, `server/src/exports/zip.ts`, `server/src/jobs/finish.ts`, `server/src/exports/routes.ts`
-- Test: `server/test/exports.test.ts`
+**Files:** Create `server/src/main/kotlin/com/fieldmaxx/server/exports/{PoleData.kt, PhotosZip.kt, Finish.kt, ExportRoutes.kt}`; Test `server/src/test/kotlin/com/fieldmaxx/server/ExportsTest.kt`
 
 **Interfaces:**
-- Produces:
-```ts
-export const POLE_COLUMNS = ['Point', 'Original lat', 'Original lon', 'Moved lat', 'Moved lon', 'Line height (ft)', 'Anchor', 'Self-supporting/Lashed', 'Tags', 'Comment', 'Photos', 'Tech', 'Closed at'] as const;
-export function poleDataRows(ctx: Ctx, jobId: string): string[][];   // POLE-type points, sorted by number then suffix
-export function poleDataCsv(rows: string[][]): string;
-export async function poleDataXlsx(rows: string[][]): Promise<Buffer>;
-export async function writePhotosZip(ctx: Ctx, jobId: string, out: NodeJS.WritableStream): Promise<void>;
-export async function finishJob(ctx: Ctx, user: User, jobId: string): Promise<{ ok: true } | { ok: false; pointsLeft: number; photosPending: number }>;
-// Routes: GET /api/jobs/:id/pole-data.csv | .xlsx; GET /api/jobs/:id/photos.zip (admin); POST /api/jobs/:id/finish
-```
+- Produces: `val POLE_COLUMNS = listOf("Point", "Original lat", "Original lon", "Moved lat", "Moved lon", "Line height (ft)", "Anchor", "Self-supporting/Lashed", "Tags", "Comment", "Photos", "Tech", "Closed at")`; `fun poleDataRows(ctx: Ctx, jobId: String): List<List<String>>`; `fun poleDataCsv(rows: List<List<String>>): String`; `fun poleDataXlsx(rows: List<List<String>>): ByteArray`; `fun writePhotosZip(ctx: Ctx, jobId: String, out: java.io.OutputStream)`; `fun finishJob(ctx: Ctx, user: User, jobId: String): FinishResult`. Routes: `GET /api/jobs/{id}/pole-data.csv|.xlsx`; `GET /api/jobs/{id}/photos.zip` (admin); `POST /api/jobs/{id}/finish` → `FinishResult`.
 
-- [ ] **Step 1: Write the failing tests:** `csv header equals POLE_COLUMNS joined by commas`; `row shows moved coordinates only when moved; tags joined with "; "; anchor Yes/No`; `rows sorted 1, 2, 10, 14, 14B`; `xlsx reopens with exceljs with the same header`; `zip contains POLE/POLE_1/<file>.jpg for stored photos (folderPath or default folder)`; `finish blocked lists points left and photos pending`; `finish ok uploads "<job>_pole_data.xlsx" to the Field Notes root (or "_2" if taken) and marks the job finished`.
+- [ ] **Step 1: Write the failing tests:**
+  - `csvHeaderExact`
+  - `movedOnlyWhenMovedTagsSemicolonAnchorYesNo`
+  - `rowsSortedNumericThenSuffix` (`1, 2, 10, 14, 14B`)
+  - `xlsxReadableWithSameHeader` (read back with Apache POI in test scope)
+  - `zipUsesFolderPathOrDefault`
+  - `finishBlockedCounts` (`FinishResult(false, 7, 3)`)
+  - `finishUploadsXlsxToRootNextFreeNameAndFinishes`
 
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run server/test/exports.test.ts`. Expected: FAIL.
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :server:test --tests '*ExportsTest'`. Expected: FAIL.
 
-- [ ] **Step 3: Implement** with exceljs and archiver (store method, no recompression for JPEGs). "Points left" = open points; "photos pending" = photos not `confirmed`/`removed`.
+- [ ] **Step 3: Implement** with fastexcel; the ZIP is stored (no compression). Finish uploads `<job>_pole_data.xlsx`, or `<job>_pole_data_2.xlsx` etc. if taken.
 
 - [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(server): pole data export, photo zip, finish job"`
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(server): pole data export, photos zip, finish job"`
+
+### Task 19: Admin endpoints, app config, APK hosting
+
+**Files:** Create `server/src/main/kotlin/com/fieldmaxx/server/admin/AdminRoutes.kt`, `server/src/main/kotlin/com/fieldmaxx/server/release/{ReleaseRoutes.kt, DownloadPage.kt}`; Modify `Cli.kt` (`publish-apk <path> <versionCode> <versionName>`); Test `server/src/test/kotlin/com/fieldmaxx/server/AdminTest.kt`
+
+**Interfaces:**
+- Produces:
+  - **Admin:** `GET /api/admin/health → HealthReport`; `POST /api/admin/photos/{id}/retry`; `GET /api/admin/activity?jobId= → List<ActivityItem>`; `PUT /api/admin/settings AdminSettings`.
+  - **Everyone:** `GET /api/config → AppConfig`.
+  - **App releases:** `GET /api/app/latest → AppRelease?`; `GET /app/fieldmaxx-<versionName>.apk`; `GET /` → download page.
+
+- [ ] **Step 1: Write the failing tests:**
+  - `adminOnly`
+  - `healthStuckFirstWithMedians`
+  - `retryResets`
+  - `activityListsCantShootReason`
+  - `settingsDefaultsAndBackupDaysMin3` (setting 2 → 400 `"Backups must be kept at least 3 days"`)
+  - `configDefaultsToEsriKeyless`
+  - `publishApkThenLatest`
+  - `downloadPageHasButtonAndSteps` (contains `Download Fieldmaxx for Android` and the three steps from §6.11)
+
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :server:test --tests '*AdminTest'`. Expected: FAIL.
+
+- [ ] **Step 3: Implement.** The download page is plain HTML in the Cadastrus colours, with a viewport meta tag, a large button and three numbered steps. It works on a phone.
+
+- [ ] **Step 4: Run to verify pass.** Expected: PASS.
+
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(server): admin endpoints, app config, apk hosting"`
 
 ---
 
-## Milestone E: Web app (`web`)
+## Milestone E: Android `app`
 
-### Task 19: Web scaffold, sign-in, offline store and sync engine
+### Task 20: App scaffold, network client, sign-in
 
-**Files:**
-- Create: `web/package.json`, `web/vite.config.ts`, `web/index.html`, `web/tsconfig.json`, `web/src/main.tsx`, `web/src/App.tsx`, `web/src/types.ts`, `web/src/styles/tokens.css`, `web/src/api/client.ts`, `web/src/api/ws.ts`, `web/src/store/db.ts`, `web/src/store/sync.ts`, `web/src/store/apply.ts`, `web/src/auth/LoginScreen.tsx`, `web/src/auth/session.ts`
-- Test: `web/test/sync.test.ts`, `web/test/login.test.tsx`, `web/test/setup.ts`
+**Files:** Create `app/build.gradle.kts`, `app/src/main/AndroidManifest.xml`, `app/src/main/kotlin/com/fieldmaxx/app/{FieldmaxxApp.kt, MainActivity.kt, AppGraph.kt, ui/Theme.kt, ui/Nav.kt}`, `app/src/main/kotlin/com/fieldmaxx/app/net/{Api.kt, OkHttpApi.kt, TokenVault.kt, AuthInterceptor.kt}`, `app/src/main/kotlin/com/fieldmaxx/app/auth/LoginScreen.kt`; Test `app/src/test/kotlin/com/fieldmaxx/app/{ManifestTest.kt, ApiTest.kt, LoginScreenTest.kt}`
 
 **Interfaces:**
 - Produces:
-```ts
-// types.ts: web-only types shared by later tasks
-export interface Fix { lat: number; lon: number; accuracyM: number; altitudeM: number | null; at: number }
-export interface CompassReading { deg: number; at: number; absolute: boolean }
-export interface CaptureMeta { jobName: string; pointLabel: string; source: 'camera' | 'gallery'; fix: Fix | null; heading: CompassReading | null; takenAt: number }
-export type PhotoView = { id: string; thumbUrl: string; status: 'phone' | 'server' | 'onedrive' | 'stuck'; error: string | null; destPath: string | null };
-// api/client.ts
-export class ApiError extends Error { constructor(public status: number, message: string, public code?: string) { super(message) } }
-export interface Api { login(u: string, p: string): Promise<User>; logout(): Promise<void>; me(): Promise<User | null>; changePassword(c: string, n: string): Promise<void>; jobs(include?: string): Promise<Array<Job & { pointsTotal: number; pointsDone: number }>>; snapshot(jobId: string): Promise<JobSnapshot>; changes(since: number): Promise<{ changes: Change[]; seq: number }>; ops(ops: Op[]): Promise<OpResult[]>; importFile(f: File): Promise<ImportPreview>; createJob(i: CreateJobInput): Promise<{ job: Job; skippedDuplicates: string[] }>; addImport(jobId: string, i: JobImportInput): Promise<{ points: Point[]; skippedDuplicates: string[] }>; patchJob(id: string, p: Partial<Pick<Job, 'name' | 'fieldNotesUrl' | 'notes'>>): Promise<Job>; checkLink(url: string): Promise<{ ok: true; rootName: string } | { ok: false; error: string }>; deleteJob(id: string): Promise<void>; finishJob(id: string): Promise<{ ok: true } | { ok: false; pointsLeft: number; photosPending: number }>; positions(): Promise<CrewPosition[]>; photoCreate(m: PhotoUploadMeta): Promise<{ offset: number; status: PhotoStatus }>; photoChunk(id: string, offset: number, body: Blob): Promise<{ offset: number; status: PhotoStatus }> }
-export const api: Api;
-// api/ws.ts
-export class Live { connect(): void; close(): void; send(m: ClientMessage): void; on(cb: (m: ServerMessage) => void): () => void; onState(cb: (s: 'open' | 'closed') => void): () => void }   // reconnect with backoff 1s→30s
-// store/db.ts — Dexie 'fieldmaxx' v1
-export interface LocalPhoto { id: string; jobId: string; pointId: string; original: Blob; upload: Blob | null; meta: CaptureMeta; state: 'saved' | 'ready' | 'uploading' | 'uploaded' | 'confirmed' | 'stuck'; offset: number; sha256: string | null; error: string | null; createdAt: number; confirmedAt: number | null }
-export const db: Dexie & { jobs: Table<Job>; points: Table<Point>; photos: Table<PhotoInfo>; refImages: Table<RefImageInfo & { jobId: string }>; outbox: Table<{ seq?: number; op: Op }>; localPhotos: Table<LocalPhoto>; meta: Table<{ key: string; value: unknown }> };
-// store/apply.ts
-export function applyOpLocally(op: Op, now: number, userId: string): Promise<void>;
-export function applyChange(c: Change): Promise<void>;
-// store/sync.ts
-export class SyncEngine { constructor(deps: { api: Api; live: Live; now?: () => number }); start(user: User): void; stop(): void; openJob(jobId: string): Promise<void>; enqueue(op: Op): Promise<void>; status(): 'online' | 'offline' | 'syncing'; onAuthRequired(cb: () => void): () => void }
+```kotlin
+class ApiException(val status: Int, override val message: String) : Exception(message)
+interface Api {   // suspend functions over OkHttp + FmxJson; base URL from BuildConfig.SERVER_URL or the login screen's server field
+  suspend fun login(username: String, password: String): Pair<String, User>; suspend fun me(): User; suspend fun logout(); suspend fun changePassword(current: String, next: String)
+  suspend fun config(): AppConfig; suspend fun jobs(include: String? = null): List<JobListItem>; suspend fun snapshot(jobId: String): JobSnapshot; suspend fun changes(since: Long): Pair<List<Change>, Long>
+  suspend fun ops(ops: List<Op>): List<OpResult>; suspend fun importFile(name: String, bytes: ByteArray): ImportPreview; suspend fun createJob(i: CreateJobInput): Job; suspend fun addImport(jobId: String, i: JobImportInput): List<Point>
+  suspend fun patchJob(jobId: String, name: String? = null, fieldNotesUrl: String? = null, notes: String? = null): Job; suspend fun checkLink(url: String): LinkCheck; suspend fun deleteJob(jobId: String); suspend fun restoreJob(jobId: String); suspend fun finishJob(jobId: String): FinishResult
+  suspend fun positions(): List<CrewPosition>; suspend fun registerPhoto(r: PhotoRegistration): RegisteredPhoto; suspend fun renamePhoto(id: String): RegisteredPhoto
+  suspend fun backupChunk(id: String, offset: Long, bytes: ByteArray): Pair<Long, Boolean>; suspend fun nearby(lat: Double, lon: Double, excludePointId: String?): List<ReuseCandidate>; suspend fun jobPhotos(jobId: String): List<ReuseCandidate>
+  suspend fun adminUsers(): List<User>; suspend fun createUser(username: String, displayName: String, password: String, role: Role): User; suspend fun patchUser(id: String, displayName: String? = null, role: Role? = null, disabled: Boolean? = null, password: String? = null): User
+  suspend fun health(): HealthReport; suspend fun retryPhoto(id: String); suspend fun activity(jobId: String?): List<ActivityItem>; suspend fun putSettings(s: AdminSettings)
+  suspend fun latestRelease(): AppRelease?; suspend fun download(path: String, to: java.io.File)
+}
+interface TokenVault { fun save(token: String?); fun load(): String? }   // AndroidKeystoreTokenVault (AES-GCM key in AndroidKeyStore, ciphertext in DataStore); InMemoryTokenVault for tests
+class AppGraph(context: Context) { val api: Api; val vault: TokenVault /* later tasks add db, sync, location, compass, photos, mapControllerFactory */ }
 ```
 
-- [ ] **Step 1: Scaffold `web`.**
-  - **Vite:** React plugin; `vite-plugin-pwa` with `registerType: 'prompt'`, a manifest named "Fieldmaxx" (`theme_color #0f172a`, `display standalone`), and Workbox runtime caching for both Esri tile URLs (CacheFirst, 3000 entries, 30 days) and for `/api/jobs/*/ref/*` reference images (CacheFirst, 500 entries), so references work offline (§6.8).
-  - **`index.html` meta tags:** viewport `width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover`, `theme-color #0f172a`, `apple-mobile-web-app-capable yes`, `apple-mobile-web-app-status-bar-style black-translucent`.
-  - **Dev server:** proxy `/api` (http + ws) to `localhost:8080`.
-  - **Tests:** `test/setup.ts` imports `fake-indexeddb/auto` and `@testing-library/jest-dom`; environment `jsdom`.
+- [ ] **Step 1: Scaffold `app`.**
+  - **Gradle:** Compose, Kotlin serialization and KSP plugins; `buildConfigField SERVER_URL`; release `signingConfig` read from git-ignored `keystore.properties` when present; `testOptions.unitTests.isIncludeAndroidResources = true`; Robolectric with `@GraphicsMode(NATIVE)` available.
+  - **Manifest:** `INTERNET`, `CAMERA`, `ACCESS_FINE_LOCATION`, `ACCESS_COARSE_LOCATION`, `REQUEST_INSTALL_PACKAGES`, `POST_NOTIFICATIONS`; a `FileProvider`; intent filters on `MainActivity` for `ACTION_SEND`/`ACTION_SEND_MULTIPLE` of `application/pdf`, `application/vnd.openxmlformats-officedocument.wordprocessingml.document` and `text/plain`.
+  - **Theme:** dark, with the Global Constraints colours.
 
 - [ ] **Step 2: Write the failing tests:**
-```ts
-test('enqueue applies the op locally at once', …);              // point.update → db.points has new comment
-test('ops queued offline survive a new engine (reload) and flush in order when online', …);
-test('server change overwrites local point', …);
-test('reconnect asks for changes since last seq', …);
-test('401 while flushing pauses the outbox and fires onAuthRequired without dropping ops', …);
-test('login screen shows "Wrong username or password" on 401', …);
-```
+  - `ManifestTest.noBackgroundLocation`: parse the merged manifest; `ACCESS_BACKGROUND_LOCATION` absent, no `<service android:foregroundServiceType="location">`.
+  - `ApiTest` (MockWebServer): `bearerHeaderSent`, `unauthorizedMapsToApiException`, `opsSerialiseWithKind`.
+  - `LoginScreenTest`: `showsWrongPasswordMessage`, `successNavigatesToJobs`.
 
-- [ ] **Step 3: Run to verify failure.** Run: `npx vitest run web/test/sync.test.ts web/test/login.test.tsx`. Expected: FAIL.
+- [ ] **Step 3: Run to verify failure.** Run: `./gradlew :app:testDebugUnitTest`. Expected: FAIL.
 
-- [ ] **Step 4: Implement.** Outbox flush posts batches of ≤ 50 in order, retrying with backoff 2 s → 60 s. `meta.lastSeq` updates after applying changes. `openJob` stores the snapshot. `App.tsx` routes: login → job list → map. The session check runs at start via `api.me()`.
+- [ ] **Step 4: Implement.** The login screen has server address (prefilled from `BuildConfig`), username and password fields.
 
-- [ ] **Step 5: Run to verify pass.** Expected: PASS.
+- [ ] **Step 5: Run to verify pass.** Expected: PASS. Also run `./gradlew :app:assembleDebug` → BUILD SUCCESSFUL.
 
-- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(web): scaffold, sign-in, offline store and sync"`
+- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat(app): scaffold, api client, token vault, login"`
 
-### Task 20: Platform adapters and crew position sender
+### Task 21: Local database and sync engine
 
-**Files:**
-- Create: `web/src/platform/geolocation.ts`, `web/src/platform/compass.ts`, `web/src/platform/camera.ts`, `web/src/platform/storage.ts`, `web/src/crew/positionSender.ts`
-- Test: `web/test/platform.test.ts`
+**Files:** Create `app/src/main/kotlin/com/fieldmaxx/app/data/{AppDatabase.kt, Entities.kt, Daos.kt, Converters.kt}`, `app/src/main/kotlin/com/fieldmaxx/app/sync/{SyncEngine.kt, OpApplier.kt, LiveSocket.kt, OutboxWorker.kt}`; Test `app/src/test/kotlin/com/fieldmaxx/app/sync/SyncEngineTest.kt`
 
 **Interfaces:**
-- Consumes: `Fix`, `CompassReading` from `web/src/types.ts` (Task 19); `Live` (Task 19).
 - Produces:
-```ts
-export interface GeoSource { start(): void; stop(): void; latest(): Fix | null; subscribe(cb: (f: Fix) => void): () => void }
-export const browserGeo: GeoSource;   // watchPosition, enableHighAccuracy, maximumAge 0
-export interface CompassSource { requestPermission(): Promise<boolean>; start(): void; latest(): CompassReading | null }
-export const browserCompass: CompassSource;
-export function headingFromEvent(e: { webkitCompassHeading?: number; alpha: number | null; absolute?: boolean }): number | null;
-export function pickPhoto(opts: { capture: boolean }): Promise<File | null>;   // hidden <input accept="image/*" [capture="environment"]>
-export function requestPersistentStorage(): Promise<boolean>;
-export function shouldSend(prev: { fix: Fix; sentAt: number } | null, next: Fix, now: number): boolean;   // > 5 m moved or ≥ 15 s
-export function startPositionSender(geo: GeoSource, live: Live): () => void;
+```kotlin
+// Room entities store core models as JSON columns
+@Entity data class JobEntity(@PrimaryKey val id: String, val json: String, val updatedAt: Long)
+@Entity(indices = [Index("jobId")]) data class PointEntity(@PrimaryKey val id: String, val jobId: String, val json: String)
+@Entity(indices = [Index("pointId"), Index("jobId")]) data class PhotoInfoEntity(@PrimaryKey val id: String, val jobId: String, val pointId: String, val json: String)
+@Entity data class OutboxEntity(@PrimaryKey(autoGenerate = true) val seq: Long = 0, val opJson: String)
+@Entity data class MetaEntity(@PrimaryKey val key: String, val value: String)
+@Entity(indices = [Index("pointId"), Index("state")]) data class LocalPhotoEntity(@PrimaryKey val id: String, val jobId: String, val pointId: String, val originalPath: String, val stampedPath: String?, val metaJson: String, val state: String /* saved|stamped|registered|confirmed */, val fileName: String?, val oneDriveUploadId: String?, val oneDriveOffset: Long, val createdThisFile: Boolean, val backupOffset: Long, val backupDone: Boolean, val attempts: Int, val nextAttemptAt: Long, val lastError: String?, val stuck: Boolean, val createdAt: Long, val confirmedAt: Long?)
+enum class SyncStatus { ONLINE, OFFLINE, SYNCING }
+class SyncEngine(api: Api, db: AppDatabase, live: LiveSocket, scope: CoroutineScope, now: () -> Long) {
+  val status: StateFlow<SyncStatus>; val authRequired: SharedFlow<Unit>; val crew: StateFlow<List<CrewPosition>>
+  fun start(user: User); fun stop(); suspend fun openJob(jobId: String); suspend fun enqueue(op: Op)
+  fun points(jobId: String): Flow<List<Point>>; fun job(jobId: String): Flow<Job?>; fun photos(pointId: String): Flow<List<PhotoInfo>>; fun jobPhotos(jobId: String): Flow<List<PhotoInfo>>
+}
+class OpApplier(db: AppDatabase) { suspend fun applyLocally(op: Op, userId: String, now: Long); suspend fun applyChange(c: Change) }
+class LiveSocket(client: OkHttpClient, url: () -> String, token: () -> String?) { val messages: SharedFlow<ServerMessage>; val connected: StateFlow<Boolean>; fun connect(); fun close(); fun send(m: ClientMessage) }   // reconnect backoff 1 s → 30 s
 ```
 
-- [ ] **Step 1: Write the failing tests:** `first fix is always sent`; `4 m move within 15 s not sent; 6 m sent`; `15 s elapsed sends even without movement`; `iOS webkitCompassHeading used as is`; `Android absolute alpha 90 → heading 270`; `non-absolute alpha → null`; `pickPhoto creates input with capture="environment" only when capture is true`.
+- [ ] **Step 1: Write the failing tests** (Robolectric, in-memory Room, fake Api):
+  - `enqueueAppliesLocallyAtOnce`
+  - `offlineOpsSurviveRestartAndFlushInOrder`
+  - `serverChangeOverwritesLocal`
+  - `reconnectFetchesChangesSinceLastSeq`
+  - `unauthorizedPausesOutboxKeepsOps`
+  - `outboxWorkerFlushesInBackground` (work-testing)
 
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run web/test/platform.test.ts`. Expected: FAIL.
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :app:testDebugUnitTest --tests '*SyncEngineTest'`. Expected: FAIL.
 
-- [ ] **Step 3: Implement.** Compass listens to `deviceorientationabsolute`, falling back to `deviceorientation`. `requestPermission` calls `DeviceOrientationEvent.requestPermission()` when present (iOS).
+- [ ] **Step 3: Implement.** Flush posts batches of ≤ 50 in order, with backoff 2 s → 60 s. An `OutboxWorker` (network constraint) is enqueued whenever the outbox is non-empty. `meta.lastSeq` updates after applying changes. `openJob` stores the snapshot and prefetches reference images into Coil's disk cache.
 
 - [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(web): platform adapters and crew position sender"`
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(app): room store and sync engine"`
 
-### Task 21: Job list, new job + check screen, job info
+### Task 22: Foreground location, compass, position sender
 
-**Files:**
-- Create: `web/src/jobs/JobList.tsx`, `web/src/jobs/NewJob.tsx`, `web/src/jobs/CheckScreen.tsx`, `web/src/jobs/checkModel.ts`, `web/src/jobs/JobInfo.tsx`, `web/src/jobs/FieldNotesLink.tsx`
-- Test: `web/test/check.test.tsx`, `web/test/jobs.test.tsx`
+**Files:** Create `app/src/main/kotlin/com/fieldmaxx/app/platform/{Location.kt, Compass.kt, PositionSender.kt}`; Test `app/src/test/kotlin/com/fieldmaxx/app/platform/PlatformTest.kt`
 
 **Interfaces:**
 - Produces:
-```ts
-// checkModel.ts
-export interface CheckState { previews: ImportPreview[]; edits: Record<string, DraftPoint[]>; ignoredUnread: Set<string>; layers: Record<string, string> }
-export function summary(points: DraftPoint[]): string[];                   // ['Found 7 POLE points'] / ['Found 26 QUERY 1 points', '1 needs coordinates']
-export function canSave(s: CheckState): boolean;                            // no point with lat null; every unread fixed or ignored
-export function fixUnread(s: CheckState, importId: string, line: UnreadLine, label: string, coords: string): CheckState;   // parses coords via findCoordinatePairs; throws 'Coordinates not recognised'
-export function toJobImports(s: CheckState): JobImportInput[];
-```
-
-- [ ] **Step 1: Write the failing tests:** `summary per type`; `save disabled while a no-coordinates point remains; enabled after fixing its coordinates or removing it`; `fixing an unread line adds a point and clears the line`; `ignoring an unread line enables save`; `check screen lists flags as badges ("Possibly swapped", "Sign differs", "Far from the rest", "Duplicate label", "No label", "No coordinates")`; `job list shows "12/159" progress and finished jobs under "Finished"`; `delete button visible only to creator or admin, confirm dialog names the job`; `Field Notes link "Check" shows root name or the error`; `saving without a link shows "Photos will wait until the Field Notes link is added"`.
-
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run web/test/check.test.tsx web/test/jobs.test.tsx`. Expected: FAIL.
-
-- [ ] **Step 3: Implement.** Check screen layout:
-  - top: summary lines and a small Leaflet preview of all points;
-  - an editable table (label, lat, lon, description, flags, remove);
-  - a "Couldn't read" section showing each raw line, a "Fix" form (label + coordinates) and "Ignore";
-  - layer name field per file;
-  - Field Notes link field with "Check";
-  - Save.
-  Adding files to an existing job reuses the same screen.
-
-- [ ] **Step 4: Run to verify pass.** Expected: PASS.
-
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(web): job list, import check screen, job info"`
-
-### Task 22: Map screen
-
-**Files:**
-- Create: `web/src/map/model.ts`, `web/src/map/viewMemory.ts`, `web/src/map/MapScreen.tsx`, `web/src/map/TopBar.tsx`, `web/src/map/ChipRow.tsx`, `web/src/map/ProgressStrip.tsx`, `web/src/map/PointMarkers.tsx`, `web/src/map/CrewLayer.tsx`, `web/src/map/MyLocation.tsx`, `web/src/map/MapControls.tsx`, `web/src/map/SearchPanel.tsx`, `web/src/map/LeftList.tsx`
-- Test: `web/test/map-model.test.ts`, `web/test/map-screen.test.tsx`
-
-**Interfaces:**
-- Produces:
-```ts
-export function progress(points: Point[]): { done: number; total: number; pct: number; byType: Array<{ type: string; done: number; total: number }> };   // done + cant_shoot count as complete; deleted excluded
-export function visiblePoints(points: Point[], f: { type: string | 'ALL'; hideShot: boolean }): Point[];
-export function chipLabel(t: { type: string; done: number; total: number }): string;   // '✓ POLE (80/80)' or 'POLE (12/80)'
-export function sunsetText(now: Date, lat: number, lon: number): string;            // '☀️ 5h 40m until sunset' | '🌙 After sunset'
-export function remainingByDistance(points: Point[], from: LatLon | null): Point[];
-export function crewDotState(p: CrewPosition, now: number): 'fresh' | 'faded' | 'hidden';
-export function searchPoints(points: Point[], q: string): Point[];                  // label, num, description; case-insensitive
-export function saveView(userId: string, jobId: string, v: { lat: number; lon: number; zoom: number }): void;
-export function loadView(userId: string, jobId: string): { lat: number; lon: number; zoom: number } | null;   // key 'fmx:view:<user>:<job>'; try/catch
-```
-
-- [ ] **Step 1: Write the failing tests:** pure-model tests for each function, including:
-  - `progress counts cant_shoot as complete and ignores deleted`;
-  - `chipLabel complete vs incomplete`;
-  - `sunsetText 5 h 40 min before suncalc's sunset for Reno (39.53, -119.81) is "☀️ 5h 40m until sunset"; 1 min after is "🌙 After sunset"`;
-  - `crewDotState 9 min fresh, 11 min faded, 61 min hidden`;
-  - `loadView returns null when localStorage throws`.
-  Screen tests (react-leaflet with jsdom; assert the initial view props): `restores the saved view on mount`, `fits all points when no saved view`, `"Hide shot" hides done points`, `tapping a chip filters by type`, `pill shows "online", "offline" or "3 photos waiting"`, `job.deliveryProblem shows a red banner with its message under the top bar`.
-
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run web/test/map-model.test.ts web/test/map-screen.test.tsx`. Expected: FAIL.
-
-- [ ] **Step 3: Implement.**
-  - **Layers and controls:** Esri imagery plus the labels overlay, toggled by `Aa`; the house-numbers button `123` is wired in Task 27. Max zoom 21, max native zoom 19. Controls at bottom right: Aa, 123, center-on-me ⊙, zoom.
-  - **Markers:** 30 px circles with `markerCode`, white 2 px border, one colour per type. Shot points are grey `#9ca3af`, opacity 0.55, struck through. A small orange badge marks points with unconfirmed photos.
-  - **Clustering:** leaflet.markercluster with `disableClusteringAtZoom: 18`.
-  - **Bars:** top bar, chip row and progress strip laid out as in spec §6.3, with "Left: N" opening `LeftList`.
-  - **View memory:** save the view on `moveend`.
-
-- [ ] **Step 4: Run to verify pass.** Expected: PASS.
-
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(web): map screen with filters, progress, crew, view memory"`
-
-### Task 23: Point sheet
-
-**Files:**
-- Create: `web/src/point/PointSheet.tsx`, `web/src/point/PoleDataForm.tsx`, `web/src/point/QueryReference.tsx`, `web/src/point/CloseControls.tsx`, `web/src/point/MoveControl.tsx`, `web/src/point/FolderInfo.tsx`, `web/src/point/DeletePoint.tsx`, `web/src/point/gps.ts`, `web/src/photos/usePointPhotos.ts` (stub: `export function usePointPhotos(pointId: string): PhotoView[] { return [] }`, replaced in Task 25)
-- Test: `web/test/point-sheet.test.tsx`
-
-**Interfaces:**
-- Consumes: `SyncEngine.enqueue` (Task 19), `Fix`, `PhotoView` (Task 19 `web/src/types.ts`).
-- Produces:
-```ts
-export function navigateUrl(lat: number, lon: number): string;   // 'https://www.google.com/maps/dir/?api=1&destination=<lat>,<lon>'
-export function gpsBadge(fix: Fix | null): { text: string; tone: 'green' | 'amber' | 'red' | 'none' };   // 'GPS ±12 ft'; ≤16 green, ≤50 amber, else red; null → 'No GPS yet'
-export const TYPE_INSTRUCTIONS: Record<string, string>;          // { POLE: 'Photograph the pole and the carrier equipment on it.' }
-export function canDeletePoint(user: User, photos: PhotoView[]): boolean;   // admin, or no photo past 'phone'
+```kotlin
+data class Fix(val lat: Double, val lon: Double, val accuracyM: Double, val altitudeM: Double?, val at: Long)
+interface LocationSource { val fixes: StateFlow<Fix?>; fun start(); fun stop() }          // FusedLocationProviderClient, high accuracy, 2 s interval
+data class Heading(val deg: Double, val at: Long, val reliable: Boolean)
+interface CompassSource { val heading: StateFlow<Heading?>; fun start(); fun stop() }       // TYPE_ROTATION_VECTOR; reliable = accuracy ≥ SENSOR_STATUS_ACCURACY_MEDIUM
+fun azimuthFromRotationVector(rv: FloatArray, displayRotation: Int): Double               // remaps axes for screen rotation; 0..360
+fun shouldSend(prev: Pair<Fix, Long>?, next: Fix, now: Long): Boolean                       // > 5 m or ≥ 15 s
+class ForegroundTracker(lifecycle: Lifecycle /* ProcessLifecycleOwner */, location: LocationSource, compass: CompassSource, live: LiveSocket, now: () -> Long)   // ON_START: start + send; ON_STOP: send Paused, stop
 ```
 
 - [ ] **Step 1: Write the failing tests:**
-  - `pole form enqueues point.update with lineHeightFt 25.5, anchor, lashed, tags`;
-  - `Done disabled with 0 photos, enabled with 1 local photo`;
-  - `Can't shoot: reason required, "Other" requires text`;
-  - `Navigate link href`;
-  - `Move: drag + Confirm enqueues point.move; "Undo move" within 10 s enqueues the previous coordinates`;
-  - `Delete hidden for a tech once a photo reached the server; confirm warns "2 photos on this phone will be discarded"`;
-  - `query point shows reference images (tap opens full size)`;
-  - `ambiguous folder shows the candidates and choosing one enqueues point.setFolder`;
-  - `folder line shows "→ Field Notes/1"`.
+  - `firstFixSent`
+  - `fourMetresWithin15sNotSent`
+  - `sixMetresSent`
+  - `fifteenSecondsSendsWithoutMovement`
+  - `azimuthNorthPortrait`
+  - `azimuthRemappedForLandscape` (known rotation-vector fixtures)
+  - `onStopSendsPausedAndStopsUpdates`
+  - `noUpdatesWhileStopped` (a lifecycle test with `TestLifecycleOwner`)
 
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run web/test/point-sheet.test.tsx`. Expected: FAIL.
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :app:testDebugUnitTest --tests '*PlatformTest'`. Expected: FAIL.
 
-- [ ] **Step 3: Implement** the bottom sheet from spec §6.4, in Cadastrus's order: header (name, ➤ Navigate, ⌖ Move, ✕), instructions/description, GPS badge, pole data, query reference, comment, Take photo / Pick from gallery / Use existing photos, photo strip, Done / Can't shoot / Reopen, delete. Comment and pole fields save on change (debounced 500 ms).
-
-- [ ] **Step 4: Run to verify pass.** Expected: PASS.
-
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(web): point sheet with pole data, move, close, delete"`
-
-### Task 24: Add point flow and "Points I added"
-
-**Files:**
-- Create: `web/src/map/AddPointFlow.tsx`, `web/src/menu/PointsIAdded.tsx`
-- Test: `web/test/add-point.test.tsx`
-
-**Interfaces:**
-- Consumes: `ADD_CATEGORIES`, `suggestAddedPoleNum`, `nextNum`, `pointLabel` (Task 2); `SyncEngine.enqueue`.
-- Produces: `export function suggestName(points: Point[], type: string, layer: string, at: LatLon): string` (POLE → nearest pole's number with `suggestAddedPoleNum`; others → `nextNum` of that type's numbers).
-
-- [ ] **Step 1: Write the failing tests:** `nearest pole 14 → suggests "POLE 14B"; with 14B present → "POLE 14C"`; `Street images with 1, 2 → "Street images 3"`; `type list = job layers then ADD_CATEGORIES without duplicates`; `confirm enqueues point.add at the crosshair and opens the new point`; `"Points I added" lists only the current user's added points`.
-
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run web/test/add-point.test.tsx`. Expected: FAIL.
-
-- [ ] **Step 3: Implement.** The "+" button starts at the latest GPS fix (else the map centre) with a fixed centre crosshair; dragging the map adjusts it. A type picker and an editable number follow.
+- [ ] **Step 3: Implement.** Use `SensorManager.getRotationMatrixFromVector` → `remapCoordinateSystem` by display rotation → `getOrientation`. Permission requests are handled on the map screen (Task 24).
 
 - [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(web): add point flow and points I added"`
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(app): foreground location, compass, position sender"`
 
-### Task 25: Photo pipeline: capture, stamp, queue, statuses
+### Task 23: Jobs: list, import, check screen, job info, share target
 
-**Files:**
-- Create: `web/src/photos/capture.ts`, `web/src/photos/process.ts`, `web/src/photos/exif.ts`, `web/src/photos/uploader.ts`, `web/src/photos/cleanup.ts`, `web/src/photos/PhotoStrip.tsx`, `web/src/photos/WherePhotosWent.tsx`, `web/src/photos/ReusePicker.tsx`
-- Modify: `web/src/photos/usePointPhotos.ts` (replace the Task 23 stub)
-- Test: `web/test/photos-process.test.ts`, `web/test/uploader.test.ts`, `web/test/photo-strip.test.tsx`
+**Files:** Create `app/src/main/kotlin/com/fieldmaxx/app/jobs/{JobListScreen.kt, NewJobScreen.kt, CheckModel.kt, CheckScreen.kt, JobInfoScreen.kt, FieldNotesLinkField.kt, ShareIntake.kt}`; Test `app/src/test/kotlin/com/fieldmaxx/app/jobs/{CheckModelTest.kt, JobsScreensTest.kt, ShareIntakeTest.kt}`
 
 **Interfaces:**
-- Consumes: `stampLines`, `stampLayout`, `StampMeta` (Task 3); `GeoSource`, `CompassSource`, `pickPhoto`, `requestPersistentStorage` (Task 20); `db.localPhotos`, `CaptureMeta`, `Fix`, `CompassReading`, `PhotoView` (Task 19); `Api.photoCreate`/`photoChunk`.
 - Produces:
-```ts
-export async function savePhoto(file: File, jobId: string, pointId: string, meta: CaptureMeta): Promise<string>;   // writes original first; returns local id (uuid, also the server photo id)
-export function targetSize(w: number, h: number, maxPixels?: number /* 16_000_000 */): { w: number; h: number };
-export interface OriginalExif { lat?: number; lon?: number; altitudeM?: number; takenAt?: number; headingDeg?: number; make?: string; model?: string }
-export function readOriginalExif(jpeg: ArrayBuffer): OriginalExif;
-export function buildExif(e: { lat: number | null; lon: number | null; altitudeM: number | null; headingDeg: number | null; trueNorth: boolean; takenAt: Date; make?: string; model?: string }): string;   // piexif dump, Orientation=1
-export function resolveStamp(meta: CaptureMeta, orig: OriginalExif, now: number): StampMeta;   // GPS stale when fix older than 10 s; gallery uses EXIF GPS/time when present
-export async function makeUploadCopy(original: Blob, stamp: StampMeta, exifStr: string, quality: 0.85 | 0.95): Promise<Blob>;
-export class Uploader { constructor(deps: { api: Api; concurrency?: number /* 3 */; chunkBytes?: number /* 524288 */ }); start(): void; stop(): void; kick(): void }
-export async function cleanupConfirmed(now: number): Promise<number>;   // deletes blobs 3 days after confirmedAt
-export function usePointPhotos(pointId: string): PhotoView[];           // thumbnail from the stamped upload copy once processed, else the original
-export function pendingCount(local: LocalPhoto[], server: PhotoInfo[]): number;
+```kotlin
+data class CheckState(val previews: List<ImportPreview>, val edits: Map<String, List<DraftPoint>>, val ignoredUnread: Set<String>, val layers: Map<String, String>)
+fun summary(points: List<DraftPoint>): List<String>        // "Found 7 POLE points"; "1 needs coordinates"
+fun canSave(s: CheckState): Boolean
+fun fixUnread(s: CheckState, importId: String, line: UnreadLine, label: String, coords: String): CheckState   // throws IllegalArgumentException("Coordinates not recognised")
+fun toJobImports(s: CheckState): List<JobImportInput>
+fun flagText(f: ImportFlag): String   // "Possibly swapped", "Sign differs", "Far from the rest", "Duplicate label", "No label", "No coordinates"
+sealed interface SharedIntake { data class Files(val uris: List<android.net.Uri>) : SharedIntake; data class Link(val url: String) : SharedIntake }
+fun parseShareIntent(intent: android.content.Intent): SharedIntake?        // text containing sharepoint.com / 1drv.ms / onedrive.live.com → Link
 ```
 
 - [ ] **Step 1: Write the failing tests:**
-```ts
-test('targetSize keeps 3000x4000', () => expect(targetSize(3000, 4000)).toEqual({ w: 3000, h: 4000 }));
-test('targetSize caps 48MP to 16MP keeping aspect', () => expect(targetSize(8000, 6000)).toEqual({ w: 4618, h: 3464 }));
-test('buildExif round-trips GPS, altitude, direction and time', …);           // piexif.load on the dump
-test('resolveStamp: fresh fix used; 11 s old fix → gpsStale; gallery with EXIF GPS uses it and is marked fromGallery', …);
-test('savePhoto stores the original before processing; a processing failure leaves it saved', …);
-test('uploader resumes from the server offset after a dropped chunk', …);
-test('uploader never runs more than 3 uploads at once', …);
-test('queue survives reload and uploads each photo once', async () => { /* 30 photos saved while api rejects with network error; new Uploader instance; api online → photoCreate completes once per id, all reach "uploaded" */ });
-test('401 pauses the uploader without changing photo states', …);
-test('server confirmation (applyChange) marks local photo confirmed; cleanup removes blobs only after 3 days', …);
-test('photo strip shows ⏳ on phone, ☁ on server, ✓ in OneDrive, ⚠ stuck with the reason', …);
-test('pendingCount counts local not uploaded + server not confirmed, no double counting', …);
+  - `summaryPerType`
+  - `saveDisabledUntilNoCoordinatesFixedOrRemoved`
+  - `fixUnreadAddsPoint`
+  - `ignoreUnreadEnablesSave`
+  - `flagBadgesText`
+  - `jobListShowsProgressAndFinishedSection`
+  - `deleteOnlyForCreatorOrAdminConfirmNamesJob`
+  - `linkCheckShowsRootOrError`
+  - `saveWithoutLinkShowsPhotosWillWait` (`"Photos will wait until the Field Notes link is added"`)
+  - `jobInfoOpensSourceFile` (downloads `/api/jobs/{id}/files/{fileId}` and fires `ACTION_VIEW`)
+  - `shareIntentPdfIsFiles`
+  - `shareIntentTextWithOneDriveLinkIsLink`
+
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :app:testDebugUnitTest --tests 'com.fieldmaxx.app.jobs.*'`. Expected: FAIL.
+
+- [ ] **Step 3: Implement.**
+  - **New job:** `ActivityResultContracts.OpenMultipleDocuments` with the PDF/DOCX MIME types, then upload each file → check screen. The job name defaults to the first file's name without its extension (`A05J9XE.pdf` → `A05J9XE`) and is editable.
+  - **Check screen cards:** summary lines, a list of point cards (edit/remove; a small map preview through `MapController` is optional in v1), "Couldn't read" fix/ignore, layer field, Field Notes link with Check, Save.
+  - **Share intake:** shows "New job / Add to job".
+
+- [ ] **Step 4: Run to verify pass.** Expected: PASS.
+
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(app): job list, import check screen, job info, share target"`
+
+### Task 24: Map screen
+
+**Files:** Create `app/src/main/kotlin/com/fieldmaxx/app/map/{MapModel.kt, ViewMemory.kt, MapController.kt, MapLibreController.kt, MapScreen.kt, TopBar.kt, ChipRow.kt, ProgressStrip.kt, SearchSheet.kt, LeftList.kt}`; Test `app/src/test/kotlin/com/fieldmaxx/app/map/{MapModelTest.kt, MapScreenTest.kt}`
+
+**Interfaces:**
+- Produces:
+```kotlin
+data class TypeProgress(val type: String, val done: Int, val total: Int); data class Progress(val done: Int, val total: Int, val pct: Int, val byType: List<TypeProgress>)
+fun progress(points: List<Point>): Progress                // done + cant_shoot complete; deleted excluded
+fun visiblePoints(points: List<Point>, type: String?, hideShot: Boolean): List<Point>
+fun chipLabel(t: TypeProgress): String                       // "✓ POLE (80/80)" | "POLE (12/80)"
+fun sunsetText(nowMs: Long, lat: Double, lon: Double, zone: java.time.ZoneId): String   // "☀️ 5h 40m until sunset" | "🌙 After sunset" (commons-suncalc)
+fun remainingByDistance(points: List<Point>, from: LatLon?): List<Point>
+enum class CrewDot { FRESH, PAUSED, FADED, HIDDEN }; fun crewDotState(p: CrewPosition, now: Long): CrewDot   // paused → PAUSED; ≥ 10 min FADED; ≥ 1 h HIDDEN
+fun searchPoints(points: List<Point>, q: String): List<Point>
+data class CameraView(val lat: Double, val lon: Double, val zoom: Double)
+interface ViewMemory { suspend fun save(userId: String, jobId: String, v: CameraView); suspend fun load(userId: String, jobId: String): CameraView? }   // DataStore
+data class HouseNumber(val lat: Double, val lon: Double, val text: String)
+interface MapController {   // MapLibre lives behind this so screens are testable (native libs don't load in Robolectric)
+  fun setConfig(c: AppConfig); fun setPoints(points: List<Point>, pendingPhotoPointIds: Set<String>); fun setCrew(crew: List<CrewPosition>, now: Long); fun setMyFix(f: Fix?)
+  fun moveTo(v: CameraView); fun fitAll(points: List<Point>); val camera: StateFlow<CameraView?>; val pointTaps: SharedFlow<String>
+  fun setLabelsVisible(v: Boolean); fun setHouseNumbers(items: List<HouseNumber>); fun beginDrag(pointId: String): Flow<LatLon>; fun endDrag()
+}
 ```
 
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run web/test/photos-process.test.ts web/test/uploader.test.ts web/test/photo-strip.test.tsx`. Expected: FAIL.
+- [ ] **Step 1: Write the failing tests:**
+  - **Model:**
+    - `progressCountsCantShootIgnoresDeleted`
+    - `chipLabels`
+    - `sunsetFormat` (5 h 40 min before commons-suncalc's sunset at 39.53, -119.81 → `☀️ 5h 40m until sunset`; 1 min after → `🌙 After sunset`)
+    - `crewDots` (9 min FRESH, paused 2 min PAUSED, 11 min FADED, 61 min HIDDEN)
+    - `searchMatchesLabelNumDescription`
+  - **Screen** (`FakeMapController`):
+    - `restoresSavedViewOnOpen`
+    - `fitsAllWhenNoSavedView`
+    - `savesViewOnCameraMove`
+    - `hideShotFilters`
+    - `chipFiltersType`
+    - `pillShowsOnlineOfflineWaiting` (`"3 photos waiting"`)
+    - `deliveryProblemBanner`
+    - `asksOnlyWhileInUseLocationPermission`
+
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :app:testDebugUnitTest --tests 'com.fieldmaxx.app.map.*'`. Expected: FAIL.
 
 - [ ] **Step 3: Implement.**
-  - **Capture:** on the first photo of a session, call `compass.requestPermission()` (iPhone's one-time prompt). Read the heading from the compass when the file returns; prefer the camera's EXIF image direction when present. Save the original Blob to Dexie (state `saved`) before anything else, then kick the processor.
-  - **Processor:** `createImageBitmap(blob, { imageOrientation: 'from-image' })` → scale to `targetSize` → draw on `OffscreenCanvas` (fallback `<canvas>`).
-  - **Stamp:** `ctx.font = '700 <fontPx>px system-ui'`, white fill, `shadowColor rgba(0,0,0,0.9)`, `shadowBlur shadowBlurPx`, lines at `firstBaselineY + i * lineHeightPx`.
-  - **Encode:** `convertToBlob({ type: 'image/jpeg', quality })` (quality from `GET /api/settings`, default 0.85) → `piexif.insert(buildExif(...))`. Compute sha256 with `crypto.subtle`; state becomes `ready`.
-  - **Uploader:** call `photoCreate` (gets the offset), then send chunks from that offset; on `received`, state becomes `uploaded`. Server photo changes drive `confirmed`/`stuck`.
-  - **Startup and schedule:** call `requestPersistentStorage()` at app start; run cleanup at start and hourly.
-  - **Screens:** `WherePhotosWent` lists, per point, each photo with destPath and status, plus a link to the Field Notes URL. `ReusePicker` lists this job's other photos (server copies via `/api/photos/:id/file` while available) and enqueues `photo.reuse`.
+  - **`MapLibreController`** wraps `MapView` in `AndroidView`:
+    - raster sources from `AppConfig` (imagery; labels at opacity 0.9);
+    - points as a GeoJSON source with `cluster = true` and `clusterMaxZoom = 17`;
+    - circle and symbol layers using data-driven colour per type and grey 55% opacity for shot points, with a badge for pending photos;
+    - crew as a separate source;
+    - viewed tiles cached by MapLibre's ambient cache.
+  - **Overlays:** top bar, chips and progress are Compose overlays matching §6.3.
+
+- [ ] **Step 4: Run to verify pass.** Expected: PASS. Then run `./gradlew :app:assembleDebug` → success.
+
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(app): map screen with filters, progress, crew, view memory"`
+
+### Task 25: Point sheet
+
+**Files:** Create `app/src/main/kotlin/com/fieldmaxx/app/point/{PointSheet.kt, PoleDataForm.kt, QueryReference.kt, CloseControls.kt, MoveFlow.kt, FolderLine.kt, DeletePoint.kt, Gps.kt}`, `app/src/main/kotlin/com/fieldmaxx/app/photos/PhotoView.kt` (the type plus a stub `fun photoViewsFor(pointId: String): Flow<List<PhotoView>> = flowOf(emptyList())`, replaced in Task 29); Test `app/src/test/kotlin/com/fieldmaxx/app/point/PointSheetTest.kt`
+
+**Interfaces:**
+- Produces:
+```kotlin
+fun navigateUri(lat: Double, lon: Double): android.net.Uri      // https://www.google.com/maps/dir/?api=1&destination=<lat>,<lon>
+enum class Tone { GREEN, AMBER, RED, NONE }; data class GpsBadge(val text: String, val tone: Tone)
+fun gpsBadge(f: Fix?): GpsBadge                       // "GPS ±12 ft"; ≤16 GREEN, ≤50 AMBER, else RED; null → "No GPS yet"
+val TYPE_INSTRUCTIONS: Map<String, String>            // "POLE" → "Photograph the pole and the carrier equipment on it."
+enum class PhotoUiStatus { ON_PHONE, UPLOADING, IN_ONEDRIVE, STUCK }
+data class PhotoView(val id: String, val thumb: Any /* java.io.File or URL String */, val status: PhotoUiStatus, val backedUp: Boolean, val error: String?, val destPath: String?, val ownerId: String)
+fun canDeletePoint(user: User, photos: List<PhotoView>): Boolean   // admin, or none IN_ONEDRIVE
+```
+
+- [ ] **Step 1: Write the failing tests:**
+  - `poleFormEnqueuesUpdate` (25.5 ft, anchor, lashed, tags)
+  - `doneDisabledWithoutPhotos`
+  - `cantShootReasonRequiredOtherNeedsText`
+  - `navigateIntentUri`
+  - `moveConfirmEnqueuesMoveUndoWithin10sRestores`
+  - `deleteHiddenAfterOneDriveForTech`
+  - `deleteWarnsPhotosOnPhoneDiscarded` (`"2 photos on this phone will be discarded"`)
+  - `queryShowsReferenceImages`
+  - `ambiguousFolderPickerEnqueuesSetFolder`
+  - `folderLineShowsPath` (`"→ Field Notes/POLE/POLE_18"`)
+  - `commentDebouncedSave`
+
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :app:testDebugUnitTest --tests 'com.fieldmaxx.app.point.*'`. Expected: FAIL.
+
+- [ ] **Step 3: Implement** a `ModalBottomSheet` in the §6.4 order. Reference images load with Coil (auth header). Move uses `MapController.beginDrag`. The comment and pole fields save after a 500 ms debounce.
 
 - [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(web): photo capture, stamping, resumable queue, statuses"`
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(app): point sheet"`
 
-### Task 26: Menu, admin screens, update prompt
+### Task 26: Add point flow and "Points I added"
 
-**Files:**
-- Create: `server/src/admin/routes.ts`; `web/src/menu/Menu.tsx`, `web/src/admin/Users.tsx`, `web/src/admin/Jobs.tsx`, `web/src/admin/DeliveryHealth.tsx`, `web/src/admin/Activity.tsx`, `web/src/admin/Settings.tsx`, `web/src/app/UpdatePrompt.tsx`
-- Test: `server/test/admin.test.ts`, `web/test/admin.test.tsx`
+**Files:** Create `app/src/main/kotlin/com/fieldmaxx/app/map/AddPointFlow.kt`, `app/src/main/kotlin/com/fieldmaxx/app/menu/PointsIAddedScreen.kt`; Test `app/src/test/kotlin/com/fieldmaxx/app/map/AddPointTest.kt`
 
 **Interfaces:**
-- Produces (server): `GET /api/admin/health → { diskUsedPct: number; photos: PhotoInfo[] /* not confirmed, stuck first */; timings: { phoneToServerMedianS: number | null; serverToOneDriveMedianS: number | null } /* photos confirmed in the last 24 h: receivedAt − takenAt, confirmedAt − receivedAt */ }`; `POST /api/admin/photos/:id/retry` (calls `retryPhoto`); `GET /api/admin/activity?jobId= → Array<{ at: number; user: string; kind: string; label: string | null; detail: string }>`; `GET /api/settings → { photoQuality: 'standard' | 'maximum' }`; `PUT /api/admin/settings { photoQuality }`. All admin routes 403 for techs.
+- Produces: `fun suggestName(points: List<Point>, type: String, layer: String, at: LatLon): String` (POLE → the nearest pole's number via `suggestAddedPoleNum`, returned as a label like `"POLE 14B"`; others → `nextNum` of that type's numbers, e.g. `"Street images 3"`); `fun typeChoices(jobLayers: List<String>): List<String>` (job layers, then `ADD_CATEGORIES`, de-duplicated).
 
-- [ ] **Step 1: Write the failing tests:** server `health lists stuck before received, admin only`; `health timings are medians over the last 24 h`; `retry resets attempts`; `activity lists can't-shoot with reason`; `settings default standard, admin can set maximum`. Web `menu shows admin section only for admins`; `menu shows a red count on Delivery health when any photo is stuck`; `delivery health shows disk %, an alert above 80%, and typical times per hop`; `finish job shows "7 points left, 3 photos not in OneDrive yet" when blocked`; `users screen creates a tech and shows the temporary password once`; `jobs screen restores a deleted job`; `update prompt "Update available — tap to reload" appears when the service worker reports a new version`.
+- [ ] **Step 1: Write the failing tests:** `nearestPole14SuggestsPOLE14B`, `with14BSuggests14C`, `streetImagesNext3`, `typeChoicesOrderNoDupes`, `confirmEnqueuesAddAtCrosshairOpensSheet`, `pointsIAddedOnlyMine`.
 
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run server/test/admin.test.ts web/test/admin.test.tsx`. Expected: FAIL.
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :app:testDebugUnitTest --tests '*AddPointTest'`. Expected: FAIL.
 
-- [ ] **Step 3: Implement** the menu from spec §6.11. "Map imagery" isn't in v1; the build id comes from `/api/version`. Admin screens are plain lists using the shared dark styles.
+- [ ] **Step 3: Implement.** A centre crosshair over the map, starting at the latest fix (else the map centre); then a type picker; then an editable name.
 
 - [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat: menu, admin screens, update prompt"`
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(app): add point flow"`
 
-### Task 27: House-number overlay
+### Task 27: Camera with live stamp overlay, gallery pick
 
-**Files:**
-- Create: `web/src/map/houseNumbers.ts`, `web/src/map/HouseNumbersLayer.tsx`
-- Test: `web/test/house-numbers.test.ts`
+**Files:** Create `app/src/main/kotlin/com/fieldmaxx/app/camera/{CameraScreen.kt, CaptureController.kt, CameraXCaptureController.kt, StampOverlay.kt, GalleryPick.kt}`, `app/src/main/kotlin/com/fieldmaxx/app/photos/{LocalPhotos.kt, CaptureMeta.kt}`; Test `app/src/test/kotlin/com/fieldmaxx/app/camera/CameraTest.kt`
 
 **Interfaces:**
-- Produces: `export function overpassQuery(b: { s: number; w: number; n: number; e: number }): string`; `export function parseHouseNumbers(json: unknown): Array<{ lat: number; lon: number; text: string }>` (nodes, plus ways via `out center`).
+- Produces:
+```kotlin
+@Serializable data class CaptureMeta(val jobName: String, val pointLabel: String, val source: String /* camera|gallery */, val lat: Double?, val lon: Double?, val accuracyM: Double?, val altitudeM: Double?, val headingDeg: Double?, val takenAt: Long, val gpsStale: Boolean)
+interface CaptureController { suspend fun capture(to: java.io.File) }   // CameraX ImageCapture, CAPTURE_MODE_MAXIMIZE_QUALITY
+fun interface PhotoPipelineStarter { fun start(localPhotoId: String) }   // Task 28 provides the real one
+class LocalPhotos(db: AppDatabase, filesDir: java.io.File, starter: PhotoPipelineStarter, now: () -> Long) {
+  suspend fun saveCaptured(jobId: String, pointId: String, meta: CaptureMeta, write: suspend (java.io.File) -> Unit): String   // file written and row inserted (state "saved") BEFORE starter.start(id)
+  suspend fun saveFromGallery(jobId: String, pointId: String, uri: android.net.Uri, jobName: String, pointLabel: String, fallback: Fix?): String
+}
+fun overlayLines(jobName: String, pointLabel: String, fix: Fix?, heading: Heading?, now: Long, zone: java.time.ZoneId): List<String>   // = stampLines, gpsStale when fix older than 10 s
+```
 
-- [ ] **Step 1: Write the failing tests:** `query contains "addr:housenumber" and the bbox in s,w,n,e order with "out center"`; `parse nodes and way centers; skips entries without a number`.
+- [ ] **Step 1: Write the failing tests:**
+  - `shutterUsesHeadingAndFixAtPressTime`
+  - `staleFixMarked`
+  - `originalPersistedBeforePipelineStarts` (the starter asserts the row and file exist)
+  - `failingWriteLeavesNoRow`
+  - `galleryUsesExifGpsWhenPresent` (an EXIF fixture JPEG)
+  - `galleryWithoutExifUsesFixAndMarksFromGallery`
+  - `burstCounterIncrements`
+  - `compassCalibrationHintWhenUnreliable` (`"Compass: calibrate"`)
 
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run web/test/house-numbers.test.ts`. Expected: FAIL.
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :app:testDebugUnitTest --tests '*CameraTest'`. Expected: FAIL.
 
-- [ ] **Step 3: Implement.** POST to `https://overpass-api.de/api/interpreter` on `moveend` at zoom ≥ 17, debounced 600 ms, caching per rounded bbox. Draw labels in a non-interactive pane at z-index 390 using the `house-number-label` style (white bold 12 px with dark text shadow, from Cadastrus's CSS). Toggle with the `123` button.
+- [ ] **Step 3: Implement** a CameraX `Preview` + `ImageCapture` (flash, pinch zoom). The overlay re-renders `overlayLines` every 500 ms. The Photo Picker uses `PickMultipleVisualMedia(ImageOnly)` and copies into app storage.
 
 - [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(web): house-number overlay"`
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(app): camera with live stamp overlay and gallery pick"`
 
-### Task 28: End-to-end tests
+### Task 28: Photo pipeline workers
 
-**Files:**
-- Create: `e2e/playwright.config.ts`, `e2e/global-setup.ts`, `e2e/field.spec.ts`, `e2e/fixtures/photo-3000x4000.jpg` (generated in global setup), `server/src/test-routes.ts`
-- Modify: `server/src/app.ts` (register test routes when `config.testRoutes`)
+**Files:** Create `app/src/main/kotlin/com/fieldmaxx/app/photos/{PhotoPipeline.kt, Stamper.kt, ExifWriter.kt, StampWorker.kt, RegisterWorker.kt, OneDriveWorker.kt, BackupWorker.kt, CleanupWorker.kt, GallerySaver.kt, UploadGate.kt}`; Test `app/src/test/kotlin/com/fieldmaxx/app/photos/{StamperTest.kt, PipelineTest.kt}`
 
 **Interfaces:**
-- Produces: `GET /__test/destination` → `{ folders: string[]; files: Array<{ path: string; size: number }> }` and `GET /__test/destination/file?path=` (bytes). Enabled only when `FMX_TEST_ROUTES=1` and `FMX_DESTINATION=fake`.
+- Consumes: `stampLines`, `stampLayout` (Task 3); `FolderResolver`, `PhotoDestination`, `ChunkSession`, `DestinationFactory` (Tasks 9–10); `Api` (Task 20); `SyncEngine`, `LocalPhotoEntity` (Task 21); `CaptureMeta`, `PhotoPipelineStarter` (Task 27).
+- Produces:
+```kotlin
+fun targetSize(w: Int, h: Int, maxPixels: Int = 16_000_000): Pair<Int, Int>
+object Stamper { fun stamp(original: java.io.File, out: java.io.File, meta: CaptureMeta, zone: java.time.ZoneId, quality: Int) }   // decode (inSampleSize + exact scale), apply EXIF rotation, draw stamp, compress, write EXIF
+object ExifWriter { fun write(file: java.io.File, meta: CaptureMeta, make: String?, model: String?) }
+class PhotoPipeline(context: Context, db: AppDatabase, api: Api, destinations: DestinationFactory, sync: SyncEngine, now: () -> Long) : PhotoPipelineStarter {
+  override fun start(localPhotoId: String); fun retryNow(localPhotoId: String); fun resumeAll()   // resumeAll on app start: re-enqueue every unfinished photo from its persisted state
+}
+object UploadGate { val oneDrive: kotlinx.coroutines.sync.Semaphore /* 3 permits */; val backup: kotlinx.coroutines.sync.Semaphore /* 1 permit */ }
+fun nextDelayMs(attempts: Int): Long   // 15 s doubling, 30 min cap
+```
+The workers are unique per photo and step (`ExistingWorkPolicy.KEEP`), all with a network constraint except `StampWorker`.
 
-- [ ] **Step 1: Write `global-setup.ts`.** Build web and server; start the server on port 8099 with a temp data dir, `FMX_DESTINATION=fake` and `FMX_TEST_ROUTES=1`; create an admin and two techs via the CLI; write the aerial replica PDF (Task 8 helper) and a 3000×4000 JPEG to `e2e/fixtures/`. Config: `--trace off`, Chromium with geolocation permission.
+- [ ] **Step 1: Write the failing tests:**
+  - **Stamper** (Robolectric `@GraphicsMode(NATIVE)`):
+    - `targetSizeCaps48MpTo16MpKeepingAspect` (`8000×6000` → `(4618, 3464)`);
+    - `keeps3000x4000`;
+    - `stampedFileHasExifGpsDirectionAndDate`;
+    - `stampDrawnInBottomLeft` (pixels in the stamp box differ from the source, the top-right does not);
+    - `qualitySettingChangesSize`.
+  - **Pipeline** (FakeDestination + fake Api + work-testing `TestDriver`):
+    - `happyPathSavedToConfirmedAndBackedUp` (file at `POLE/POLE_1/<server fileName>`; `Op.PhotoConfirmed` enqueued);
+    - `pipelineSurvivesAKillAfterEveryStep` (run the steps one at a time, rebuild `PhotoPipeline` from the database between each, call `resumeAll()`; exactly one file in the fake and exactly one confirmed op);
+    - `resumesChunkedUploadFromPersistedOffset` (the fake drops after chunk 1; a new worker run resumes from that offset);
+    - `sameNameSameSizeCountsAsDelivered`;
+    - `sameNameDifferentSizeRenamesViaServer`;
+    - `ambiguousFolderWaitsForChoice`;
+    - `retriesThenStuckAfter6ReportsFailedOp`;
+    - `retryNowForcesAttempt`;
+    - `neverMoreThan3OneDriveUploads`;
+    - `backupRunsWhenOneDriveFails`;
+    - `serverConfirmedFirstMarksLocalConfirmed` (the server took over: a `PhotoInfo` change to `confirmed` stops the phone upload);
+    - `cleanupDeletesOnly3DaysAfterConfirmedAndBackedUp`;
+    - `galleryCopyWhenSettingOn`;
+    - `queueSurvivesOfflineHours` (30 photos with no network, then network → each uploads once).
 
-- [ ] **Step 2: Write the specs:**
-  - `tech imports a job, shoots POLE 1, photo is confirmed in OneDrive`: upload the PDF → "Found 7 POLE points" → Save with a dummy link → 7 markers → open POLE 1 → `setInputFiles` on the camera input → strip shows ✓ within 30 s. `/__test/destination` has `POLE/POLE_1/POLE_1_*.jpg`, 3000×4000, and EXIF GPS equal to the context geolocation.
-  - `reload keeps the map view`: zoom/pan, reload, centre within 1e-5 and same zoom.
-  - `offline photo uploads after reconnect`: `context.setOffline(true)`, take photo → ⏳; reload (app shell from the service worker) → still ⏳; `setOffline(false)` → ✓.
-  - `second tech sees the closed point and the first tech's dot within 5 s`: two contexts, geolocations set.
-  - `tech cannot delete a point after its photo reached the server`.
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :app:testDebugUnitTest --tests 'com.fieldmaxx.app.photos.*'`. Expected: FAIL.
 
-- [ ] **Step 3: Run.** Run: `npx playwright test -c e2e --trace off`. Expected: all specs PASS. Fix code, not tests, on failure (use superpowers:systematic-debugging).
+- [ ] **Step 3: Implement.** Steps and their persisted state:
+  1. **StampWorker:** `saved` → `stamped`.
+  2. **RegisterWorker:** `api.registerPhoto` → `fileName` → `registered`.
+  3. **OneDriveWorker:**
+     - folder from `point.folderPath`, else `FolderResolver` + enqueue `Op.PointSetFolder`;
+     - `fileInfo` check;
+     - `uploadChunked` (resume from `oneDriveUploadId`/`oneDriveOffset`; persist progress after each chunk; set `createdThisFile`);
+     - verify;
+     - enqueue `Op.PhotoConfirmed`;
+     - state `confirmed`.
+  4. **BackupWorker:** chunks to `PUT /api/photos/{id}/backup` from `backupOffset`, lower priority, independent of the OneDrive result.
+  5. **CleanupWorker:** periodic, every 6 h.
 
-- [ ] **Step 4: Commit.** `git add -A && git commit -m "test: end-to-end field workflow"`
+  Failures: `attempts++`, schedule the next run with `nextDelayMs`; at 6 attempts set `stuck` and enqueue `Op.PhotoFailed(error, attempts)`. `FieldmaxxApp.onCreate` calls `resumeAll()`. JPEG quality comes from `AppConfig.photoQuality`.
 
-### Task 29: Deployment
+- [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
-**Files:**
-- Create: `Dockerfile`, `docker-compose.yml`, `deploy/Caddyfile`, `deploy/setup.sh`, `deploy/backup.sh`, `deploy/README.md`
-- Modify: `server/src/cli.ts` (add `speedtest`)
-- Test: `server/test/cli-speedtest.test.ts`
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(app): resilient photo pipeline to OneDrive and server backup"`
+
+### Task 29: Photo UI, reuse picker, export to OneDrive app
+
+**Files:** Create `app/src/main/kotlin/com/fieldmaxx/app/photos/{PhotoViews.kt, PhotoStrip.kt, WherePhotosWentScreen.kt, ReusePicker.kt, ExportZip.kt, DeletePhoto.kt}`; Modify `photos/PhotoView.kt` (replace the stub); Test `app/src/test/kotlin/com/fieldmaxx/app/photos/PhotoUiTest.kt`
 
 **Interfaces:**
-- Produces: `node dist/cli.js speedtest <shareUrl>`, which uploads 3 synthetic 9 MB JPEGs into `_fieldmaxx_speedtest/` and prints `Upload: <n> MB/s (3 files, <s> s)`. The README says to use a throwaway shared folder and delete it afterwards, because the link can't delete.
+- Produces: `fun photoViews(local: List<LocalPhotoEntity>, server: List<PhotoInfo>): List<PhotoView>`; `fun photoViewsFor(pointId: String): Flow<List<PhotoView>>` (real version, combining Room flows); `fun pendingCount(local: List<LocalPhotoEntity>, server: List<PhotoInfo>): Int`; `fun buildExportZip(photos: List<LocalPhotoEntity>, points: Map<String, Point>, out: java.io.File)` (paths `<folderPath or Category/defaultFolder>/<fileName or local id>.jpg`); `fun canDeletePhoto(user: User, p: PhotoView): Boolean` (owner before IN_ONEDRIVE; admin always; after IN_ONEDRIVE it only hides).
 
-- [ ] **Step 1: Write the failing test:** `speedtest uploads 3 files to FakeDestination under _fieldmaxx_speedtest/ and prints MB/s`.
+- [ ] **Step 1: Write the failing tests:**
+  - `statusMapping` (saved/stamped → ON_PHONE; registered → UPLOADING; confirmed → IN_ONEDRIVE; stuck → STUCK)
+  - `shieldWhenBackedUp`
+  - `pendingCountNoDoubleCounting`
+  - `stripShowsIconsAndStuckReasonWithRetryNow`
+  - `whereWentListsPathsAndOpensFieldNotesLink`
+  - `reusePickerTabsNearbyThisJobSearch` (nearby shows `"80 m"`; after picking, the point shows `"reused from POLE 5 · A05J9XE · 11/05/26"`)
+  - `reuseEnqueuesPhotoReuseOps`
+  - `exportZipFieldNotesLayoutOnlyUnconfirmed` (shared through the share sheet via `FileProvider`)
+  - `deletePhotoRules`
 
-- [ ] **Step 2: Run to verify failure.** Run: `npx vitest run server/test/cli-speedtest.test.ts`. Expected: FAIL.
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :app:testDebugUnitTest --tests '*PhotoUiTest'`. Expected: FAIL.
 
-- [ ] **Step 3: Implement.**
-  - **`Dockerfile`:** multi-stage on `node:22-bookworm-slim`. Build stage: `npm ci`, build web and server. Runtime: production deps, `server/dist`, `web/dist`, volume `/data`, `ENV FMX_DATA_DIR=/data`, `EXPOSE 8080`.
-  - **`docker-compose.yml`:** `app` plus `caddy:2` (ports 80/443, Caddyfile `{$DOMAIN} { reverse_proxy app:8080 }`). Volumes `fmx-data` and `caddy-data`.
-  - **`setup.sh`:** for Ubuntu. Installs Docker, asks for the domain (suggesting `<ip>.sslip.io`), the admin username, display name and password, writes `.env`, runs `docker compose up -d --build`, then `docker compose exec app node server/dist/cli.js create-admin …`, and installs a nightly cron for `backup.sh`.
-  - **`backup.sh`:** `sqlite3 .backup` into `/data/backups/fieldmaxx-YYYYMMDD.db`, keeping 14.
-  - **`README.md`:** the server requirements from spec §7.3 (US-West, ≥ 1 Gbps, ≥ 4 TB transfer, ≥ 80 GB disk), setup steps, how to run the speed test, updating (`git pull && docker compose up -d --build`), and restoring a backup.
+- [ ] **Step 3: Implement.** Thumbnails come from the stamped local file, else the server thumb (`/api/photos/{id}/thumb`) via Coil. The reuse picker calls `api.nearby` (excluding this point), `api.jobPhotos`, and filters by label on search.
 
-- [ ] **Step 4: Verify.** Run: `npx vitest run server/test/cli-speedtest.test.ts` → PASS. Run `bash -n deploy/setup.sh deploy/backup.sh` → no output. If Docker is available, also run `docker build -t fieldmaxx .` → success. If not, run `npm run build -w web && npm run build -w server && FMX_DATA_DIR=$(mktemp -d) FMX_DESTINATION=fake node server/dist/index.js` and confirm `curl -s localhost:8080/api/version` returns JSON and `curl -s localhost:8080/` returns the app HTML.
+- [ ] **Step 4: Run to verify pass.** Expected: PASS.
 
-- [ ] **Step 5: Final check.** Run: `npm test && npm run typecheck && npx playwright test -c e2e --trace off`. Expected: all PASS.
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(app): photo statuses, reuse picker, export to OneDrive app"`
 
-- [ ] **Step 6: Commit.** `git add -A && git commit -m "feat: docker deployment, setup and backup scripts, speed test"`
+### Task 30: Menu, admin screens, exports, finish job, in-app update, settings
+
+**Files:** Create `app/src/main/kotlin/com/fieldmaxx/app/menu/{MenuSheet.kt, SettingsScreen.kt}`, `app/src/main/kotlin/com/fieldmaxx/app/admin/{UsersScreen.kt, AdminJobsScreen.kt, DeliveryHealthScreen.kt, ActivityScreen.kt, AdminSettingsScreen.kt}`, `app/src/main/kotlin/com/fieldmaxx/app/update/{UpdateChecker.kt, UpdateInstaller.kt}`, `app/src/main/kotlin/com/fieldmaxx/app/jobs/{ExportPoleData.kt, FinishJob.kt}`; Test `app/src/test/kotlin/com/fieldmaxx/app/menu/MenuAdminUpdateTest.kt`
+
+**Interfaces:**
+- Produces: `class UpdateChecker(api: Api, currentVersionCode: Int, now: () -> Long) { suspend fun check(force: Boolean = false): AppRelease? }` (at most once a day unless forced); `class UpdateInstaller(context: Context, api: Api) { suspend fun downloadAndInstall(r: AppRelease) }` (verifies sha256, then `ACTION_VIEW` via `FileProvider`; if `!packageManager.canRequestPackageInstalls()` it opens `ACTION_MANAGE_UNKNOWN_APP_SOURCES` first).
+
+- [ ] **Step 1: Write the failing tests:**
+  - `menuAdminSectionOnlyForAdmins`
+  - `stuckRedCountOnDeliveryHealth`
+  - `deliveryHealthDiskAlertAndMedians`
+  - `usersCreateShowsTempPasswordOnce`
+  - `adminRestoresDeletedJob`
+  - `adminSettingsBackupDaysMin3Message`
+  - `exportPoleDataSavesOrShares`
+  - `finishBlockedMessage` (`"7 points left, 3 photos not in OneDrive yet"`)
+  - `updateCheckOncePerDay`
+  - `updateBannerText` (`"Update available — tap to install"`)
+  - `installerRejectsShaMismatch`
+  - `gallerySettingToggles`
+
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :app:testDebugUnitTest --tests '*MenuAdminUpdateTest'`. Expected: FAIL.
+
+- [ ] **Step 3: Implement** the menu from §6.12 and the admin screens from §6.9, as plain lists in the theme. Exports download to cache and offer "Save to Downloads" (MediaStore) or "Share".
+
+- [ ] **Step 4: Run to verify pass.** Expected: PASS.
+
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(app): menu, admin, exports, finish job, in-app update"`
+
+### Task 31: House-number overlay
+
+**Files:** Create `app/src/main/kotlin/com/fieldmaxx/app/map/HouseNumbers.kt`; Test `app/src/test/kotlin/com/fieldmaxx/app/map/HouseNumbersTest.kt`
+
+**Interfaces:**
+- Consumes: `HouseNumber`, `MapController.setHouseNumbers` (Task 24).
+- Produces: `data class BBox(val s: Double, val w: Double, val n: Double, val e: Double)`; `fun overpassQuery(b: BBox): String`; `fun parseHouseNumbers(json: String): List<HouseNumber>`; `class HouseNumberLoader(client: OkHttpClient) { suspend fun load(b: BBox): List<HouseNumber> }` (cached per bbox rounded to 3 decimals).
+
+- [ ] **Step 1: Write the failing tests:** `queryHasHousenumberBboxOutCenter`, `parsesNodesAndWayCentersSkipsMissing`.
+
+- [ ] **Step 2: Run to verify failure.** Run: `./gradlew :app:testDebugUnitTest --tests '*HouseNumbersTest'`. Expected: FAIL.
+
+- [ ] **Step 3: Implement.** POST to `https://overpass-api.de/api/interpreter` on camera idle at zoom ≥ 17, debounced 600 ms. Draw via `MapController.setHouseNumbers` as a white bold 12 sp symbol layer with a dark halo. Toggle with the `123` button.
+
+- [ ] **Step 4: Run to verify pass.** Expected: PASS.
+
+- [ ] **Step 5: Commit.** `git add -A && git commit -m "feat(app): house-number overlay"`
+
+---
+
+## Milestone F: Ship
+
+### Task 32: Server deployment, release signing, APK publishing
+
+**Files:** Create `server/Dockerfile`, `docker-compose.yml`, `deploy/Caddyfile`, `deploy/setup.sh`, `deploy/backup.sh`, `deploy/README.md`, `tools/make-release-key.sh`, `tools/release.sh`; Modify `server/build.gradle.kts` (Ktor fat jar), `app/build.gradle.kts` (versionCode from `-PversionCode`)
+
+**Interfaces:**
+- Produces:
+  - `tools/make-release-key.sh <out.keystore>`: `keytool` RSA 4096, validity 30 years. Writes `keystore.properties` (git-ignored) and prints a reminder to back up both files.
+  - `tools/release.sh <versionCode> <versionName> <server ssh>`: `./gradlew :app:assembleRelease -PversionCode=…`, copies the APK to the server, runs `publish-apk`.
+
+- [ ] **Step 1: Write the deployment files.**
+  - **`Dockerfile`:** `eclipse-temurin:21-jre`, the fat jar, volume `/data`, `EXPOSE 8080`.
+  - **`docker-compose.yml`:** `app` + `caddy:2` (`{$DOMAIN} { reverse_proxy app:8080 }`).
+  - **`setup.sh`:** for Ubuntu. Installs Docker; asks for the domain (suggest `<ip>.sslip.io`), admin username, display name and password; writes `.env`; `docker compose up -d --build`; `create-admin`; nightly cron for `backup.sh`.
+  - **`backup.sh`:** `sqlite3 .backup` to `/data/backups`, keeping 14.
+  - **`README.md`:**
+    - server requirements from §7.3 (US-West, 2–4 GB RAM, ≥ 80 GB disk, ≥ 1 Gbps, ≥ 2 TB transfer);
+    - setup;
+    - publishing an app update;
+    - **back up the release key**;
+    - restoring a backup;
+    - adding an ArcGIS key later.
+
+- [ ] **Step 2: Verify.**
+  - `bash -n deploy/setup.sh deploy/backup.sh tools/*.sh` → no output.
+  - `./gradlew :server:buildFatJar` → BUILD SUCCESSFUL.
+  - `FMX_DATA_DIR=$(mktemp -d) FMX_DESTINATION=fake java -jar server/build/libs/*-all.jar &`, then `curl -s localhost:8080/api/version` → JSON and `curl -s localhost:8080/ | grep 'Download Fieldmaxx for Android'` → match.
+  - With a throwaway key: `tools/make-release-key.sh /tmp/test.keystore && ./gradlew :app:assembleRelease -PversionCode=1` → APK under `app/build/outputs/apk/release/`.
+  - If Docker is available: `docker build -f server/Dockerfile .` → success.
+
+- [ ] **Step 3: Run the full test suite.** Run: `./gradlew test :app:testDebugUnitTest`. Expected: PASS.
+
+- [ ] **Step 4: Commit.** `git add -A && git commit -m "build: docker deployment, release signing and apk publishing"`
+
+### Task 33: Live check against the test folder and the owner's phone checklist
+
+**Files:** Create `docs/acceptance-checklist.md`; Test `server/src/test/kotlin/com/fieldmaxx/server/LiveDeliveryTest.kt`
+
+- [ ] **Step 1: Write `LiveDeliveryTest`** (`@EnabledIfEnvironmentVariable FMX_LIVE_TEST_LINK`). It runs the server delivery worker with the real `SharePointLinkDestination` against the test folder, under `_fieldmaxx_it/<timestamp>/` as a fake job's Field Notes: a POLE 33 photo backup is taken over and delivered to `POLE/POLE_33/<name>`; a reuse photo is copied from it; both are verified by size.
+
+- [ ] **Step 2: Run it.** Run: `FMX_LIVE_TEST_LINK='<owner test link>' ./gradlew :server:test --tests '*LiveDeliveryTest'`. Expected: PASS.
+
+- [ ] **Step 3: Write `docs/acceptance-checklist.md`.** It's a numbered checklist for the owner on a real phone with a debug APK, each step stating its expected result:
+  - install from the download page;
+  - sign in;
+  - import `A05J9XE.pdf` and see "Found 7 POLE points";
+  - set the test folder link;
+  - map keeps its view after closing and reopening;
+  - photo with the live stamp; the compass changes when turning;
+  - photo goes ✓ in the test folder within 30 s on LTE;
+  - airplane mode → photos wait (⏳) → back online → ✓;
+  - force-stop mid-upload → reopen → ✓ without duplicates;
+  - a second phone sees the grey point and your dot, and the dot turns grey "app closed" when you leave the app;
+  - reuse photo on a query point;
+  - can't shoot;
+  - add POLE 14B;
+  - delete a point;
+  - pole data export;
+  - finish job;
+  - in-app update.
+  Then a pilot on one real EES job before the crew switches.
+
+- [ ] **Step 4: Commit.** `git add -A && git commit -m "test: live delivery check and phone acceptance checklist"`
