@@ -64,7 +64,7 @@ private fun extract(doc: PDDocument, renderDpi: Float): PdfExtract {
             val paras = paras(ann.contents, pageNo)
             if (paras.isNotEmpty()) groups += PdfGroup(GroupSource.ANNOTATION, pageNo, paras)
         }
-        val fields = fieldValues[pageNo].orEmpty().flatMap { paras(it, pageNo) }
+        val fields = fieldValues[pageNo].orEmpty()
         if (fields.isNotEmpty()) groups += PdfGroup(GroupSource.FIELD, pageNo, fields)
 
         val placed = placedImages(page)
@@ -86,7 +86,9 @@ private fun extract(doc: PDDocument, renderDpi: Float): PdfExtract {
         flushImagesAbove(Float.MAX_VALUE)
         if (blocks.isNotEmpty()) groups += PdfGroup(GroupSource.PAGE_TEXT, pageNo, blocks)
 
-        renders += ExtractedImage("page-$pageNo", "image/png", png(renderer.renderImageWithDPI(i, renderDpi)))
+        // A page that cannot be rendered loses only its picture; the text already extracted is kept.
+        runCatching { png(renderer.renderImageWithDPI(i, renderDpi)) }
+            .onSuccess { renders += ExtractedImage("page-$pageNo", "image/png", it) }
     }
     return PdfExtract(groups, images, renders)
 }
@@ -94,14 +96,15 @@ private fun extract(doc: PDDocument, renderDpi: Float): PdfExtract {
 private fun paras(text: String?, page: Int): List<ParaBlock> =
     text.orEmpty().split(Regex("\r\n|\r|\n")).filter { it.isNotBlank() }.map { ParaBlock(it, null, page) }
 
-private fun fieldValuesByPage(doc: PDDocument): Map<Int, List<String>> {
+private fun fieldValuesByPage(doc: PDDocument): Map<Int, List<ParaBlock>> {
     val form = doc.documentCatalog.acroForm ?: return emptyMap()
-    val out = sortedMapOf<Int, MutableList<String>>()
+    val out = sortedMapOf<Int, MutableList<ParaBlock>>()
     for (field in form.fieldTree) {
         if (field !is PDTerminalField) continue
-        val value = runCatching { field.valueAsString }.getOrNull()?.takeIf { it.isNotBlank() } ?: continue
-        val pageIdx = field.widgets.firstNotNullOfOrNull { w -> w.page?.let { doc.pages.indexOf(it) }?.takeIf { it >= 0 } } ?: 0
-        out.getOrPut(pageIdx + 1) { mutableListOf() } += value
+        val pageNo = (field.widgets.firstNotNullOfOrNull { w -> w.page?.let { doc.pages.indexOf(it) }?.takeIf { it >= 0 } } ?: 0) + 1
+        val value = try { field.valueAsString } catch (e: Exception) { null }
+        val blocks = if (value == null) listOf(ParaBlock("${field.fullyQualifiedName}: unreadable", null, pageNo)) else paras(value, pageNo)
+        if (blocks.isNotEmpty()) out.getOrPut(pageNo) { mutableListOf() } += blocks
     }
     return out
 }
@@ -155,7 +158,8 @@ private fun placedImages(page: PDPage): List<PlacedImage> {
                     val m = graphicsState.currentTransformationMatrix
                     // The image occupies the unit square mapped by the CTM; its top edge is ty + the vertical extent.
                     val top = height - (m.translateY + m.scalingFactorY)
-                    found += PlacedImage(top, png(xobj.image))
+                    // One undecodable image (JPX, odd colour space, corrupt) is skipped; the page render still shows it.
+                    try { found += PlacedImage(top, png(xobj.image)) } catch (e: Exception) { }
                 } else if (xobj is PDFormXObject) {
                     showForm(xobj)
                 }

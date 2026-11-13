@@ -40,4 +40,33 @@ class PdfTest {
         val e = assertFailsWith<ImportException> { pdfToGroups(byteArrayOf(1, 2, 3, 4)) }
         assertEquals("unreadable_pdf", e.code)
     }
+
+    @Test fun fieldValuesBecomeFieldGroups() {
+        val x = pdfToGroups(makePdf(listOf(
+            PdfPageSpec(),
+            PdfPageSpec(fields = listOf("blank" to "", "pole" to "39.636130,-119.691104")),
+        )))
+        val g = x.groups.single { it.source == GroupSource.FIELD }
+        assertEquals(2, g.page)
+        assertEquals(listOf("39.636130,-119.691104"), g.blocks.filterIsInstance<ParaBlock>().map { it.text })
+    }
+
+    @Test fun acroFormWithZeroFieldsIsFine() {
+        val x = pdfToGroups(makePdf(listOf(PdfPageSpec(lines = listOf(Triple("hello", 50f, 700f)))), emptyAcroForm = true))
+        assertTrue(x.groups.none { it.source == GroupSource.FIELD })
+        assertEquals(1, x.groups.size)
+    }
+
+    // The fixture draws an image whose JPEG stream is garbage, so PDFBox throws while decoding it.
+    @Test fun unreadableImageDoesNotAbortImport() {
+        val bad = PdfImageSpec(solidPng(), 50f, 500f, 40f, 40f, corrupt = true)
+        val good = PdfImageSpec(solidPng(), 50f, 300f, 40f, 40f)
+        val x = pdfToGroups(makePdf(listOf(PdfPageSpec(
+            lines = listOf(Triple("top", 50f, 700f)), images = listOf(bad, good), freeText = listOf("POLE 1 = 39.1,-119.1"),
+        ))))
+        assertEquals(1, x.images.size)
+        assertEquals(1, x.groups.count { it.source == GroupSource.ANNOTATION })
+        assertTrue(x.groups.single { it.source == GroupSource.PAGE_TEXT }.blocks.any { it is ParaBlock && it.text == "top" })
+        assertEquals(listOf("page-1"), x.pageRenders.map { it.id })
+    }
 }
