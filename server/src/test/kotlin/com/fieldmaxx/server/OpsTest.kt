@@ -251,4 +251,41 @@ class OpsTest {
         val t = tokenFor("ann")
         assertEquals("unsupported", send(t, Op.PhotoRemove("p1", "ph")).single().error)
     }
+
+    @Test fun opIdFromAnotherUserIsAConflict() = TestApp().run { app ->
+        seed(app)
+        val a = tokenFor("ann")
+        val b = tokenFor("bob")
+        assertTrue(send(a, Op.PointUpdate("same", pt, comment = "ann")).single().ok)
+        val head = app.ctx.changes.headSeq()
+        assertEquals(OpResult("same", false, "op_id_conflict"), send(b, Op.PointUpdate("same", pt, comment = "bob")).single())
+        assertEquals("ann", point(app).comment)
+        assertEquals(head, app.ctx.changes.headSeq())
+    }
+
+    @Test fun concurrentEditsLeaveFeedConsistent() = TestApp(fileDb = true).run { app ->
+        seed(app)
+        val a = tokenFor("ann")
+        val b = tokenFor("bob")
+        val pole = PoleData(lineHeightFt = 28.0)
+        coroutineScope {
+            (0 until 15).flatMap { i ->
+                listOf(
+                    async { send(a, Op.PointUpdate("pa$i", pt, pole = pole)) },
+                    async { send(b, Op.PointUpdate("cb$i", pt, comment = "c$i")) },
+                )
+            }.awaitAll().forEach { r -> assertTrue(r.all { it.ok }) }
+        }
+        val (changes, _) = app.ctx.changes.since(0)
+        val mine = changes.filter { it.entity == "point" && it.entityId == pt }
+        assertEquals(30, mine.size)
+        assertTrue(mine.zipWithNext().all { (x, y) -> x.seq < y.seq })
+        val last = assertNotNull(mine.last().point)
+        val final = point(app)
+        assertEquals(pole, last.pole)
+        assertEquals(final.comment, last.comment)
+        assertEquals(final.updatedAt, last.updatedAt)
+        // Every snapshot in the feed is at least as complete as the one before it (nothing goes backwards).
+        assertTrue(mine.mapNotNull { it.point }.zipWithNext().all { (x, y) -> !(x.pole != null && y.pole == null) })
+    }
 }

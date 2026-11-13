@@ -8,6 +8,7 @@ import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.model.ServerMessage
 import com.fieldmaxx.server.ChangeRecorder
 import com.fieldmaxx.server.Db
+import java.sql.Connection
 import java.sql.Statement
 import java.time.Clock
 
@@ -17,23 +18,30 @@ class ChangeLog(private val db: Db, private val clock: Clock, private val hub: H
         jobId: String?, entity: String, entityId: String,
         job: Job?, point: Point?, photo: PhotoInfo?,
     ): Change {
-        val at = clock.millis()
-        val payload = FmxJson.encodeToString(Change.serializer(), Change(0, jobId, entity, entityId, job, point, photo, at))
-        val seq = db.tx {
-            prepareStatement(
-                "INSERT INTO changes(job_id, entity, entity_id, data_json, at) VALUES (?,?,?,?,?)",
-                Statement.RETURN_GENERATED_KEYS,
-            ).use {
-                it.setString(1, jobId); it.setString(2, entity); it.setString(3, entityId)
-                it.setString(4, payload); it.setLong(5, at)
-                it.executeUpdate()
-                it.generatedKeys.use { k -> k.next(); k.getLong(1) }
-            }
-        }
-        val change = Change(seq, jobId, entity, entityId, job, point, photo, at)
-        hub.broadcast(ServerMessage.ChangeMsg(change))
+        val change = db.tx { recordInTx(this, jobId, entity, entityId, job, point, photo) }
+        publish(change)
         return change
     }
+
+    override fun recordInTx(
+        conn: Connection, jobId: String?, entity: String, entityId: String,
+        job: Job?, point: Point?, photo: PhotoInfo?,
+    ): Change {
+        val at = clock.millis()
+        val payload = FmxJson.encodeToString(Change.serializer(), Change(0, jobId, entity, entityId, job, point, photo, at))
+        val seq = conn.prepareStatement(
+            "INSERT INTO changes(job_id, entity, entity_id, data_json, at) VALUES (?,?,?,?,?)",
+            Statement.RETURN_GENERATED_KEYS,
+        ).use {
+            it.setString(1, jobId); it.setString(2, entity); it.setString(3, entityId)
+            it.setString(4, payload); it.setLong(5, at)
+            it.executeUpdate()
+            it.generatedKeys.use { k -> k.next(); k.getLong(1) }
+        }
+        return Change(seq, jobId, entity, entityId, job, point, photo, at)
+    }
+
+    override fun publish(change: Change) = hub.broadcast(ServerMessage.ChangeMsg(change))
 
     /** Changes after [seq] (at most [limit]) and the seq to continue from: the last one returned, else the current head. */
     override fun since(seq: Long, limit: Int): Pair<List<Change>, Long> = db.read {

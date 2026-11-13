@@ -2,6 +2,7 @@ package com.fieldmaxx.server.ops
 
 import com.fieldmaxx.core.FmxJson
 import com.fieldmaxx.core.model.CantShootReason
+import com.fieldmaxx.core.model.Change
 import com.fieldmaxx.core.model.Op
 import com.fieldmaxx.core.model.OpResult
 import com.fieldmaxx.core.model.Point
@@ -34,8 +35,11 @@ private fun applyOp(ctx: Ctx, user: User, op: Op): OpResult {
     if (op is Op.PhotoReuse || op is Op.PhotoRemove || op is Op.PhotoConfirmed || op is Op.PhotoFailed) {
         return OpResult(op.opId, false, "unsupported")
     }
-    val (result, changed) = ctx.db.tx {
-        storedResult(op.opId)?.let { return@tx it to null }
+    val (result, change) = ctx.db.tx {
+        storedOp(op.opId)?.let { (owner, stored) ->
+            // An opId belongs to whoever first used it; another user's replay must not read or reuse the result.
+            return@tx (if (owner == user.id) stored else OpResult(op.opId, false, "op_id_conflict")) to null
+        }
         val now = ctx.clock.millis()
         var applied: Applied? = null
         val r = try {
@@ -49,25 +53,28 @@ private fun applyOp(ctx: Ctx, user: User, op: Op): OpResult {
             it.setString(4, FmxJson.encodeToString(OpResult.serializer(), r)); it.executeUpdate()
         }
         val p = applied?.point
+        var change: Change? = null
         if (p != null) {
             prepareStatement("INSERT INTO events(job_id, user_id, kind, data_json, at) VALUES (?,?,?,?,?)").use {
                 it.setString(1, p.jobId); it.setString(2, user.id); it.setString(3, applied!!.kind)
                 it.setString(4, buildJsonObject { put("opId", op.opId); put("pointId", p.id) }.toString())
                 it.setLong(5, now); it.executeUpdate()
             }
+            // Same transaction as the write: change order equals commit order and the snapshot is never stale.
+            change = ctx.changes.recordInTx(this, p.jobId, "point", p.id, point = p)
         }
-        r to p
+        r to change
     }
-    // After the commit: the change log opens its own write transaction.
-    changed?.let { ctx.changes.record(it.jobId, "point", it.id, point = it) }
+    change?.let(ctx.changes::publish)
     return result
 }
 
-private fun Connection.storedResult(opId: String): OpResult? =
-    prepareStatement("SELECT result_json FROM ops_done WHERE op_id = ?").use { ps ->
+/** The user that first used [opId] and the result stored for it. */
+private fun Connection.storedOp(opId: String): Pair<String, OpResult>? =
+    prepareStatement("SELECT user_id, result_json FROM ops_done WHERE op_id = ?").use { ps ->
         ps.setString(1, opId)
         ps.executeQuery().use { rs ->
-            if (rs.next()) rs.getString(1)?.let { FmxJson.decodeFromString(OpResult.serializer(), it) } ?: OpResult(opId, true) else null
+            if (rs.next()) rs.getString(1) to (rs.getString(2)?.let { FmxJson.decodeFromString(OpResult.serializer(), it) } ?: OpResult(opId, true)) else null
         }
     }
 

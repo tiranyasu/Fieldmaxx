@@ -62,7 +62,7 @@ fun createJob(ctx: Ctx, user: User, input: CreateJobInput): Pair<Job, List<Strin
     val jobId = newId()
     val now = ctx.clock.millis()
     val url = input.fieldNotesUrl?.trim()?.ifEmpty { null }
-    val (job, added, skipped) = ctx.db.tx {
+    val (job, skipped, changes) = ctx.db.tx {
         prepareStatement(
             "INSERT INTO jobs(id, name, notes, field_notes_url, status, created_by, created_at) VALUES (?,?,?,?,'active',?,?)",
         ).use {
@@ -76,10 +76,12 @@ fun createJob(ctx: Ctx, user: User, input: CreateJobInput): Pair<Job, List<Strin
             val (a, s) = insertImport(ctx, user, jobId, imp, existing, now)
             added += a; skipped += s
         }
-        Triple(requireJob(jobId), added, skipped)
+        val job = requireJob(jobId)
+        val changes = listOf(ctx.changes.recordInTx(this, jobId, "job", jobId, job = job)) +
+            added.map { ctx.changes.recordInTx(this, jobId, "point", it.id, point = it) }
+        Triple(job, skipped, changes)
     }
-    ctx.changes.record(jobId, "job", jobId, job = job)
-    added.forEach { ctx.changes.record(jobId, "point", it.id, point = it) }
+    changes.forEach(ctx.changes::publish)
     return job to skipped
 }
 
@@ -87,16 +89,19 @@ fun createJob(ctx: Ctx, user: User, input: CreateJobInput): Pair<Job, List<Strin
 fun addImportToJob(ctx: Ctx, user: User, jobId: String, imp: JobImportInput): Pair<List<Point>, List<String>> {
     checkHaveCoordinates(listOf(imp))
     val now = ctx.clock.millis()
-    val (job, notesChanged, result) = ctx.db.tx {
+    val (result, changes) = ctx.db.tx {
         val job = requireJob(jobId)
         if (job.deletedAt != null) throw HttpError(HttpStatusCode.NotFound, "Job not found")
         val before = job.notes
         val r = insertImport(ctx, user, jobId, imp, activePoints(jobId), now)
         val after = requireJob(jobId)
-        Triple(after, after.notes != before, r)
+        val changes = buildList {
+            if (after.notes != before) add(ctx.changes.recordInTx(this@tx, jobId, "job", jobId, job = after))
+            r.first.forEach { add(ctx.changes.recordInTx(this@tx, jobId, "point", it.id, point = it)) }
+        }
+        r to changes
     }
-    if (notesChanged) ctx.changes.record(jobId, "job", jobId, job = job)
-    result.first.forEach { ctx.changes.record(jobId, "point", it.id, point = it) }
+    changes.forEach(ctx.changes::publish)
     return result
 }
 
@@ -216,7 +221,7 @@ fun jobSnapshot(ctx: Ctx, jobId: String): JobSnapshot {
 fun updateJob(ctx: Ctx, jobId: String, name: String?, fieldNotesUrl: String?, notes: String?): Job {
     require(name == null || name.isNotBlank()) { "Job name is required" }
     val newLink = fieldNotesUrl?.trim()?.ifEmpty { null }
-    val job = ctx.db.tx {
+    val (job, change) = ctx.db.tx {
         val j = requireJob(jobId)
         if (j.deletedAt != null) throw HttpError(HttpStatusCode.NotFound, "Job not found")
         prepareStatement(
@@ -229,15 +234,16 @@ fun updateJob(ctx: Ctx, jobId: String, name: String?, fieldNotesUrl: String?, no
             it.setBoolean(5, newLink != null); it.setString(6, jobId)
             it.executeUpdate()
         }
-        requireJob(jobId)
+        val updated = requireJob(jobId)
+        updated to ctx.changes.recordInTx(this, jobId, "job", jobId, job = updated)
     }
-    ctx.changes.record(jobId, "job", jobId, job = job)
+    ctx.changes.publish(change)
     if (newLink != null) ctx.delivery.kick()
     return job
 }
 
 fun deleteJob(ctx: Ctx, user: User, jobId: String) {
-    val job = ctx.db.tx {
+    val (_, change) = ctx.db.tx {
         val j = requireJob(jobId)
         if (j.deletedAt != null) throw HttpError(HttpStatusCode.NotFound, "Job not found")
         if (j.createdBy != user.id && user.role != Role.admin) {
@@ -246,14 +252,15 @@ fun deleteJob(ctx: Ctx, user: User, jobId: String) {
         prepareStatement("UPDATE jobs SET deleted_at = ?, deleted_by = ? WHERE id = ?").use {
             it.setLong(1, ctx.clock.millis()); it.setString(2, user.id); it.setString(3, jobId); it.executeUpdate()
         }
-        requireJob(jobId)
+        val updated = requireJob(jobId)
+        updated to ctx.changes.recordInTx(this, jobId, "job", jobId, job = updated)
     }
-    ctx.changes.record(jobId, "job", jobId, job = job)
+    ctx.changes.publish(change)
 }
 
 fun restoreJob(ctx: Ctx, user: User, jobId: String) {
     if (user.role != Role.admin) throw HttpError(HttpStatusCode.Forbidden, "Admins only")
-    val job = ctx.db.tx {
+    val (_, change) = ctx.db.tx {
         val j = requireJob(jobId)
         val deletedAt = j.deletedAt ?: throw IllegalArgumentException("That job is not deleted")
         if (ctx.clock.millis() - deletedAt > RESTORE_WINDOW_MS) {
@@ -262,9 +269,10 @@ fun restoreJob(ctx: Ctx, user: User, jobId: String) {
         prepareStatement("UPDATE jobs SET deleted_at = NULL, deleted_by = NULL WHERE id = ?").use {
             it.setString(1, jobId); it.executeUpdate()
         }
-        requireJob(jobId)
+        val updated = requireJob(jobId)
+        updated to ctx.changes.recordInTx(this, jobId, "job", jobId, job = updated)
     }
-    ctx.changes.record(jobId, "job", jobId, job = job)
+    ctx.changes.publish(change)
 }
 
 /** Permanently removes jobs deleted more than 30 days ago, with their points, photos and files. Returns how many. */

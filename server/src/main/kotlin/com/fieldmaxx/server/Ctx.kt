@@ -9,11 +9,25 @@ import com.fieldmaxx.server.sync.Hub
 import java.time.Clock
 
 interface ChangeRecorder {
-    /** Call AFTER the writer's transaction commits; never inside a db.tx (it opens its own write transaction). */
+    /**
+     * For writers OUTSIDE a transaction: records in its own transaction and publishes. Never call inside a db.tx.
+     */
     fun record(
         jobId: String?, entity: String, entityId: String,
         job: Job? = null, point: Point? = null, photo: PhotoInfo? = null,
     ): Change
+
+    /**
+     * Inserts the `changes` row on the caller's connection, inside the caller's transaction, so the change commits (or
+     * not) together with the write and seq order equals commit order. Does NOT broadcast: call [publish] after commit.
+     */
+    fun recordInTx(
+        conn: java.sql.Connection, jobId: String?, entity: String, entityId: String,
+        job: Job? = null, point: Point? = null, photo: PhotoInfo? = null,
+    ): Change
+
+    /** Pushes an already-committed change to live clients. */
+    fun publish(change: Change)
 
     /** Changes after [seq] (at most [limit]) and the seq to continue from. */
     fun since(seq: Long, limit: Int = 1000): Pair<List<Change>, Long>
@@ -30,6 +44,11 @@ interface DeliveryKick {
 object NoopChangeRecorder : ChangeRecorder {
     override fun record(jobId: String?, entity: String, entityId: String, job: Job?, point: Point?, photo: PhotoInfo?) =
         Change(seq = 0, jobId = jobId, entity = entity, entityId = entityId, at = 0)
+
+    override fun recordInTx(conn: java.sql.Connection, jobId: String?, entity: String, entityId: String, job: Job?, point: Point?, photo: PhotoInfo?) =
+        record(jobId, entity, entityId, job, point, photo)
+
+    override fun publish(change: Change) {}
 
     override fun since(seq: Long, limit: Int) = emptyList<Change>() to 0L
     override fun headSeq() = 0L
