@@ -6,7 +6,6 @@ import com.fieldmaxx.core.model.ServerMessage
 import com.fieldmaxx.core.model.User
 import com.fieldmaxx.server.positions.listPositions
 import com.fieldmaxx.server.positions.savePosition
-import com.fieldmaxx.server.sync.ChangeLog
 import io.ktor.client.plugins.websocket.WebSockets
 import io.ktor.client.plugins.websocket.webSocket
 import io.ktor.client.request.get
@@ -20,6 +19,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
@@ -27,8 +27,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
 class SyncTest {
-    private fun log(app: TestApp) = app.ctx.changes as ChangeLog
-    private val ann = User("u1", "ann", "Ann", com.fieldmaxx.core.model.Role.tech, false)
+        private val ann = User("u1", "ann", "Ann", com.fieldmaxx.core.model.Role.tech, false)
 
     private suspend fun io.ktor.client.plugins.websocket.DefaultClientWebSocketSession.next(): ServerMessage = withTimeout(5000) {
         val f = incoming.receive() as Frame.Text
@@ -39,7 +38,7 @@ class SyncTest {
         val a = app.ctx.changes.record("j1", "point", "p1")
         val b = app.ctx.changes.record("j1", "point", "p2")
         assertTrue(b.seq > a.seq)
-        val (list, seq) = log(app).since(a.seq)
+        val (list, seq) = app.ctx.changes.since(a.seq, 1000)
         assertEquals(listOf("p2"), list.map { it.entityId })
         assertEquals(b.seq, seq)
         val token = tokenFor("ann")
@@ -50,10 +49,10 @@ class SyncTest {
 
     @Test fun sinceCapsAtLimit() = TestApp().run { app ->
         repeat(5) { app.ctx.changes.record(null, "job", "j$it") }
-        val (list, seq) = log(app).since(0, limit = 3)
+        val (list, seq) = app.ctx.changes.since(0, 3)
         assertEquals(3, list.size)
         assertEquals(list.last().seq, seq)
-        assertEquals(2, log(app).since(seq, 3).first.size)
+        assertEquals(2, app.ctx.changes.since(seq, 3).first.size)
     }
 
     @Test fun wsRejectsBadToken() = TestApp(fileDb = true).run { app ->
@@ -111,7 +110,7 @@ class SyncTest {
             close()
         }
         assertEquals(1, listPositions(app.ctx).size)
-        assertEquals(0, log(app).since(0).first.size, "positions never enter the change log")
+        assertEquals(0, app.ctx.changes.since(0, 1000).first.size, "positions never enter the change log")
     }
 
     @Test fun pausedMarksPositionPaused() = TestApp().run { app ->
@@ -138,5 +137,52 @@ class SyncTest {
         assertEquals(1, listPositions(app.ctx).size)
         app.clock.nowMs += 2_000
         assertEquals(0, listPositions(app.ctx).size)
+    }
+
+    @Test fun changeBetweenConnectAndHelloIsNotMissed() = TestApp(fileDb = true).run { app ->
+        val token = tokenFor("ann")
+        val c = createClient { install(WebSockets) }
+        val recorder = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch {
+            repeat(30) { app.ctx.changes.record("j1", "point", "p$it"); kotlinx.coroutines.delay(1) }
+        }
+        c.webSocket("/api/ws?token=$token") {
+            var hello = -1L
+            val seen = mutableSetOf<Long>()
+            while (seen.size < 30 || hello < 0) {
+                when (val m = next()) {
+                    is ServerMessage.Hello -> hello = m.seq
+                    is ServerMessage.ChangeMsg -> seen += m.change.seq
+                    else -> {}
+                }
+                if (hello >= 0 && (1..30L).all { it <= hello || it in seen }) break
+            }
+            assertTrue((1..30L).all { it <= hello || it in seen })
+            close()
+        }
+        recorder.join()
+    }
+
+    private fun idOf(app: TestApp, name: String) = app.ctx.db.read {
+        createStatement().use { it.executeQuery("SELECT id FROM users WHERE username='$name'").use { r -> r.next(); r.getString(1) } }
+    }
+
+    @Test fun disablingUserClosesTheirSocket() = TestApp(fileDb = true).run { app ->
+        val token = tokenFor("ann")
+        val c = createClient { install(WebSockets) }
+        c.webSocket("/api/ws?token=$token") {
+            next()
+            com.fieldmaxx.server.users.updateUser(app.ctx, idOf(app, "ann"), null, null, true, null)
+            assertEquals(4401, withTimeout(5000) { closeReason.await() }?.code?.toInt())
+        }
+    }
+
+    @Test fun passwordResetClosesTheirSocket() = TestApp(fileDb = true).run { app ->
+        val token = tokenFor("ann")
+        val c = createClient { install(WebSockets) }
+        c.webSocket("/api/ws?token=$token") {
+            next()
+            com.fieldmaxx.server.users.updateUser(app.ctx, idOf(app, "ann"), null, null, null, "brand-new-pass-1")
+            assertEquals(4401, withTimeout(5000) { closeReason.await() }?.code?.toInt())
+        }
     }
 }

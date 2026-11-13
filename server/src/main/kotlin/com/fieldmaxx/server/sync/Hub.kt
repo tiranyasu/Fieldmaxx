@@ -4,7 +4,9 @@ import com.fieldmaxx.core.FmxJson
 import com.fieldmaxx.core.model.ServerMessage
 import com.fieldmaxx.core.model.User
 import io.ktor.server.websocket.DefaultWebSocketServerSession
+import io.ktor.websocket.CloseReason
 import io.ktor.websocket.Frame
+import io.ktor.websocket.close
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.channels.Channel
@@ -39,6 +41,20 @@ class Hub {
     fun broadcast(msg: ServerMessage) {
         val text = FmxJson.encodeToString(ServerMessage.serializer(), msg)
         for (c in clients.values) c.outbox.trySend(text)
+    }
+
+    /** Queues [msg] for one client only (ordered with broadcasts). */
+    fun sendTo(session: DefaultWebSocketServerSession, msg: ServerMessage) {
+        clients[session]?.outbox?.trySend(FmxJson.encodeToString(ServerMessage.serializer(), msg))
+    }
+
+    /** Closes every live socket of [userId] with 4401 (account disabled or password reset). */
+    fun disconnect(userId: String) {
+        for ((session, c) in clients) {
+            if (c.user.id != userId) continue
+            drop(session)
+            session.launch { runCatching { session.close(CloseReason(4401, "Sign in required")) } }
+        }
     }
 
     private fun drop(session: DefaultWebSocketServerSession) {

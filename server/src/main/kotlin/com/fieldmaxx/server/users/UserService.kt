@@ -59,7 +59,7 @@ fun updateUser(ctx: Ctx, id: String, displayName: String?, role: Role?, disabled
     password?.let(::checkPassword)
     require(displayName == null || displayName.isNotBlank()) { "Display name is required" }
     val hash = password?.let(::hashPassword)
-    return ctx.db.tx {
+    val updated = ctx.db.tx {
         val exists = prepareStatement("SELECT 1 FROM users WHERE id = ?").use { ps -> ps.setString(1, id); ps.executeQuery().use { it.next() } }
         if (!exists) throw HttpError(HttpStatusCode.NotFound, "No such user")
         fun set(col: String, bind: PreparedStatement.() -> Unit) =
@@ -73,6 +73,8 @@ fun updateUser(ctx: Ctx, id: String, displayName: String?, role: Role?, disabled
         }
         prepareStatement("SELECT * FROM users WHERE id = ?").use { ps -> ps.setString(1, id); ps.executeQuery().use { it.next(); it.toUser() } }
     }
+    if (disabled == true || hash != null) ctx.hub.disconnect(id)
+    return updated
 }
 
 /** Changes a password after checking the current one; the caller's own session ([keepTokenHash]) stays, others end. */

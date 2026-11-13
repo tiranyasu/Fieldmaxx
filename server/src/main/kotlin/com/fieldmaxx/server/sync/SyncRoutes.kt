@@ -27,13 +27,11 @@ import kotlinx.serialization.Serializable
 
 const val WS_UNAUTHORIZED = 4401
 
-private fun Ctx.log(): ChangeLog = changes as? ChangeLog ?: error("ChangeLog not installed")
-
 fun Route.syncRoutes(ctx: Ctx) {
     authenticate("bearer") {
         get("/changes") {
             val since = call.request.queryParameters["since"]?.toLongOrNull() ?: 0L
-            val (changes, seq) = ctx.log().since(since)
+            val (changes, seq) = ctx.changes.since(since)
             call.respond(ChangesBody(changes, seq))
         }
         get("/positions") {
@@ -47,8 +45,9 @@ fun Route.syncRoutes(ctx: Ctx) {
             close(CloseReason(WS_UNAUTHORIZED.toShort(), "Sign in required"))
             return@webSocket
         }
-        send(Frame.Text(FmxJson.encodeToString(ServerMessage.serializer(), ServerMessage.Hello(ctx.log().headSeq()))))
+        // Register before reading the head: a change is then covered by the hello seq or delivered by broadcast.
         ctx.hub.add(this, user)
+        ctx.hub.sendTo(this, ServerMessage.Hello(ctx.changes.headSeq()))
         for (frame in incoming) {
             if (frame !is Frame.Text) continue
             try {

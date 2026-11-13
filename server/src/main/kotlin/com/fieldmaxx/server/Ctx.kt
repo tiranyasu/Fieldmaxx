@@ -9,10 +9,17 @@ import com.fieldmaxx.server.sync.Hub
 import java.time.Clock
 
 interface ChangeRecorder {
+    /** Call AFTER the writer's transaction commits; never inside a db.tx (it opens its own write transaction). */
     fun record(
         jobId: String?, entity: String, entityId: String,
         job: Job? = null, point: Point? = null, photo: PhotoInfo? = null,
     ): Change
+
+    /** Changes after [seq] (at most [limit]) and the seq to continue from. */
+    fun since(seq: Long, limit: Int = 1000): Pair<List<Change>, Long>
+
+    /** The newest change seq (0 when none). */
+    fun headSeq(): Long
 }
 
 interface DeliveryKick {
@@ -23,6 +30,9 @@ interface DeliveryKick {
 object NoopChangeRecorder : ChangeRecorder {
     override fun record(jobId: String?, entity: String, entityId: String, job: Job?, point: Point?, photo: PhotoInfo?) =
         Change(seq = 0, jobId = jobId, entity = entity, entityId = entityId, at = 0)
+
+    override fun since(seq: Long, limit: Int) = emptyList<Change>() to 0L
+    override fun headSeq() = 0L
 }
 
 /** Placeholder until the delivery worker exists (Task 17). */

@@ -36,7 +36,7 @@ class ChangeLog(private val db: Db, private val clock: Clock, private val hub: H
     }
 
     /** Changes after [seq] (at most [limit]) and the seq to continue from: the last one returned, else the current head. */
-    fun since(seq: Long, limit: Int = 1000): Pair<List<Change>, Long> = db.read {
+    override fun since(seq: Long, limit: Int): Pair<List<Change>, Long> = db.read {
         val list = prepareStatement("SELECT seq, data_json FROM changes WHERE seq > ? ORDER BY seq LIMIT ?").use { ps ->
             ps.setLong(1, seq); ps.setInt(2, limit)
             ps.executeQuery().use { rs ->
@@ -46,7 +46,7 @@ class ChangeLog(private val db: Db, private val clock: Clock, private val hub: H
         list to (list.lastOrNull()?.seq ?: headSeq())
     }
 
-    fun headSeq(): Long = db.read { headSeq() }
+    override fun headSeq(): Long = db.read { headSeq() }
 
     private fun java.sql.Connection.headSeq(): Long =
         createStatement().use { st -> st.executeQuery("SELECT COALESCE(MAX(seq), 0) FROM changes").use { it.next(); it.getLong(1) } }
