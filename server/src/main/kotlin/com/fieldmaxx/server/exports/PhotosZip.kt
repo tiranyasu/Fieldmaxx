@@ -11,6 +11,10 @@ import java.util.zip.ZipOutputStream
 
 private class ZipPhoto(val fileName: String, val backupPath: String, val folder: String)
 
+/** Safe zip path segments from a client-supplied path: no empty, `.` or `..` parts, no characters Windows/zip tools reject. */
+internal fun safeSegments(path: String): List<String> =
+    path.split('/', '\\').map { it.replace(UNSAFE, "_").trim() }.filter { it.isNotEmpty() && it != "." && it != ".." && it.any { c -> c != '.' } }
+
 /**
  * Streams the job's backed-up photos laid out like the Field Notes folder: the point's folder (or the one the folder
  * resolver would create) and the photo's own file name. Photos whose backup is gone are left out. JPEGs are already
@@ -26,9 +30,10 @@ fun writePhotosZip(ctx: Ctx, jobId: String, out: OutputStream) {
             ps.executeQuery().use { rs ->
                 buildList {
                     while (rs.next()) {
-                        val folder = rs.getString(3)?.takeIf { it.isNotBlank() }
-                            ?: "${if (isQueryLayer(rs.getString(4))) rs.getString(4).trim() else rs.getString(5)}/${defaultFolderName(rs.getString(6))}"
-                        add(ZipPhoto(rs.getString(1), rs.getString(2), folder))
+                        val default = listOf(if (isQueryLayer(rs.getString(4))) rs.getString(4).trim() else rs.getString(5), defaultFolderName(rs.getString(6)))
+                        val folder = rs.getString(3)?.let(::safeSegments)?.takeIf { it.isNotEmpty() } ?: safeSegments(default.joinToString("/")).ifEmpty { listOf("photos") }
+                        val file = safeSegments(rs.getString(1)).joinToString("_").ifEmpty { "photo.jpg" }
+                        add(ZipPhoto(file, rs.getString(2), folder.joinToString("/")))
                     }
                 }
             }
@@ -40,7 +45,7 @@ fun writePhotosZip(ctx: Ctx, jobId: String, out: OutputStream) {
         for (p in photos) {
             val file = ctx.path(p.backupPath)
             if (!Files.exists(file)) continue
-            val name = "${p.folder.trim('/')}/${p.fileName}"
+            val name = "${p.folder}/${p.fileName}"
             if (!used.add(name)) continue
             zip.putNextEntry(ZipEntry(name))
             Files.newInputStream(file).use { it.copyTo(zip, 64 * 1024) }

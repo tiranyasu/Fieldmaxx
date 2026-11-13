@@ -18,6 +18,7 @@ import java.io.ByteArrayInputStream
 import java.nio.file.Files
 import java.util.zip.ZipInputStream
 import kotlin.test.Test
+import kotlinx.coroutines.async
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import org.apache.poi.xssf.usermodel.XSSFWorkbook
@@ -230,5 +231,99 @@ class ExportsTest {
         app.ctx.db.tx { createStatement().use { it.execute("UPDATE jobs SET deleted_at = 5") } }
         val token = tokenFor("sam")
         assertEquals(HttpStatusCode.NotFound, client.get("/api/jobs/$job/pole-data.csv") { bearerAuth(token) }.status)
+    }
+
+    @Test fun finishRechecksAtCommit() {
+        val fake = com.fieldmaxx.sharepoint.FakeDestination()
+        lateinit var app: TestApp
+        var reopened = false
+        // The upload happens between the first count and the commit: a tech reopens a point meanwhile.
+        val reopening = object : com.fieldmaxx.sharepoint.PhotoDestination by fake {
+            override fun upload(relPath: String, bytes: ByteArray) {
+                fake.upload(relPath, bytes)
+                if (!reopened) {
+                    reopened = true
+                    app.ctx.db.tx { createStatement().use { it.execute("UPDATE points SET status = 'open' WHERE id = 'd'") } }
+                }
+            }
+        }
+        app = TestApp(destinations = { reopening })
+        app.run {
+            seedJob(app); point(app, "d", "1", status = "done")
+            val token = tokenFor("sam")
+            val res = client.post("/api/jobs/$job/finish") { bearerAuth(token) }
+            assertEquals(FinishResult(false, 1, 0), FmxJson.decodeFromString(FinishResult.serializer(), res.bodyAsText()))
+            assertEquals("active", jobStatus(app))
+            assertEquals(1, fake.files.size) // stale snapshot stays
+            app.ctx.db.tx { createStatement().use { it.execute("UPDATE points SET status = 'done'") } }
+            assertEquals(FinishResult(true), FmxJson.decodeFromString(FinishResult.serializer(), client.post("/api/jobs/$job/finish") { bearerAuth(token) }.bodyAsText()))
+            assertEquals(setOf("Run 5_pole_data.xlsx", "Run 5_pole_data_2.xlsx"), fake.files.keys) // never overwritten
+        }
+    }
+
+    @Test fun finishingTwiceIs409AndUploadsOnce() = TestApp(fileDb = true).run { app ->
+        seedJob(app); point(app, "d", "1", status = "done")
+        val token = tokenFor("sam")
+        val before = app.ctx.changes.headSeq()
+        val codes = kotlinx.coroutines.coroutineScope {
+            val client = client
+            (1..2).map { async(kotlinx.coroutines.Dispatchers.IO) { client.post("/api/jobs/$job/finish") { bearerAuth(token) }.status } }
+                .map { it.await() }
+        }
+        assertEquals(listOf(HttpStatusCode.OK, HttpStatusCode.Conflict), codes.sortedBy { it.value })
+        assertEquals(1, app.destination.files.size)
+        assertEquals(before + 1, app.ctx.changes.headSeq())
+        val again = client.post("/api/jobs/$job/finish") { bearerAuth(token) }
+        assertEquals(HttpStatusCode.Conflict, again.status)
+        assertEquals("""{"error":"This job is already finished"}""", again.bodyAsText())
+        assertEquals(1, app.destination.files.size)
+    }
+
+    @Test fun finishGivesUpAfter100NameTries() {
+        val fake = com.fieldmaxx.sharepoint.FakeDestination()
+        val taken = object : com.fieldmaxx.sharepoint.PhotoDestination by fake {
+            override fun upload(relPath: String, bytes: ByteArray) =
+                throw com.fieldmaxx.sharepoint.DestinationException(com.fieldmaxx.sharepoint.DestinationErrorCode.EXISTS, "exists")
+        }
+        TestApp(destinations = { taken }).run { app ->
+            seedJob(app)
+            val token = tokenFor("sam")
+            val res = client.post("/api/jobs/$job/finish") { bearerAuth(token) }
+            assertEquals(HttpStatusCode.BadGateway, res.status)
+            assertEquals("""{"error":"Too many existing pole data exports in Field Notes"}""", res.bodyAsText())
+            assertEquals("active", jobStatus(app))
+            assertEquals(100, fake.calls.count { it.startsWith("fileInfo") })
+        }
+    }
+
+    @Test fun zipNeutralisesHostilePathsAndNames() = TestApp().run { app ->
+        seedJob(app)
+        point(app, "a", "1", folder = "../../x/..\\..\\y//z/./")
+        point(app, "b", "2", folder = "../..")
+        photo(app, "p1", "a", "confirmed", "../../evil/a.jpg", byteArrayOf(1))
+        photo(app, "p2", "b", "confirmed", "b.jpg", byteArrayOf(2))
+        val admin = tokenFor("boss", Role.admin)
+        val names = mutableListOf<String>()
+        ZipInputStream(ByteArrayInputStream(client.get("/api/jobs/$job/photos.zip") { bearerAuth(admin) }.bodyAsBytes())).use { z ->
+            while (true) { names += (z.nextEntry ?: break).name }
+        }
+        assertEquals(setOf("x/y/z/evil_a.jpg", "POLE/POLE_2/b.jpg"), names.toSet())
+        assertTrue(names.none { ".." in it.split('/') || it.startsWith("/") || "//" in it })
+    }
+
+    @Test fun csvDefusesFormulasXlsxKeepsTextCells() = TestApp().run { app ->
+        seedJob(app)
+        point(app, "a", "1", status = "done", lat = -39.5, comment = "=1+1",
+            pole = """{"lineHeightFt":30.0,"anchor":false,"tags":["@x","-y"]}""")
+        val token = tokenFor("sam")
+        val csv = client.get("/api/jobs/$job/pole-data.csv") { bearerAuth(token) }.bodyAsText().lines()[1]
+        assertTrue(csv.startsWith("POLE 1,-39.5,"), csv) // numbers untouched
+        assertTrue(csv.contains(",'@x; -y,'=1+1,"), csv)
+        val x = client.get("/api/jobs/$job/pole-data.xlsx") { bearerAuth(token) }.bodyAsBytes()
+        XSSFWorkbook(ByteArrayInputStream(x)).use {
+            val c = it.getSheetAt(0).getRow(1).getCell(9)
+            assertEquals(org.apache.poi.ss.usermodel.CellType.STRING, c.cellType)
+            assertEquals("=1+1", c.stringCellValue)
+        }
     }
 }

@@ -71,8 +71,15 @@ fun poleDataRows(ctx: Ctx, jobId: String): List<List<String>> = ctx.db.read {
 private fun csvCell(s: String): String =
     if (s.any { it == ',' || it == '"' || it == '\n' || it == '\r' }) "\"" + s.replace("\"", "\"\"") + "\"" else s
 
+/** Columns holding user text (point, tags, comment, tech); the rest are numbers or fixed words. */
+private val TEXT_COLUMNS = setOf(0, 8, 9, 11)
+
+/** Spreadsheet apps evaluate cells that start with these; a leading quote makes them plain text. */
+private fun defuse(s: String) = if (s.isNotEmpty() && s[0] in "=+-@\t\r") "'$s" else s
+
 fun poleDataCsv(rows: List<List<String>>): String =
-    (listOf(POLE_COLUMNS) + rows).joinToString("\r\n", postfix = "\r\n") { r -> r.joinToString(",", transform = ::csvCell) }
+    (listOf(POLE_COLUMNS) + rows.map { r -> r.mapIndexed { i, v -> if (i in TEXT_COLUMNS) defuse(v) else v } })
+        .joinToString("\r\n", postfix = "\r\n") { r -> r.joinToString(",", transform = ::csvCell) }
 
 fun poleDataXlsx(rows: List<List<String>>): ByteArray {
     val out = ByteArrayOutputStream()
