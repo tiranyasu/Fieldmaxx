@@ -233,6 +233,49 @@ class PhotosTest {
         assertEquals(HttpStatusCode.NotFound, client.get("/api/photos/nope/thumb") { bearerAuth(t) }.status)
     }
 
+    @Test fun thumbnailFailureDoesNotBreakUpload() = TestApp().run { app ->
+        seed(app)
+        val t = tokenFor("ann")
+        val junk = ByteArray(5000) { (it * 7).toByte() }
+        registered(t, reg("ph-1", junk))
+        val res = chunk(t, "ph-1", 0, junk)
+        assertEquals(HttpStatusCode.OK, res.status, res.bodyAsText())
+        assertEquals("true", Json.parseToJsonElement(res.bodyAsText()).jsonObject.getValue("complete").jsonPrimitive.content)
+        assertNotNull(col(app, "ph-1", "backup_received_at"))
+        assertNull(col(app, "ph-1", "thumb_path"))
+        assertEquals(0, com.fieldmaxx.server.photos.regenerateMissingThumbs(app.ctx))
+    }
+
+    @Test fun missingThumbnailIsRegenerated() = TestApp().run { app ->
+        seed(app)
+        val t = tokenFor("ann")
+        val bytes = jpeg(1600, 800)
+        registered(t, reg("ph-1", bytes)); uploadAll(t, "ph-1", bytes)
+        Files.delete(app.ctx.config.dataDir.resolve("thumbs/ph-1.jpg"))
+        app.ctx.db.tx { createStatement().use { it.execute("UPDATE photos SET thumb_path = NULL WHERE id = 'ph-1'") } }
+        assertEquals(1, com.fieldmaxx.server.photos.regenerateMissingThumbs(app.ctx))
+        assertEquals("thumbs/ph-1.jpg", col(app, "ph-1", "thumb_path"))
+        assertEquals(HttpStatusCode.OK, client.get("/api/photos/ph-1/thumb") { bearerAuth(t) }.status)
+        assertEquals(0, com.fieldmaxx.server.photos.regenerateMissingThumbs(app.ctx))
+    }
+
+    @Test fun removingSourceKeepsBackupForPendingReuse() = TestApp().run { app ->
+        seed(app)
+        val t = tokenFor("ann")
+        val bytes = jpeg()
+        registered(t, reg("ph-1", bytes)); uploadAll(t, "ph-1", bytes)
+        assertTrue(send(t, Op.PhotoReuse("ru", "ph-2", "ph-1", "pt-2")).single().ok)
+        assertEquals(col(app, "ph-1", "thumb_path"), col(app, "ph-2", "thumb_path"))
+        assertTrue(com.fieldmaxx.server.photos.backupStillNeeded(app.ctx, "ph-1"))
+        assertTrue(send(t, Op.PhotoRemove("rm", "ph-1")).single().ok)
+        assertEquals(PhotoStatus.removed, photo(app, "ph-1").status)
+        assertNotNull(col(app, "ph-1", "backup_path"))
+        assertTrue(Files.exists(app.ctx.config.dataDir.resolve("photos/ph-1.jpg")))
+        // Once the copy is delivered nothing needs the original's server copy any more.
+        send(t, Op.PhotoConfirmed("c", "ph-2", "x.jpg", 1))
+        assertTrue(!com.fieldmaxx.server.photos.backupStillNeeded(app.ctx, "ph-1"))
+    }
+
     @Test fun confirmedOpSetsDestAndTimingsAndChange() = TestApp().run { app ->
         seed(app)
         val t = tokenFor("ann")

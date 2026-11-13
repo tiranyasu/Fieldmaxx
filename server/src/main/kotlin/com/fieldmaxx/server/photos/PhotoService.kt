@@ -208,19 +208,36 @@ fun appendBackupChunk(ctx: Ctx, user: User, photoId: String, offset: Long, bytes
         }
         val jpg = dir.resolve("$photoId.jpg")
         Files.move(part, jpg, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-        val thumbRel = "thumbs/$photoId.jpg"
-        val hasThumb = makeThumbnail(jpg, ctx.path(thumbRel))
         var change: Change? = null
         ctx.db.tx {
             exec(
-                "UPDATE photos SET backup_path = ?, backup_offset = ?, backup_received_at = ?, thumb_path = ? WHERE id = ?",
-                "photos/$photoId.jpg", row.size, ctx.clock.millis(), if (hasThumb) thumbRel else null, photoId,
+                "UPDATE photos SET backup_path = ?, backup_offset = ?, backup_received_at = ? WHERE id = ?",
+                "photos/$photoId.jpg", row.size, ctx.clock.millis(), photoId,
             )
             change = ctx.changes.recordInTx(this, row.jobId, "photo", photoId, photo = photoInfo(photoId))
         }
         change?.let(ctx.changes::publish)
+        // After the commit: a thumbnail problem can never undo or fail an upload that is already safe.
+        makeThumbFor(ctx, photoId, "photos/$photoId.jpg")
         return row.size to true
     }
+}
+
+private fun makeThumbFor(ctx: Ctx, photoId: String, backupRel: String): Boolean {
+    val rel = "thumbs/$photoId.jpg"
+    if (!makeThumbnail(ctx.path(backupRel), ctx.path(rel))) return false
+    ctx.db.tx { exec("UPDATE photos SET thumb_path = ? WHERE id = ?", rel, photoId) }
+    return true
+}
+
+/** Retries thumbnails for photos whose server copy exists but whose thumbnail is missing. Returns how many were made. */
+fun regenerateMissingThumbs(ctx: Ctx): Int {
+    val todo = ctx.db.read {
+        prepareStatement("SELECT id, backup_path FROM photos WHERE backup_path IS NOT NULL AND backup_purged_at IS NULL AND thumb_path IS NULL AND status != 'removed'").use { ps ->
+            ps.executeQuery().use { rs -> buildList { while (rs.next()) add(rs.getString(1) to rs.getString(2)) } }
+        }
+    }
+    return todo.count { (id, rel) -> makeThumbFor(ctx, id, rel) }
 }
 
 // ---- ops (each runs inside applyOps' per-op transaction) ----
@@ -273,19 +290,13 @@ private fun Connection.reuse(ctx: Ctx, user: User, op: Op.PhotoReuse, now: Long)
     val lat = src.lat ?: srcPoint?.lat
     val lon = src.lon ?: srcPoint?.lon
     val backupKept = src.backupPath != null && src.backupPurgedAt == null && Files.exists(ctx.path(src.backupPath))
-    // Thumbnails live forever, so the copy gets its own file and survives the original's job being purged.
-    val thumbRel = src.thumbPath?.takeIf { Files.exists(ctx.path(it)) }?.let {
-        val rel = "thumbs/${op.photoId}.jpg"
-        Files.createDirectories(ctx.path(rel).parent)
-        Files.copy(ctx.path(it), ctx.path(rel), StandardCopyOption.REPLACE_EXISTING)
-        rel
-    }
+    // Thumbnails are permanent, so the copy simply points at the original's.
     val name = photoFileName(defaultFolderName(target.label), lat ?: target.lat, lon ?: target.lon, nextCounter("photo"))
     exec(
         "INSERT INTO photos(id, job_id, point_id, user_id, file_name, size, sha256, taken_at, lat, lon, accuracy_m, heading_deg, status, " +
             "thumb_path, reused_from, source_kind, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'registered',?,?,?,?)",
         op.photoId, target.jobId, target.id, user.id, name, src.size, src.sha256, src.takenAt, lat, lon, src.accuracyM, src.headingDeg,
-        thumbRel, src.id, if (backupKept) "backup" else "onedrive", now,
+        src.thumbPath, src.id, if (backupKept) "backup" else "onedrive", now,
     )
     return Applied(null, "photo.reuse", photo = photoInfo(op.photoId), kickDelivery = true)
 }
@@ -300,7 +311,7 @@ private fun Connection.remove(ctx: Ctx, user: User, op: Op.PhotoRemove, now: Lon
     exec("UPDATE photos SET status = 'removed', removed_at = ?, removed_by = ? WHERE id = ?", now, user.id, op.photoId)
     // Only a photo that never reached OneDrive loses its server copy; a delivered one is merely hidden.
     var cleanup: (() -> Unit)? = null
-    if (row.confirmedAt == null) {
+    if (row.confirmedAt == null && !backupStillNeeded(op.photoId)) {
         exec("UPDATE photos SET backup_path = NULL, backup_purged_at = ? WHERE id = ?", now, op.photoId)
         cleanup = {
             runCatching { Files.deleteIfExists(ctx.path("photos/${op.photoId}.jpg")) }
@@ -309,6 +320,17 @@ private fun Connection.remove(ctx: Ctx, user: User, op: Op.PhotoRemove, now: Lon
     }
     return Applied(null, "photo.remove", photo = photoInfo(op.photoId), afterCommit = cleanup)
 }
+
+/**
+ * True while an unremoved, undelivered reuse copy still takes its image from this photo's server copy, so the copy must
+ * be kept (also by any later purge) even when the original itself was removed.
+ */
+internal fun Connection.backupStillNeeded(photoId: String): Boolean =
+    prepareStatement("SELECT 1 FROM photos WHERE reused_from = ? AND status != 'removed' AND confirmed_at IS NULL AND status != 'confirmed' LIMIT 1").use { ps ->
+        ps.setString(1, photoId); ps.executeQuery().use { it.next() }
+    }
+
+fun backupStillNeeded(ctx: Ctx, photoId: String): Boolean = ctx.db.read { backupStillNeeded(photoId) }
 
 // ---- reuse search ----
 
