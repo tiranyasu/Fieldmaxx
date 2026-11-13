@@ -1,6 +1,9 @@
 package com.fieldmaxx.server
 
 import com.fieldmaxx.core.FmxJson
+import com.fieldmaxx.server.auth.authRoutes
+import com.fieldmaxx.server.auth.installAuth
+import com.fieldmaxx.server.users.userRoutes
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
@@ -33,8 +36,11 @@ fun Application.fieldmaxx(ctx: Ctx) {
             call.respond(HttpStatusCode.InternalServerError, ErrorBody("Internal server error"))
         }
     }
+    installAuth(ctx)
     routing {
         route("/api") {
+            authRoutes(ctx)
+            userRoutes(ctx)
             get("/version") { call.respond(VersionBody(ctx.config.buildId)) }
         }
     }
