@@ -9,6 +9,8 @@ kotlin {
 
 dependencies {
     api(project(":core"))
+    implementation(libs.pdfbox)
+    testFixturesImplementation(libs.pdfbox)
     testImplementation(platform(libs.junit.bom))
     testImplementation(libs.junit.jupiter)
     testImplementation(kotlin("test"))
@@ -17,4 +19,5 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    systemProperty("java.awt.headless", "true")
 }
