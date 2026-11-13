@@ -1,9 +1,9 @@
 # Fieldmaxx: Field Survey App for Android (design)
 
 Date: 2026-11-13
-Status: v2 draft (native Android), awaiting owner approval (includes the
+Status: v2 approved by owner 2026-11-13 (native Android; includes the
 owner's answers to the v2 review: server backup ≥ 3 days, photo reuse on
-queries, test folder coming). v1 (web app) was
+queries, test folder provided). v1 (web app) was
 approved earlier the same day; the owner then switched to a native Android
 app because a friend is building a web clone of Cadastrus. Everything the
 owner decided in v1 carries over unless §8 says otherwise.
@@ -213,8 +213,29 @@ A05J9XE_Additional fielding/Field Notes`):
   No compass line. The sample was stamped 13:35 local and created in
   OneDrive at 14:12 local (~37 min later); that job's 17 photos all landed
   within 21 s of each other.
-- Not yet tested: SharePoint's chunked upload (`StartUpload` /
-  `ContinueUpload` / `FinishUpload`) through the link (§6.6, §9).
+
+### 5.6 Test folder findings (owner's test folder, 2026-11-13)
+The owner's test folder is a **personal OneDrive** "anyone can edit" link
+(`https://1drv.ms/f/c/184ec04aa3230f57/…`). Personal OneDrive now runs on the
+same SharePoint back end, so the same calls work:
+- `1drv.ms` → 301 to `onedrive.live.com/:f:/g/personal/<cid>/…` → 302 to
+  `onedrive.live.com/?id=…&spopath=%2Fpersonal%2F<cid>%2FDocuments%2FFieldmaxx&listurl=…`
+  and a guest cookie. The site is `https://onedrive.live.com/personal/<cid>`;
+  the folder's server-relative path is the `spopath` parameter. (The EES
+  business link instead redirects to `<tenant>-my.sharepoint.com/personal/
+  <user>/_layouts/15/onedrive.aspx?id=<path>`.) The link resolver must
+  handle both shapes. Use a normal browser User-Agent when resolving.
+- Same results as the business link: contextinfo digest, nested folder
+  creation, 9.3 MB upload in 1.8 s, read-back size match, "already exists"
+  refusal (HTTP 400) on a duplicate name, and **no delete permission**.
+- **Chunked upload works through the link**: create an empty file, then
+  `StartUpload(uploadId=guid'…')`, `ContinueUpload(uploadId,fileOffset)`,
+  `FinishUpload(uploadId,fileOffset)` with 3.2 MB chunks; the final size
+  matched. So uploads can resume mid-file on weak signal.
+- Test files left in the test folder: `POLE/POLE_1/POLE_1_TEST_simple.jpg`,
+  `POLE/POLE_1/POLE_1_TEST_chunked.jpg` (the owner can delete them).
+- A final check on a real EES job folder is still needed before the crew
+  switches over (pilot job).
 
 ## 6. What it does
 
@@ -434,9 +455,8 @@ crash, a dead battery or a force-stop never loses a photo):
 4. **Uploading**: the phone uploads straight to the job's Field Notes folder
    (§6.6.1), up to 3 photos in parallel, in the background (Android
    WorkManager: keeps going with the screen off or the app closed, resumes
-   after a reboot, waits for signal). Uses SharePoint's chunked upload if the
-   link allows it (resumes mid-file on weak signal), otherwise whole-file
-   upload with retries (§9).
+   after a reboot, waits for signal). Uses SharePoint's chunked upload (proven
+   through the link, §5.6) so a dropped connection resumes mid-file.
 5. **Confirmed**: the phone reads the file back from OneDrive (exists, byte
    size matches), then reports "confirmed" (destination path, timings) to our
    server, which tells the crew.
@@ -703,11 +723,10 @@ server; the build includes setup instructions.
 - Stack and hosting in §7.
 
 ## 9. Open items
-- **Test folder**: the owner is creating a folder shared "anyone with the
-  link can edit" for development and on-phone testing (free to write to;
-  the owner deletes it at the end). All SharePoint integration tests,
-  including SharePoint's chunked upload calls, run against it. If chunked
-  upload isn't allowed through the link, use whole-file uploads with retries.
+- **Test folder**: provided (§5.6). All SharePoint integration tests run
+  against it; chunked upload confirmed working. The link URL is kept out of
+  the repo (an environment variable for live tests).
+- **Pilot**: first real job run end to end before the crew switches over.
 - **Esri licensing**: Esri's terms expect business users to have an ArcGIS
   account (free tier exists). The app works keyless like Cadastrus; the owner
   can add a key later via the server (§8).
