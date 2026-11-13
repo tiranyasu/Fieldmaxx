@@ -259,6 +259,18 @@ class PhotosTest {
         assertEquals(0, com.fieldmaxx.server.photos.regenerateMissingThumbs(app.ctx))
     }
 
+    @Test fun reuseCreatedBeforeSourceThumbGetsItLater() = TestApp().run { app ->
+        seed(app)
+        val t = tokenFor("ann")
+        val bytes = jpeg()
+        registered(t, reg("ph-1", bytes)); uploadAll(t, "ph-1", bytes)
+        app.ctx.db.tx { createStatement().use { it.execute("UPDATE photos SET thumb_path = NULL WHERE id = 'ph-1'") } }
+        assertTrue(send(t, Op.PhotoReuse("ru", "ph-2", "ph-1", "pt-2")).single().ok)
+        assertNull(col(app, "ph-2", "thumb_path"))
+        assertEquals(1, com.fieldmaxx.server.photos.regenerateMissingThumbs(app.ctx))
+        assertEquals("thumbs/ph-1.jpg", col(app, "ph-2", "thumb_path"))
+    }
+
     @Test fun removingSourceKeepsBackupForPendingReuse() = TestApp().run { app ->
         seed(app)
         val t = tokenFor("ann")

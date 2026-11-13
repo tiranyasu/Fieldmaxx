@@ -226,7 +226,11 @@ fun appendBackupChunk(ctx: Ctx, user: User, photoId: String, offset: Long, bytes
 private fun makeThumbFor(ctx: Ctx, photoId: String, backupRel: String): Boolean {
     val rel = "thumbs/$photoId.jpg"
     if (!makeThumbnail(ctx.path(backupRel), ctx.path(rel))) return false
-    ctx.db.tx { exec("UPDATE photos SET thumb_path = ? WHERE id = ?", rel, photoId) }
+    ctx.db.tx {
+        exec("UPDATE photos SET thumb_path = ? WHERE id = ?", rel, photoId)
+        // Reuse copies made before this thumbnail existed share it.
+        exec("UPDATE photos SET thumb_path = ? WHERE reused_from = ? AND thumb_path IS NULL", rel, photoId)
+    }
     return true
 }
 

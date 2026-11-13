@@ -16,7 +16,7 @@ private val log = LoggerFactory.getLogger("com.fieldmaxx.server.photos.Thumbs")
 
 /** Decodes [src] subsampled so its longest side stays under about twice the thumbnail size (a 16 MP photo never fully decodes). */
 private fun readSmall(src: Path): BufferedImage? {
-    ImageIO.createImageInputStream(Files.newInputStream(src)).use { iis ->
+    Files.newInputStream(src).use { raw -> ImageIO.createImageInputStream(raw).use { iis ->
         val readers = ImageIO.getImageReaders(iis)
         if (!readers.hasNext()) return null
         val reader = readers.next()
@@ -31,7 +31,7 @@ private fun readSmall(src: Path): BufferedImage? {
         } finally {
             reader.dispose()
         }
-    }
+    } }
 }
 
 /**
@@ -61,9 +61,11 @@ fun makeThumbnail(src: Path, dst: Path): Boolean {
                 compressionMode = ImageWriteParam.MODE_EXPLICIT
                 compressionQuality = THUMB_QUALITY
             }
-            ImageIO.createImageOutputStream(Files.newOutputStream(tmp)).use { os ->
-                writer.output = os
-                writer.write(null, IIOImage(out, null, null), param)
+            Files.newOutputStream(tmp).use { raw ->
+                ImageIO.createImageOutputStream(raw).use { os ->
+                    writer.output = os
+                    writer.write(null, IIOImage(out, null, null), param)
+                }
             }
         } finally {
             writer.dispose()
