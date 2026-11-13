@@ -1,5 +1,6 @@
 package com.fieldmaxx.server
 
+import com.fieldmaxx.sharepoint.DestinationFactory
 import com.fieldmaxx.sharepoint.FakeDestination
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.server.sync.ChangeLog
@@ -33,6 +34,7 @@ class MutableClock(var nowMs: Long = 1_762_000_000_000) : Clock() {
 class TestApp(
     val clock: MutableClock = MutableClock(),
     val destination: FakeDestination = FakeDestination(),
+    destinations: DestinationFactory? = null, // overrides `destination` (e.g. a destination that throws)
     fileDb: Boolean = false, // a real file avoids shared-cache table locks when a test drives parallel requests
 ) {
     val ctx: Ctx
@@ -46,7 +48,7 @@ class TestApp(
             if (fileDb) "jdbc:sqlite:${dataDir.resolve("test.db")}"
             else "jdbc:sqlite:file:test${counter.incrementAndGet()}?mode=memory&cache=shared",
         )
-        ctx = Ctx(config, db, clock, { _ -> destination }, NoopChangeRecorder, NoopDeliveryKick)
+        ctx = Ctx(config, db, clock, destinations ?: { _ -> destination }, NoopChangeRecorder, NoopDeliveryKick)
         ctx.changes = ChangeLog(db, clock, ctx.hub)
     }
 

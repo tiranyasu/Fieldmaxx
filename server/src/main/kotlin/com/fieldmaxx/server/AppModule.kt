@@ -3,6 +3,9 @@ package com.fieldmaxx.server
 import com.fieldmaxx.core.FmxJson
 import com.fieldmaxx.server.auth.authRoutes
 import com.fieldmaxx.server.auth.installAuth
+import com.fieldmaxx.server.jobs.importRoutes
+import com.fieldmaxx.server.jobs.jobRoutes
+import com.fieldmaxx.server.links.linkRoutes
 import com.fieldmaxx.server.sync.syncRoutes
 import com.fieldmaxx.server.users.userRoutes
 import io.ktor.http.HttpStatusCode
@@ -44,6 +47,9 @@ fun Application.fieldmaxx(ctx: Ctx) {
             authRoutes(ctx)
             userRoutes(ctx)
             syncRoutes(ctx)
+            importRoutes(ctx)
+            jobRoutes(ctx)
+            linkRoutes(ctx)
             get("/version") { call.respond(VersionBody(ctx.config.buildId)) }
         }
     }
