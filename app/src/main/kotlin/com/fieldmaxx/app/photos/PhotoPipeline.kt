@@ -43,6 +43,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -139,6 +140,8 @@ internal sealed interface Outcome {
  *   stuck after 6 attempts and then every 30 min, reported to the server once stuck (R56 opIds).
  * - Waiting for a link, a folder choice or a deleted point's fate is not a failure (R58, R67): the photo waits, and
  *   in-process watchers line it up again when its job, point or the outbox change.
+ * - A photo the server shows removed before it reached OneDrive (an admin's delete) is never delivered (R86): each step,
+ *   and the watcher for a photo that waits, discard it as [discardIfRemoved] says.
  * - [resumeAll] at app start, and the cleanup worker every 6 hours, recover what a power cut left (R80) and line up every
  *   unfinished photo's step again from its persisted state.
  *
@@ -215,12 +218,13 @@ class PhotoPipeline(
     // ---- running a step ----
 
     /**
-     * One run of a delivery step (stamp, register, OneDrive). A vanished row ends it quietly (R58). A row at another
-     * state lines up the step it is at instead. A deleted point holds the photo (R67). Then [body]'s [Outcome] is recorded;
-     * a stopped worker records nothing (WorkManager runs it again).
+     * One run of a delivery step (stamp, register, OneDrive). A vanished row ends it quietly (R58). A photo the server shows
+     * removed is discarded (R86). A row at another state lines up the step it is at instead. A deleted point holds the photo
+     * (R67). Then [body]'s [Outcome] is recorded; a stopped worker records nothing (WorkManager runs it again).
      */
     internal suspend fun runStep(step: Step, id: String, body: suspend (LocalPhotoEntity) -> Outcome) {
         val row = photos.get(id) ?: return
+        if (discardIfRemoved(row)) return
         if (row.state != step.state) {
             enqueueCurrent(row, ExistingWorkPolicy.KEEP)
             return
@@ -307,19 +311,22 @@ class PhotoPipeline(
     }
 
     /**
-     * Brings into each unfinished photo what the server and its point say: R67 (a deleted point holds its photos; once the
+     * Brings into each unfinished photo what the server and its point say: R86 (removed on the server before OneDrive, it
+     * is discarded, also while it waits for a link, a folder or a stream), R67 (a deleted point holds its photos; once the
      * server shows it deleted, those not in OneDrive are discarded), R57 (the server delivered the photo itself, or renamed
      * it), the server's backup, and the photos waiting for a link, a folder or their rows.
      */
     internal suspend fun reconcile() = reconciling.withLock {
         var inOutbox: Set<String>? = null
         for (row in photos.unfinished()) {
+            val info = db.photos().get(row.id)?.toPhoto()
+            if (discardIfRemoved(row, info)) continue // first: the photo is gone for everyone, whatever its point's fate
             if (row.state != CONFIRMED && pointDeleted(row)) {
                 val busy = inOutbox ?: pointsInOutbox().also { inOutbox = it }
                 if (row.pointId !in busy) checkDelete(row.jobId)
                 continue
             }
-            val info = db.photos().get(row.id)?.toPhoto() ?: continue
+            if (info == null) continue
             if (row.state == REGISTERED && info.delivered()) {
                 confirmedByServer(row, info, cancelUpload = true)
                 continue
@@ -388,6 +395,20 @@ class PhotoPipeline(
         deleteFiles(row)
         photos.delete(row.id)
         waiting.remove(row.id)
+    }
+
+    /**
+     * R86: the server shows the photo removed before it reached OneDrive (an admin deleted it, say): the phone that holds it
+     * never delivers it. Its work stops and its copy goes as [discard] does. Not once this phone confirmed it, nor once the
+     * server shows it delivered: a removal after that only hides it on the server. Not cancellable, since stopping the
+     * photo's work may stop the very worker that asks. True when it was discarded.
+     */
+    internal suspend fun discardIfRemoved(row: LocalPhotoEntity): Boolean = discardIfRemoved(row, db.photos().get(row.id)?.toPhoto())
+
+    private suspend fun discardIfRemoved(row: LocalPhotoEntity, info: PhotoInfo?): Boolean {
+        if (row.state == CONFIRMED || info == null || info.status != PhotoStatus.removed || info.delivered()) return false
+        withContext(NonCancellable) { discard(row) }
+        return true
     }
 
     /** The photo's own folder, meta.json first: a sweep must never find a meta.json whose row is gone. */

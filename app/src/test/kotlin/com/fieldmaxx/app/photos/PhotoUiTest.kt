@@ -95,6 +95,8 @@ import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Before
 import org.junit.Rule
+import org.junit.rules.ExternalResource
+import org.junit.rules.RuleChain
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
@@ -208,11 +210,21 @@ private class WatchedDb(context: Context) {
 @RunWith(RobolectricTestRunner::class)
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class PhotoUiTest {
-    @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
+    val compose = createAndroidComposeRule<ComponentActivity>()
 
     private val context: Context = ApplicationProvider.getApplicationContext()
     private val watched = WatchedDb(context)
     private val db: AppDatabase = watched.db
+
+    /**
+     * The database closes only once the screen under test is gone: JUnit's @After runs before the compose rule ends the
+     * activity, and a flow the screen still collects would then query a closed database.
+     */
+    @get:Rule val rules: RuleChain = RuleChain.outerRule(
+        object : ExternalResource() {
+            override fun after() = db.close()
+        },
+    ).around(compose)
     private val api = FakeApi()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val sync = SyncEngine(api, db, FakeLiveSocket(), scope, { NOV5 }, { SERVER })
@@ -237,7 +249,6 @@ class PhotoUiTest {
     @After fun tearDown() {
         sync.stop()
         runBlocking { scope.coroutineContext.job.cancelAndJoin() }
-        db.close()
         WorkManagerTestInitHelper.closeWorkDatabase()
         photosDir.deleteRecursively()
         File(context.cacheDir, "shared").deleteRecursively()
@@ -777,6 +788,31 @@ class PhotoUiTest {
         assertFalse(exists(PointTags.DELETE), "the server would refuse Alice's delete (ops/Ops.kt)")
         deps.hiddenDeliveredFlow.value = false
         waitForTag(PointTags.DELETE)
+    }
+
+    @Test fun adminDeletingAnotherTechsUnconfirmedPhotoIsWarnedOfTheEmptyFile() { // R86, R84
+        val bobsName = "POLE_1_39.636130_-119.691104_7.jpg" // the name the server gave Bob's photo (the photo() fixture's)
+        val theirs = photoViews(emptyList(), listOf(photo("theirs", "p18")), SERVER).single() // registered, not in OneDrive yet
+        assertEquals(PhotoUiStatus.UPLOADING, theirs.status)
+        assertFalse(theirs.onThisPhone, "the admin's phone has only the server's copy")
+        assertEquals(
+            RemovalPrompt(
+                "Delete this photo?",
+                listOf("It won't go to OneDrive.", "An empty file named $bobsName may stay in OneDrive. Remove it there by hand."),
+                "Delete",
+            ),
+            removalPrompt(theirs),
+        )
+
+        // On the admin's strip: asked first, with the sentence, then removed.
+        strip.me = ADMIN
+        showStrip(listOf(theirs))
+        tapPhoto("theirs")
+        press(PhotoTags.REMOVE)
+        waitForText("An empty file named $bobsName may stay in OneDrive. Remove it there by hand.")
+        assertTrue(hasTextNode("It won't go to OneDrive."))
+        press(PhotoTags.REMOVE_CONFIRM)
+        waitFor { strip.removed.toList() == listOf("theirs") }
     }
 
     @Test fun reusePickerWorksOfflineOnThisJob() { // R66

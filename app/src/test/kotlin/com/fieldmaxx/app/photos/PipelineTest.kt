@@ -680,6 +680,139 @@ class PipelineTest {
         assertEquals(emptyList(), confirmedOps(b))
     }
 
+    /**
+     * R86: an admin deleted another tech's photo before it reached OneDrive. The server's state reaches that tech's phone
+     * through sync, and the phone never delivers the photo: its work stops, its meta.json, folder and row go.
+     */
+    @Test fun photoRemovedOnTheServerWhileItWaitsForTheLinkIsNeverDelivered() {
+        runBlocking { OpApplier(db).applyChange(jobChange(11, job("j1"))) } // no Field Notes link yet: both photos wait for it
+        val kept = take()
+        val removed = take()
+        runUntil("both waiting for the link") { listOf(kept, removed).all { id -> work(Step.ONEDRIVE, id).any { it.state == WorkInfo.State.SUCCEEDED } } }
+        awaitIdle()
+        val removedName = assertNotNull(row(removed)?.fileName)
+
+        serverRemoved(removed) // deleted on the admin's phone; this phone hears it from the server
+        runUntil("discarded on this phone") { row(removed) == null }
+        assertFalse(folder(removed).exists(), "its meta.json and folder went with it")
+
+        runBlocking { OpApplier(db).applyChange(jobChange(12, job("j1").copy(fieldNotesUrl = LINK))) } // the office adds the link
+        runUntil("the other photo delivered") { done(kept) }
+        awaitIdle()
+        assertDeliveredOnce(kept)
+        assertEquals(1, fake.files.size, "the removed photo never went")
+        assertTrue(fake.calls.none { it.startsWith("uploadChunked") && removedName in it })
+        assertNull(row(removed), "nor came back")
+        assertTrue(workManager.getWorkInfosByTag(photoTag(removed)).get().all { it.state.isFinished }, "its work is stopped")
+    }
+
+    /** R86: the same while the photo waits for one of the 3 OneDrive streams: its turn never comes. */
+    @Test fun photoRemovedOnTheServerWhileItWaitsForAStreamIsNeverDelivered() = runBlocking {
+        val busy = CompletableDeferred<Unit>()
+        val streams = (1..3).map { launch(Dispatchers.Default) { UploadGate.withOneDrive { busy.await() } } }
+        try {
+            await("3 OneDrive uploads") { UploadGate.oneDrive.availablePermits == 0 }
+            val kept = take()
+            val removed = take()
+            // Running with every stream taken: both wait in the gate for a stream.
+            runUntil("both waiting for a stream") { listOf(kept, removed).all { id -> work(Step.ONEDRIVE, id).any { it.state == WorkInfo.State.RUNNING } } }
+            val removedName = assertNotNull(row(removed)?.fileName)
+
+            serverRemoved(removed)
+            runUntil("discarded on this phone") { row(removed) == null }
+            assertFalse(folder(removed).exists(), "its meta.json and folder went with it")
+
+            busy.complete(Unit) // the streams free up
+            streams.joinAll()
+            runUntil("the other photo delivered") { done(kept) }
+            awaitIdle()
+            assertDeliveredOnce(kept)
+            assertEquals(1, fake.files.size, "the removed photo never went")
+            assertTrue(fake.calls.none { it.startsWith("uploadChunked") && removedName in it })
+            assertNull(row(removed))
+            assertTrue(workManager.getWorkInfosByTag(photoTag(removed)).get().all { it.state.isFinished }, "its work is stopped")
+        } finally {
+            busy.complete(Unit) // the gate is the app's: never left held for the next test
+        }
+    }
+
+    /**
+     * R86: each step checks for itself, so one that starts before the watcher has seen the removal never delivers the photo
+     * either. No watcher runs here at all.
+     */
+    @Test fun eachStepDiscardsAPhotoTheServerShowsRemoved() = runBlocking {
+        pipelineScope.cancel() // no watcher: only the steps see the removals
+        // Its registration's answer was lost, and the server already shows it removed: the register step's own check.
+        val unregistered = take()
+        await("stamped") { row(unregistered)?.state == STAMPED }
+        serverRemoved(unregistered)
+        pipeline.register(unregistered)
+        assertNull(row(unregistered))
+        assertFalse(folder(unregistered).exists())
+        assertNull(server.registrations[unregistered], "not registered again")
+
+        // The backup step's own check.
+        val backingUp = take()
+        runStep(Step.REGISTER, backingUp)
+        serverRemoved(backingUp)
+        pipeline.backUp(backingUp, 0)
+        assertNull(row(backingUp))
+        assertFalse(folder(backingUp).exists())
+        assertNull(server.copies[backingUp], "no copy sent")
+
+        // Waiting for a stream when the removal came: its upload's own check, once a stream frees.
+        val busy = CompletableDeferred<Unit>()
+        val streams = (1..3).map { launch(Dispatchers.Default) { UploadGate.withOneDrive { busy.await() } } }
+        try {
+            await("3 OneDrive uploads") { UploadGate.oneDrive.availablePermits == 0 }
+            val queued = take()
+            runUntil("waiting for a stream") { work(Step.ONEDRIVE, queued).any { it.state == WorkInfo.State.RUNNING } }
+            serverRemoved(queued)
+            busy.complete(Unit)
+            streams.joinAll()
+            runUntil("discarded once its turn came") { row(queued) == null }
+            awaitIdle()
+            assertFalse(folder(queued).exists())
+        } finally {
+            busy.complete(Unit) // the gate is the app's: never left held for the next test
+        }
+        assertEquals(emptyList(), fake.calls.toList(), "OneDrive was never even asked")
+    }
+
+    /** R86: once a photo is in OneDrive, a removal only hides it on the server; the phone that holds it changes nothing. */
+    @Test fun removalAfterConfirmationChangesNothingOnThePhone() {
+        val id = take()
+        server.backupBlocked += id // its backup still owed: a photo the watcher and the backup step still look at
+        runUntil("confirmed", backoffOver = false) { row(id)?.state == CONFIRMED }
+        awaitIdle()
+        assertEquals(1, confirmedOps(id).size)
+        runBlocking { sync.flushOutbox() } // its report is answered
+        val before = assertNotNull(row(id))
+        val files = folder(id).list()!!.toSet()
+
+        // An admin deleted it just as this phone confirmed it: the removal arrives before the server's record of the confirmation.
+        serverRemoved(id)
+        runBlocking { pipeline.reconcile() } // the watcher's pass over it
+        assertEquals(before, row(id), "unchanged")
+        assertEquals(files, folder(id).list()!!.toSet())
+        server.backupBlocked -= id
+        runUntil("its backup step ran") { row(id)?.backupDone == true }
+        awaitIdle()
+        assertEquals(CONFIRMED, row(id)?.state)
+        assertEquals(files, folder(id).list()!!.toSet(), "its copies go with the usual cleanup, 3 days on")
+        assertEquals(listOf(destPath(id)), fake.files.filterValues { it.contentEquals(stamped(id)) }.keys.toList(), "in OneDrive, once")
+
+        // The server delivered one itself (its takeover) and it was hidden afterwards: confirmed here as usual, not discarded.
+        val t = take()
+        runStep(Step.REGISTER, t)
+        val name = assertNotNull(row(t)?.fileName)
+        serverRemoved(t, confirmedAt = NOW + 2)
+        runUntil("confirmed by the server") { row(t)?.state == CONFIRMED }
+        awaitIdle()
+        assertTrue(folder(t).isDirectory)
+        assertTrue(fake.calls.none { it.startsWith("uploadChunked") && name in it }, "the phone never uploads it")
+    }
+
     /** R80: a photo folder a power cut left without its row is rebuilt from its meta.json; one with neither is swept after 1 h. */
     @Test fun orphanFoldersAreRecoveredOrSwept() {
         val kept = take()
@@ -1049,6 +1182,22 @@ class PipelineTest {
         fake.dropChunkAfter = chunks
         assertFailsWith<DestinationException> { fake.uploadChunked(destPath(id), File(row(id)!!.stampedPath!!), CHUNK, null) {} }
         assertEquals(0L, fake.fileInfo(destPath(id))?.size)
+    }
+
+    private val removals = AtomicLong(40)
+
+    /**
+     * R86: an admin removed the photo on their phone; the server's state arrives here, as the sync engine applies it.
+     * [confirmedAt]: it had reached OneDrive first.
+     */
+    private fun serverRemoved(id: String, confirmedAt: Long? = null) = runBlocking {
+        val row = row(id)!!
+        val info = PhotoInfo(
+            id = id, jobId = "j1", pointId = row.pointId, userId = "u1", fileName = row.fileName, size = stamped(id).size.toLong(),
+            status = PhotoStatus.removed, destPath = confirmedAt?.let { "$FOLDER/${row.fileName}" }, lastError = null, takenAt = NOW,
+            lat = META.lat, lon = META.lon, backedUp = false, confirmedAt = confirmedAt, uploadMs = null, reusedFrom = null,
+        )
+        OpApplier(db).applyChange(Change(removals.incrementAndGet(), "j1", "photo", id, photo = info, at = NOW + 1))
     }
 
     /** The server's own delivery got there first: its photo change arrives, as the sync engine applies it. */
