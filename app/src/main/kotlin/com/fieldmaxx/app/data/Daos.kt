@@ -130,6 +130,14 @@ interface LocalPhotoDao {
     @Query("SELECT * FROM LocalPhotoEntity WHERE state IN (:states) ORDER BY createdAt")
     suspend fun inStates(states: List<String>): List<LocalPhotoEntity>
 
+    /** This phone's photos that OneDrive hasn't confirmed yet, across all jobs: the map's "3 photos waiting" (R40). */
+    @Query("SELECT COUNT(*) FROM LocalPhotoEntity WHERE state != 'confirmed'")
+    fun observeWaitingCount(): Flow<Int>
+
+    /** The job's points with a photo on this phone that OneDrive hasn't confirmed yet: the map's badge. */
+    @Query("SELECT DISTINCT pointId FROM LocalPhotoEntity WHERE jobId = :jobId AND state != 'confirmed'")
+    fun observeWaitingPointIds(jobId: String): Flow<List<String>>
+
     @Upsert
     suspend fun upsert(photo: LocalPhotoEntity)
 }

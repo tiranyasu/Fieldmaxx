@@ -293,6 +293,21 @@ class JobsScreensTest {
         assertTrue(api.deleted.isEmpty())
     }
 
+    @Test fun jobListShowsNotice() {
+        api.jobsReply = { listOf(item("j1", "A05J9XE", 5, 7)) }
+        compose.setContent {
+            FieldmaxxTheme {
+                JobListScreen(
+                    jobs, status, currentUser = { ALICE }, onOpenJob = {}, onNewJob = {}, onAddFiles = {}, onJobInfo = {},
+                    notice = "This job was deleted",
+                )
+            }
+        }
+
+        waitForText("This job was deleted") // the map went back here because the job is gone (R42)
+        waitForText("A05J9XE")
+    }
+
     @Test fun offlineShowsCachedList() {
         runBlocking {
             api.jobsReply = { listOf(item("j9", "Z99OLD", 1, 1)) }

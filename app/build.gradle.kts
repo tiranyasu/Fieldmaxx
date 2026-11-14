@@ -107,6 +107,8 @@ dependencies {
     implementation(libs.androidx.work.runtime)
     implementation(libs.androidx.lifecycle.process)
     implementation(libs.play.services.location)
+    implementation(libs.maplibre.android)
+    implementation(libs.suncalc)
     implementation(libs.coil)
     implementation(libs.coil.network.okhttp)
     debugImplementation(libs.androidx.compose.ui.test.manifest) // the empty activity createComposeRule() launches

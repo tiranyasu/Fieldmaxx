@@ -3,6 +3,12 @@ package com.fieldmaxx.app
 import android.content.Context
 import android.os.SystemClock
 import androidx.annotation.VisibleForTesting
+import androidx.datastore.core.DataStore
+import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
+import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.emptyPreferences
+import androidx.datastore.preferences.preferencesDataStoreFile
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
@@ -13,9 +19,12 @@ import coil3.request.CachePolicy
 import coil3.request.ImageRequest
 import com.fieldmaxx.app.data.AppDatabase
 import com.fieldmaxx.app.jobs.JobList
+import com.fieldmaxx.app.map.DataStoreViewMemory
+import com.fieldmaxx.app.map.ViewMemory
 import com.fieldmaxx.app.net.AndroidKeystoreTokenVault
 import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.AuthInterceptor
+import com.fieldmaxx.app.net.ConfigStore
 import com.fieldmaxx.app.net.OkHttpApi
 import com.fieldmaxx.app.net.ServerAddress
 import com.fieldmaxx.app.net.TokenVault
@@ -28,11 +37,13 @@ import com.fieldmaxx.app.sync.LiveSocket
 import com.fieldmaxx.app.sync.OutboxWorker
 import com.fieldmaxx.app.sync.SyncEngine
 import com.fieldmaxx.app.sync.liveSocketUrl
+import com.fieldmaxx.core.model.AppConfig
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
@@ -86,8 +97,33 @@ class AppGraph(context: Context, val vault: TokenVault = AndroidKeystoreTokenVau
 
     val sync: SyncEngine by lazy {
         SyncEngine(api, db, live, scope, System::currentTimeMillis, server::get) { urls -> prefetch(urls) }
-            .also { watchOutbox() }
+            .also {
+                watchOutbox()
+                configStore.refreshWhenOnline(it.status)
+            }
     }
+
+    private val configStore: ConfigStore by lazy { ConfigStore(api, dataStore("app_config"), scope) }
+
+    /**
+     * The server's map and photo settings (R39): the last ones fetched, kept on the phone, or the defaults until a fetch
+     * ever succeeded. They are fetched again each time sync comes online and after sign-in ([refreshConfig]).
+     */
+    val config: StateFlow<AppConfig> get() = configStore.config
+
+    fun refreshConfig() {
+        scope.launch { configStore.refresh() }
+    }
+
+    /** The map's view per user per job (spec §6.3). */
+    val mapViews: ViewMemory by lazy { DataStoreViewMemory(dataStore("map_views")) }
+
+    /** One store per file and graph; it closes with the graph's scope. A damaged file starts empty again. */
+    private fun dataStore(name: String): DataStore<Preferences> = PreferenceDataStoreFactory.create(
+        corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
+        scope = CoroutineScope(scope.coroutineContext + Dispatchers.IO),
+        produceFile = { app.preferencesDataStoreFile(name) },
+    )
 
     /**
      * Coil's app-wide loader, handed out by [FieldmaxxApp]: requests go through the signed-in client, and the disk cache

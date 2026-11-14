@@ -1,28 +1,13 @@
 package com.fieldmaxx.app.ui
 
 import android.net.Uri
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
 import androidx.navigation.NavBackStackEntry
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
@@ -37,6 +22,9 @@ import com.fieldmaxx.app.jobs.JobListScreen
 import com.fieldmaxx.app.jobs.NewJobScreen
 import com.fieldmaxx.app.jobs.ShareIntakeScreen
 import com.fieldmaxx.app.jobs.SharedIntake
+import com.fieldmaxx.app.map.GraphMapDeps
+import com.fieldmaxx.app.map.MapScreen
+import com.fieldmaxx.app.map.rememberMapLibreController
 import com.fieldmaxx.app.net.ApiException
 import java.io.IOException
 import kotlinx.coroutines.Dispatchers
@@ -102,12 +90,14 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
         }
     }
     var intakeShown by rememberSaveable { mutableStateOf(false) }
+    var jobsNotice by rememberSaveable { mutableStateOf<String?>(null) } // e.g. the map's "This job was deleted" (R42)
     val toMap: (String) -> Unit = { jobId -> navController.navigate(Routes.map(jobId)) { popUpTo(Routes.JOBS) } }
     val back: () -> Unit = { navController.popBackStack() }
     NavHost(navController, startDestination = start) {
         composable(Routes.LOGIN) {
             LoginScreen(graph.api, graph.vault, graph.server) { user ->
                 graph.sync.start(user)
+                graph.refreshConfig() // the map's imagery and the photo quality come from the server (R39)
                 navController.navigate(Routes.JOBS) { popUpTo(Routes.LOGIN) { inclusive = true } }
             }
         }
@@ -124,6 +114,8 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
                 onNewJob = { navController.navigate(Routes.newJob()) },
                 onAddFiles = { navController.navigate(Routes.addFiles(it)) },
                 onJobInfo = { navController.navigate(Routes.jobInfo(it)) },
+                notice = jobsNotice,
+                onNoticeShown = { jobsNotice = null },
             )
         }
         composable(Routes.SHARE) {
@@ -157,7 +149,19 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
         composable(Routes.JOB_INFO, arguments = listOf(jobIdArg, optional("link"))) { entry ->
             JobInfoScreen(entry.jobId(), graph.api, graph.sync, sharedLink = entry.arguments?.getString("link"), onBack = back)
         }
-        composable(Routes.MAP, arguments = listOf(jobIdArg)) { entry -> MapPlaceholder(graph, entry.jobId(), onBack = back) }
+        composable(Routes.MAP, arguments = listOf(jobIdArg)) { entry ->
+            val controller = rememberMapLibreController(graph.compass.heading)
+            MapScreen(
+                entry.jobId(), remember(graph) { GraphMapDeps(graph) }, controller, mapView = { controller.View(it) },
+                onBack = back,
+                onJobGone = { message ->
+                    jobsNotice = message
+                    if (!navController.popBackStack(Routes.JOBS, inclusive = false)) {
+                        navController.navigate(Routes.JOBS) { popUpTo(Routes.MAP) { inclusive = true } }
+                    }
+                },
+            )
+        }
     }
 }
 
@@ -175,24 +179,4 @@ private suspend fun resumeSync(graph: AppGraph, toLogin: suspend () -> Unit) {
         return // no signal and nothing saved: the next launch asks again
     }
     graph.sync.start(user)
-}
-
-/** Stands in for the job's map until Task 24 replaces it. */
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun MapPlaceholder(graph: AppGraph, jobId: String, onBack: () -> Unit) {
-    val job by remember(jobId) { graph.sync.job(jobId) }.collectAsState(null, Dispatchers.Main.immediate)
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text(job?.name ?: "Map") },
-                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back") } },
-                colors = fmxBarColors(),
-            )
-        },
-    ) { padding ->
-        Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
-            Text("The map will show here.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-    }
 }

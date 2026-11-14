@@ -26,6 +26,8 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -36,6 +38,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -150,7 +153,7 @@ private fun count(n: Int, noun: String) = if (n == 1) "1 $noun" else "$n ${noun}
  * The jobs with their progress, finished ones in their own section. It shows the kept list at once and refreshes on
  * every start, on pull-to-refresh and when sync comes online; with no signal the kept list stays, with an offline note.
  * Tapping a job opens it. Each job's menu has its info, adding files (active jobs) and, for its creator or an admin,
- * delete.
+ * delete. A [notice] (the map came back because its job is gone, R42) shows as a snackbar; [onNoticeShown] once it went.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -162,6 +165,8 @@ fun JobListScreen(
     onNewJob: () -> Unit,
     onAddFiles: (jobId: String) -> Unit,
     onJobInfo: (jobId: String) -> Unit,
+    notice: String? = null,
+    onNoticeShown: () -> Unit = {},
 ) {
     var items by remember { mutableStateOf<List<JobListItem>?>(null) } // null until the kept list or the server's
     var offline by remember { mutableStateOf(false) }
@@ -170,6 +175,8 @@ fun JobListScreen(
     var me by remember { mutableStateOf<User?>(null) }
     var deleting by remember { mutableStateOf<Job?>(null) }
     val refreshAsked = remember { Channel<Unit>(Channel.CONFLATED) }
+    val snackbar = remember { SnackbarHostState() }
+    val noticeShown by rememberUpdatedState(onNoticeShown)
 
     // Main-confined, as on the login screen: the screen's state is written on the main thread wherever a call finishes.
     LaunchedEffect(jobs) {
@@ -203,8 +210,15 @@ fun JobListScreen(
         status.map { it == SyncStatus.ONLINE }.distinctUntilChanged().drop(1).filter { it }.collect { refreshAsked.trySend(Unit) }
     }
 
+    LaunchedEffect(notice) {
+        if (notice == null) return@LaunchedEffect
+        snackbar.showSnackbar(notice)
+        noticeShown()
+    }
+
     Scaffold(
         topBar = { TopAppBar(title = { Text("Jobs") }, colors = fmxBarColors()) },
+        snackbarHost = { SnackbarHost(snackbar) },
         floatingActionButton = {
             ExtendedFloatingActionButton(
                 onClick = onNewJob,
