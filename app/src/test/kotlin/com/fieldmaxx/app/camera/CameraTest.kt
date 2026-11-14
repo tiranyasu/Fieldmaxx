@@ -852,6 +852,10 @@ class CameraTest {
         waitFor { registry.launches.size == 1 }
         assertEquals(Manifest.permission.CAMERA, registry.launches.single().input, "asked again, not a black screen")
         assertFalse(exists(CameraTags.SHUTTER))
+        compose.activityRule.scenario.moveToState(Lifecycle.State.STARTED) // the system's dialog comes and goes
+        compose.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
+        compose.waitForIdle()
+        assertEquals(1, registry.launches.size, "one request at a time")
 
         compose.runOnUiThread { registry.answer(false) }
         waitFor { exists(CameraTags.REFUSED) }
