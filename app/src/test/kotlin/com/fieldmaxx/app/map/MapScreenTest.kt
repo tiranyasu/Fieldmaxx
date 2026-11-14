@@ -7,7 +7,12 @@ import androidx.activity.compose.LocalActivityResultRegistryOwner
 import androidx.activity.result.ActivityResultRegistry
 import androidx.activity.result.ActivityResultRegistryOwner
 import androidx.activity.result.contract.ActivityResultContract
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.hasTestTag
@@ -194,19 +199,21 @@ class MapScreenTest {
     private val hh2 = mapPoint("h2", type = "HH", lat = 39.6401, status = PointStatus.done)
     private val job = listOf(pole1, pole2, pole3, hh1, hh2)
 
-    private fun show() {
-        val owner = object : ActivityResultRegistryOwner {
-            override val activityResultRegistry: ActivityResultRegistry = registry
-        }
-        compose.setContent {
-            CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
-                FieldmaxxTheme {
-                    MapScreen(
-                        "j1", deps, map, onBack = {}, onJobGone = { gone = it },
-                        onAddPoint = { adds.incrementAndGet() }, onMenu = { menus.incrementAndGet() },
-                        pointSheet = { pointId, _ -> selected = pointId },
-                    )
-                }
+    private val owner = object : ActivityResultRegistryOwner {
+        override val activityResultRegistry: ActivityResultRegistry = registry
+    }
+
+    private fun show() = compose.setContent { Screen(map) }
+
+    @Composable
+    private fun Screen(controller: MapController) {
+        CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) {
+            FieldmaxxTheme {
+                MapScreen(
+                    "j1", deps, controller, onBack = {}, onJobGone = { gone = it },
+                    onAddPoint = { adds.incrementAndGet() }, onMenu = { menus.incrementAndGet() },
+                    pointSheet = { pointId, _ -> selected = pointId },
+                )
             }
         }
     }
@@ -288,6 +295,10 @@ class MapScreenTest {
         waitFor { map.shown.first().status == PointStatus.done }
         deps.pointsFlow.value = job.map { it.copy(updatedAt = 9) }
         waitFor { map.shown.first().updatedAt == 9L }
+        deps.jobFlow.value = job("j1", "A05J9XE").copy(deliveryProblem = "This link needs a Microsoft sign-in")
+        waitForTag(MapTags.BANNER)
+        deps.pendingFlow.value = setOf("p1")
+        waitFor { map.pending == setOf("p1") }
         deps.crew.value = listOf(CrewPosition("u2", "Bob Tech", 39.64, -119.69, 5.0, NOW - 60_000, paused = false))
         waitFor { map.crew.isNotEmpty() }
         deps.fixes.value = Fix(39.6, -119.7, 4.0, null, NOW)
@@ -299,6 +310,25 @@ class MapScreenTest {
         compose.waitForIdle()
         assertEquals(listOf(saved), map.moves, "data changes never move the camera")
         assertEquals(emptyList(), map.fits)
+    }
+
+    @Test fun recreatedScreenRestoresLastView() {
+        deps.pointsFlow.value = job
+        val maps = CopyOnWriteArrayList(listOf(map))
+        var generation by mutableStateOf(0)
+        compose.setContent { key(generation) { Screen(maps[generation]) } }
+        waitFor { map.fits.size == 1 }
+
+        val panned = CameraView(39.7000, -119.8000, 16.0)
+        map.camera.value = panned
+        waitFor { deps.views.views["u1" to "j1"] == panned }
+
+        // A rotation, or coming back from another screen: a new screen with a new map.
+        maps += FakeMapController()
+        generation = 1
+        waitFor { maps[1].moves.isNotEmpty() }
+        assertEquals(listOf(panned), maps[1].moves, "back where the tech left it")
+        assertEquals(emptyList(), maps[1].fits)
     }
 
     @Test fun hideShotFilters() {

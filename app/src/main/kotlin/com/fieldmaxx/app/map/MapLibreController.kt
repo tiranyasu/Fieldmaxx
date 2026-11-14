@@ -170,7 +170,7 @@ private const val GRAB_DP = 36f
 private const val NO_ACCURACY_M = 2_000.0
 private const val EARTH_CIRCUMFERENCE_M = 40_075_016.686
 private const val TILE_WORLD_PX = 512.0 // MapLibre's world is 512 px wide at zoom 0
-private const val AMBIENT_CACHE_BYTES = 512L * 1024 * 1024
+private const val AMBIENT_CACHE_BYTES = 256L * 1024 * 1024
 private const val ESRI_IMAGERY_CREDIT = "Esri, Maxar, Earthstar Geographics, and the GIS User Community"
 private const val ESRI_CREDIT = "Esri"
 
@@ -210,7 +210,7 @@ class MapLibreController(context: Context) : MapController {
     private var labelsVisible = true
     private var houseNumbers: List<HouseNumber> = emptyList()
 
-    /** The screen's first camera move, waiting for the style. */
+    /** The screen's opening camera move, waiting for the style; dropped if the user moves the map first. */
     private var waitingMove: ((MapLibreMap) -> Unit)? = null
 
     /** Placed by the screen or moved by the user: from then on each settled view is reported. */
@@ -377,7 +377,12 @@ class MapLibreController(context: Context) : MapController {
     private fun onMapReady(m: MapLibreMap) {
         if (shown == Lifecycle.State.DESTROYED) return
         map = m
-        m.addOnCameraMoveStartedListener { reason -> if (reason == MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE) placed = true }
+        m.addOnCameraMoveStartedListener { reason ->
+            if (reason == MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE) {
+                placed = true
+                waitingMove = null // the user took over before the opening move could run: it would be a jump now
+            }
+        }
         m.addOnCameraIdleListener {
             val target = m.cameraPosition.target
             if (placed && target != null) view.value = CameraView(target.latitude, target.longitude, m.cameraPosition.zoom)
@@ -391,7 +396,6 @@ class MapLibreController(context: Context) : MapController {
         style = s
         addSourcesAndLayers(s)
         drawConfig(s)
-        setLabelsVisible(labelsVisible)
         drawHouses(s)
         drawPoints(s)
         drawDrag(s)
@@ -758,8 +762,12 @@ class MapLibreController(context: Context) : MapController {
 
     private fun px(dp: Float) = (dp * density).toInt()
 
-    /** Leaves room for the top bar, the chips and the progress strip when fitting all points. */
-    private fun fitPadding() = intArrayOf(px(48f), px(170f), px(64f), px(150f))
+    /** Leaves room for the top bar and chips, the progress strip and the side buttons, within what a landscape screen allows. */
+    private fun fitPadding(): IntArray {
+        val w = mapView.width
+        val h = mapView.height
+        return intArrayOf(min(px(32f), w / 10), min(px(170f), h * 3 / 10), min(px(64f), w / 6), min(px(150f), h / 4))
+    }
 
     private fun angleBetween(a: Double, b: Double): Double = abs(((a - b) % 360.0 + 540.0) % 360.0 - 180.0)
 
