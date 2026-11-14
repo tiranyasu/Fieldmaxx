@@ -12,7 +12,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * SharePoint's through the link (R10, R82): a file that needs more than one chunk is created empty first, its session is
  * reported (offset 0) before the first chunk, and it reads as 0 bytes until its last chunk is in. A session that stops
  * short stays open (until [expireSessions]); a fresh session into a file another one holds is accepted, or refused BUSY
- * with [busyWhileUploading].
+ * with [busyWhileUploading]. A lost session is UPLOAD_SESSION_LOST, or with [restartLostSessions] it is handled as the
+ * real destination handles it.
  */
 class FakeDestination(private val root: String = "Field Notes") : PhotoDestination {
     val folders: MutableSet<String> = ConcurrentHashMap.newKeySet()
@@ -28,6 +29,14 @@ class FakeDestination(private val root: String = "Field Notes") : PhotoDestinati
     /** R82: a new session into a file another open session writes to is refused with BUSY (SharePoint's lock); else accepted. */
     @Volatile
     var busyWhileUploading = false
+
+    /**
+     * m3: a resume of a session that is gone (past offset 0) goes as through SharePoint's link (R94, m4): the file is done
+     * when it is whole, restarted from 0 under a new session when it is empty (its own partial), EXISTS when another file
+     * of another size is there, NOT_FOUND when nothing is. Off: UPLOAD_SESSION_LOST, for the caller to retry.
+     */
+    @Volatile
+    var restartLostSessions = false
 
     /** An open upload session: the file it writes to, and the bytes it holds so far. */
     private class Session(val path: String) {
@@ -101,7 +110,13 @@ class FakeDestination(private val root: String = "Field Notes") : PhotoDestinati
             }
             sessions[resume.uploadId]?.path == relPath -> resume.uploadId to sessions.getValue(resume.uploadId)
             resume.offset == 0L -> resume.uploadId to openInto(relPath, resume.uploadId)
-            else -> throw DestinationException(DestinationErrorCode.UPLOAD_SESSION_LOST, "upload session ${resume.uploadId} is gone")
+            !restartLostSessions -> throw DestinationException(DestinationErrorCode.UPLOAD_SESSION_LOST, "upload session ${resume.uploadId} is gone")
+            else -> when (files[relPath]?.size) {
+                data.size -> return // whole already: never written again
+                0 -> "upload-${nextUploadId.getAndIncrement()}".let { id -> id to openInto(relPath, id) }
+                null -> throw notFound(relPath)
+                else -> throw DestinationException(DestinationErrorCode.EXISTS, "$relPath is another file now")
+            }
         }
         var offset = session.data.size()
         var sent = 0

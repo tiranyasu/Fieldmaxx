@@ -42,6 +42,15 @@ private val SESSION_LOST_CODES = setOf(400, 409, 423)
 /** SharePoint's answers to a StartUpload on a file another open session holds (its lock), R82. */
 private val LOCKED_CODES = setOf(409, 423)
 
+/** R94: live SharePoint answers a chunk sent to an upload session it no longer holds with HTTP 500 naming this. */
+private const val SESSION_NOT_FOUND = "SPBITSSessionNotFoundException"
+
+/**
+ * Ledger item 7: SharePoint's lock in words, either way it says it ("SPFileLockException", "… is locked for shared use").
+ * The whole word only: "blocked", or a page's `display:block`, is not a lock.
+ */
+private val LOCKED = Regex("""SPFileLockException|\blocked\b""", RegexOption.IGNORE_CASE)
+
 /**
  * [PhotoDestination] behind an "anyone with the link can edit" OneDrive/SharePoint folder link, with no
  * Microsoft sign-in (spec §5.5, §5.6). Opening the link gives a guest cookie; with it the SharePoint REST API
@@ -106,12 +115,15 @@ class SharePointLinkDestination(
      * A file that fits in one chunk goes up in one request (no session, no progress). Otherwise, with no [resume]:
      * create the empty file (EXISTS if the name is taken) and report `ChunkSession(id, 0)` at once, so a retry
      * resumes this file instead of meeting it as EXISTS; then StartUpload / ContinueUpload / FinishUpload, reporting
-     * the confirmed offset after each chunk. With [resume]: carry on from its offset; if SharePoint has lost that
-     * session, the file is done when it already has the full size (a FinishUpload whose answer was lost), else the
-     * same (own, partial) file is restarted under a new upload id. UPLOAD_SESSION_LOST means the session was lost and
-     * not restarted in this call: retry later with the last reported [ChunkSession]. A [resume] at offset 0 under an id
-     * SharePoint never saw starts a fresh session into the existing file (R82: an empty file of the same photo, left by
-     * another uploader). BUSY: a StartUpload met the file locked by another open session (423, 409, or a lock message).
+     * the confirmed offset after each chunk. With [resume]: carry on from its offset. If SharePoint has lost that session
+     * (400, 409 or 423, a 404 past the first chunk, or the 500 "session not found", R94), what is at the name decides
+     * (m4): the full size is the file done (a FinishUpload whose answer was lost); an empty file is this upload's own
+     * partial (SharePoint shows it as 0 bytes until its last chunk), restarted under a new upload id; another size is
+     * someone else's file, never written over: EXISTS, so the caller takes a new counter (R82); nothing there is
+     * NOT_FOUND. UPLOAD_SESSION_LOST means the session was lost and not restarted in this call: retry later with the last
+     * reported [ChunkSession]. A [resume] at offset 0 under an id SharePoint never saw starts a fresh session into the
+     * existing file (R82: an empty file of the same photo, left by another uploader). BUSY: a StartUpload met the file
+     * locked by another open session (423, 409, or SharePoint's lock in words).
      */
     override fun uploadChunked(relPath: String, file: File, chunkBytes: Int, resume: ChunkSession?, onProgress: (ChunkSession) -> Unit) {
         require(chunkBytes > 0) { "chunkBytes must be positive" }
@@ -123,14 +135,18 @@ class SharePointLinkDestination(
                     create(relPath, ByteArray(0))
                     val uploadId = newUploadId()
                     onProgress(ChunkSession(uploadId, 0))
-                    sendChunks(relPath, chunks, uploadId, 0, onProgress)
+                    sendChunks(relPath, chunks, uploadId, 0, resumed = false, onProgress)
                 }
                 else -> try {
-                    sendChunks(relPath, chunks, resume.uploadId, resume.offset.coerceIn(0, chunks.length), onProgress)
+                    sendChunks(relPath, chunks, resume.uploadId, resume.offset.coerceIn(0, chunks.length), resumed = true, onProgress)
                 } catch (e: DestinationException) {
                     if (e.code != DestinationErrorCode.UPLOAD_SESSION_LOST) throw e
-                    if (fileInfo(relPath)?.size == chunks.length) return // complete already: never rewrite it
-                    sendChunks(relPath, chunks, newUploadId(), 0, onProgress)
+                    when (fileInfo(relPath)?.size) {
+                        chunks.length -> return // complete already: never rewrite it
+                        0L -> sendChunks(relPath, chunks, newUploadId(), 0, resumed = false, onProgress) // its own partial
+                        null -> throw DestinationException(DestinationErrorCode.NOT_FOUND, "$relPath was not found")
+                        else -> throw DestinationException(DestinationErrorCode.EXISTS, "$relPath is another file now: never written over")
+                    }
                 }
             }
         }
@@ -157,8 +173,12 @@ class SharePointLinkDestination(
         }
     }
 
-    /** Sends the chunks from [from] on; offset 0 opens the session with StartUpload, the last chunk is FinishUpload. */
-    private fun sendChunks(relPath: String, chunks: Chunks, uploadId: String, from: Long, onProgress: (ChunkSession) -> Unit) {
+    /**
+     * Sends the chunks from [from] on; offset 0 opens the session with StartUpload, the last chunk is FinishUpload.
+     * [resumed]: [uploadId] is a session an earlier call opened, so SharePoint's "session not found" on its StartUpload
+     * means it was lost too (R94). A session this call opens (new, or a restart) never counts as lost on its StartUpload.
+     */
+    private fun sendChunks(relPath: String, chunks: Chunks, uploadId: String, from: Long, resumed: Boolean, onProgress: (ChunkSession) -> Unit) {
         var offset = from
         while (true) {
             val starting = offset == 0L
@@ -173,10 +193,11 @@ class SharePointLinkDestination(
             api(body, { "${it.file(it.path(relPath))}/$call" }) { r ->
                 if (!r.isSuccessful) {
                     val text = r.text()
-                    if (starting && (r.code in LOCKED_CODES || text.contains("lock", ignoreCase = true))) {
+                    val notFound = r.code == 500 && text.contains(SESSION_NOT_FOUND, ignoreCase = true)
+                    if (!notFound && starting && (r.code in LOCKED_CODES || LOCKED.containsMatchIn(text))) {
                         throw DestinationException(DestinationErrorCode.BUSY, "OneDrive holds $relPath for another upload")
                     }
-                    val lost = r.code in SESSION_LOST_CODES || (r.code == 404 && !starting)
+                    val lost = r.code in SESSION_LOST_CODES || (r.code == 404 && !starting) || (notFound && (resumed || !starting))
                     if (lost) throw DestinationException(DestinationErrorCode.UPLOAD_SESSION_LOST, "The upload session for $relPath was lost")
                     throw failure(r.code, text, relPath)
                 }

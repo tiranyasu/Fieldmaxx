@@ -1,12 +1,19 @@
 package com.fieldmaxx.sharepoint
 
+import com.fieldmaxx.sharepoint.MockSharePoint.Companion.BAD_FOLDER_PATH
 import com.fieldmaxx.sharepoint.MockSharePoint.Companion.BUSINESS_ROOT
 import com.fieldmaxx.sharepoint.MockSharePoint.Companion.BUSINESS_SHARE_PATH
+import com.fieldmaxx.sharepoint.MockSharePoint.Companion.FORBIDDEN_PATH
+import com.fieldmaxx.sharepoint.MockSharePoint.Companion.LOOP_PATH
+import com.fieldmaxx.sharepoint.MockSharePoint.Companion.NO_LOCATION_PATH
 import com.fieldmaxx.sharepoint.MockSharePoint.Companion.PERSONAL_REDEEM_PATH
 import com.fieldmaxx.sharepoint.MockSharePoint.Companion.PERSONAL_ROOT
 import com.fieldmaxx.sharepoint.MockSharePoint.Companion.PERSONAL_SHARE_PATH
+import com.fieldmaxx.sharepoint.MockSharePoint.Companion.PLAIN_PAGE_PATH
+import com.fieldmaxx.sharepoint.MockSharePoint.Companion.SESSION_NOT_FOUND
 import com.fieldmaxx.sharepoint.MockSharePoint.Companion.SHARE_PATHS
 import okhttp3.OkHttpClient
+import okhttp3.mockwebserver.MockResponse
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.time.Clock
@@ -229,32 +236,130 @@ class SharePointLinkTest {
         assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/POLE/p.jpg"])
     }
 
+    /** A chunked upload of [f] to [name] that stopped after its first chunk, whose session SharePoint has since dropped. */
+    private fun droppedOvernight(name: String, f: File): ChunkSession {
+        var last: ChunkSession? = null
+        mock.dropOnChunk(2)
+        assertEquals(DestinationErrorCode.NETWORK, failure { business().uploadChunked(name, f, CHUNK, null) { last = it } }.code)
+        mock.expireUploadSessions() // e.g. the phone sat out of signal overnight
+        mock.log.clear()
+        return last!!
+    }
+
+    /** Live SharePoint answers a chunk sent to a session it dropped with HTTP 500 (R94); the mock used to answer 400. */
+    private val lostSessionAnswers = listOf(500, 400)
+
     @Test
     fun lostSessionRestartsOnOwnPartialFile() {
         business().ensureFolder("POLE")
+        for (code in lostSessionAnswers) {
+            mock.lostSessionAnswers500 = code == 500
+            val name = "POLE/p$code.jpg"
+            val f = tmpFile(9_000_000)
+            val last = droppedOvernight(name, f)
+
+            val progress = mutableListOf<ChunkSession>()
+            business().uploadChunked(name, f, CHUNK, last) { progress += it }
+            assertEquals(
+                listOf(
+                    "continue $name @3200000 3200000 $code",
+                    "info $name 200", // empty: the upload's own partial (it reads as 0 bytes), so it is restarted
+                    "start $name 3200000 200",
+                    "continue $name @3200000 3200000 200",
+                    "finish $name @6400000 2600000 200",
+                ),
+                mock.log.filter { name in it },
+                "a lost session answered $code",
+            )
+            assertEquals(listOf(3_200_000L, 6_400_000L, 9_000_000L), progress.map { it.offset })
+            assertEquals(1, progress.map { it.uploadId }.distinct().size)
+            assertNotEquals(last.uploadId, progress.first().uploadId)
+            assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/$name"])
+        }
+    }
+
+    /** R94: a resumed StartUpload (the first chunk sent again) answered "session not found" is a lost session too. */
+    @Test
+    fun resumedStartWhoseSessionIsGoneRestarts() {
+        business().ensureFolder("POLE")
         val f = tmpFile(9_000_000)
-        var last: ChunkSession? = null
-        mock.dropOnChunk(2)
-        assertEquals(DestinationErrorCode.NETWORK, failure { business().uploadChunked("POLE/p.jpg", f, CHUNK, null) { last = it } }.code)
-        mock.expireUploadSessions() // e.g. the phone sat out of signal overnight
+        val progress = mutableListOf<ChunkSession>()
+        mock.dropOnChunk(1) // the StartUpload with the first 3.2 MB: only the empty file and its recovery point
+        assertEquals(DestinationErrorCode.NETWORK, failure { business().uploadChunked("POLE/p.jpg", f, CHUNK, null) { progress += it } }.code)
+        val first = progress.single()
 
         mock.log.clear()
-        val progress = mutableListOf<ChunkSession>()
-        business().uploadChunked("POLE/p.jpg", f, CHUNK, last) { progress += it }
+        mock.failChunk(1, MockSharePoint.spError(500, SESSION_NOT_FOUND, "Error in the application."))
+        business().uploadChunked("POLE/p.jpg", f, CHUNK, first) { progress += it }
         assertEquals(
             listOf(
-                "continue POLE/p.jpg @3200000 3200000 400",
-                "info POLE/p.jpg 200", // the partial file is not complete: restart it
+                "start POLE/p.jpg 3200000 500 (injected)",
+                "info POLE/p.jpg 200",
                 "start POLE/p.jpg 3200000 200",
                 "continue POLE/p.jpg @3200000 3200000 200",
                 "finish POLE/p.jpg @6400000 2600000 200",
             ),
             mock.log.filter { "p.jpg" in it },
         )
-        assertEquals(listOf(3_200_000L, 6_400_000L, 9_000_000L), progress.map { it.offset })
-        assertEquals(1, progress.map { it.uploadId }.distinct().size)
-        assertNotEquals(last!!.uploadId, progress.first().uploadId)
+        assertNotEquals(first.uploadId, progress.last().uploadId)
         assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/POLE/p.jpg"])
+    }
+
+    /**
+     * R94: only that 500 means a lost session, and only for a session this call didn't just open. Any other 500 stays
+     * UNEXPECTED, and so does that 500 on a new upload's StartUpload or on a restart's, so a restart never goes round again.
+     */
+    @Test
+    fun otherServerErrorsStayUnexpected() {
+        business().ensureFolder("POLE")
+        val f = tmpFile(9_000_000)
+        val notFound = MockSharePoint.spError(500, SESSION_NOT_FOUND, "Error in the application.")
+
+        mock.failChunk(1, notFound)
+        val fresh = failure { business().uploadChunked("POLE/a.jpg", f, CHUNK, null) {} }
+        assertEquals(DestinationErrorCode.UNEXPECTED to "OneDrive answered HTTP 500: Error in the application.", fresh.code to fresh.message)
+
+        mock.lostSessionAnswers500 = true
+        val last = droppedOvernight("POLE/b.jpg", f)
+        mock.failChunk(2, notFound) // the restart's StartUpload, after the ContinueUpload that found the session gone
+        assertEquals(DestinationErrorCode.UNEXPECTED, failure { business().uploadChunked("POLE/b.jpg", f, CHUNK, last) {} }.code)
+        assertEquals(1, mock.log.count { it.startsWith("start POLE/b.jpg") }, "restarted once, not again")
+
+        mock.log.clear()
+        mock.failChunk(2, MockSharePoint.spError(500, "-2147467259, System.Exception", "Something went wrong."))
+        val other = failure { business().uploadChunked("POLE/c.jpg", f, CHUNK, null) {} }
+        assertEquals(DestinationErrorCode.UNEXPECTED to "OneDrive answered HTTP 500: Something went wrong.", other.code to other.message)
+        assertTrue(mock.log.none { it.startsWith("info POLE/c.jpg") }, "not treated as lost")
+    }
+
+    /** m4: a lost session restarts only into an empty file; another file of another size under the name is never written over. */
+    @Test
+    fun lostSessionNeverWritesOverAnotherFile() {
+        mock.lostSessionAnswers500 = true
+        business().ensureFolder("POLE")
+        val f = tmpFile(9_000_000)
+        val last = droppedOvernight("POLE/p.jpg", f)
+        val theirs = Random(3).nextBytes(5_000_000) // a whole file of someone else's, under the name meanwhile
+        mock.files["$BUSINESS_ROOT/POLE/p.jpg"] = theirs
+
+        val e = failure { business().uploadChunked("POLE/p.jpg", f, CHUNK, last) {} }
+        assertEquals(DestinationErrorCode.EXISTS, e.code, "a collision: the caller takes a new counter (R82)")
+        assertEquals(listOf("continue POLE/p.jpg @3200000 3200000 500", "info POLE/p.jpg 200"), mock.log.filter { "p.jpg" in it })
+        assertContentEquals(theirs, mock.files["$BUSINESS_ROOT/POLE/p.jpg"], "never written over")
+    }
+
+    /** m4: the photo's file went (removed by hand) while its session was away: nothing to restart into, nothing made. */
+    @Test
+    fun lostSessionWhoseFileIsGoneIsNotFound() {
+        mock.lostSessionAnswers500 = true
+        business().ensureFolder("POLE")
+        val f = tmpFile(9_000_000)
+        val last = droppedOvernight("POLE/p.jpg", f)
+        mock.files.remove("$BUSINESS_ROOT/POLE/p.jpg")
+
+        assertEquals(DestinationErrorCode.NOT_FOUND, failure { business().uploadChunked("POLE/p.jpg", f, CHUNK, last) {} }.code)
+        assertEquals(listOf("continue POLE/p.jpg @3200000 3200000 500", "info POLE/p.jpg 404"), mock.log.filter { "p.jpg" in it })
+        assertNull(mock.files["$BUSINESS_ROOT/POLE/p.jpg"])
     }
 
     @Test
@@ -329,24 +434,50 @@ class SharePointLinkTest {
     @Test
     fun finishedUploadIsNeverRewritten() {
         business().ensureFolder("POLE")
+        for (code in lostSessionAnswers) {
+            mock.lostSessionAnswers500 = code == 500
+            val name = "POLE/p$code.jpg"
+            val f = tmpFile(9_000_000)
+            var last: ChunkSession? = null
+            mock.loseAnswerOnChunk(3) // FinishUpload is applied, its answer never arrives
+            assertEquals(DestinationErrorCode.NETWORK, failure { business().uploadChunked(name, f, CHUNK, null) { last = it } }.code)
+            assertEquals(6_400_000L, last!!.offset)
+            assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/$name"])
+
+            mock.log.clear()
+            val progress = mutableListOf<ChunkSession>()
+            business().uploadChunked(name, f, CHUNK, last) { progress += it }
+            assertEquals(listOf("finish $name @6400000 2600000 $code", "info $name 200"), mock.log.filter { name in it }, "answered $code")
+            assertEquals(emptyList(), progress)
+
+            // A resume at the full length (the last progress of a finished upload) is done too.
+            mock.log.clear()
+            business().uploadChunked(name, f, CHUNK, ChunkSession(last!!.uploadId, f.length())) {}
+            assertEquals(listOf("finish $name @9000000 0 $code", "info $name 200"), mock.log.filter { name in it }, "answered $code")
+            assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/$name"])
+        }
+    }
+
+    /** Ledger item 7: BUSY means SharePoint's lock ("locked", SPFileLockException), never any answer with "lock" in it. */
+    @Test
+    fun onlyARealLockIsBusy() {
+        business().ensureFolder("POLE")
         val f = tmpFile(9_000_000)
-        var last: ChunkSession? = null
-        mock.loseAnswerOnChunk(3) // FinishUpload is applied, its answer never arrives
-        assertEquals(DestinationErrorCode.NETWORK, failure { business().uploadChunked("POLE/p.jpg", f, CHUNK, null) { last = it } }.code)
-        assertEquals(6_400_000L, last!!.offset)
-        assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/POLE/p.jpg"])
+        mock.failChunk(1, MockResponse().setResponseCode(500).setBody("<html><div style=\"display:block\">Something went wrong</div></html>"))
+        assertEquals(DestinationErrorCode.UNEXPECTED, failure { business().uploadChunked("POLE/a.jpg", f, CHUNK, null) {} }.code)
+        mock.failChunk(1, MockSharePoint.spError(400, "-2147024809, System.ArgumentException", "The request was blocked."))
+        assertEquals(DestinationErrorCode.UPLOAD_SESSION_LOST, failure { business().uploadChunked("POLE/b.jpg", f, CHUNK, null) {} }.code)
 
-        mock.log.clear()
-        val progress = mutableListOf<ChunkSession>()
-        business().uploadChunked("POLE/p.jpg", f, CHUNK, last) { progress += it }
-        assertEquals(listOf("finish POLE/p.jpg @6400000 2600000 400", "info POLE/p.jpg 200"), mock.log.filter { "p.jpg" in it })
-        assertEquals(emptyList(), progress)
-
-        // A resume at the full length (the last progress of a finished upload) is done too.
-        mock.log.clear()
-        business().uploadChunked("POLE/p.jpg", f, CHUNK, ChunkSession(last!!.uploadId, f.length())) {}
-        assertEquals(listOf("finish POLE/p.jpg @9000000 0 400", "info POLE/p.jpg 200"), mock.log.filter { "p.jpg" in it })
-        assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/POLE/p.jpg"])
+        // A.jpg is an empty file now; a session into it meets the lock, in either wording.
+        for (lock in listOf(
+            MockSharePoint.spError(400, "-2147018894, Microsoft.SharePoint.SPFileLockException", "The file is in use."),
+            MockSharePoint.spError(400, "-2130575306, Microsoft.SharePoint.SPException", "The file \"POLE/a.jpg\" is LOCKED for shared use."),
+        )) {
+            mock.failChunk(1, lock)
+            val e = failure { business().uploadChunked("POLE/a.jpg", f, CHUNK, ChunkSession(UUID.randomUUID().toString(), 0)) {} }
+            assertEquals(DestinationErrorCode.BUSY, e.code)
+        }
+        assertEquals(FileInfo(0), business().fileInfo("POLE/a.jpg"))
     }
 
     @Test
@@ -357,6 +488,36 @@ class SharePointLinkTest {
             assertEquals(DestinationErrorCode.REQUIRES_SIGN_IN, e.code)
             assertEquals("This link needs a Microsoft sign-in", e.message)
         }
+    }
+
+    /** Review Focus 4 (m9): a link that was deleted, or has expired, says so when it is entered. */
+    @Test
+    fun expiredLinkSaysItDoesNotExist() {
+        mock.linkGone = true
+        for (link in listOf(mock.businessLink, mock.personalLink)) {
+            val e = failure { SharePointLinkDestination(link, client).rootName() }
+            assertEquals(DestinationErrorCode.NOT_FOUND to "This link doesn't exist (deleted or mistyped)", e.code to e.message, link)
+        }
+    }
+
+    /** Review Focus 4 (m9): a link that doesn't lead to a OneDrive folder says what is wrong with it. */
+    @Test
+    fun wrongLinksSayWhatIsWrong() {
+        fun at(path: String) = mock.server.url(path).toString()
+        val expected = listOf(
+            "Field Notes" to (DestinationErrorCode.UNEXPECTED to "This is not a web link"),
+            at(PLAIN_PAGE_PATH) to (DestinationErrorCode.UNEXPECTED to "This link doesn't open a OneDrive folder (HTTP 200)"),
+            at(NO_LOCATION_PATH) to (DestinationErrorCode.UNEXPECTED to "This link doesn't open a OneDrive folder"),
+            at(BAD_FOLDER_PATH) to (DestinationErrorCode.UNEXPECTED to "This link doesn't open a OneDrive folder"),
+            at(LOOP_PATH) to (DestinationErrorCode.UNEXPECTED to "This link redirects too many times"),
+            at(FORBIDDEN_PATH) to (DestinationErrorCode.FORBIDDEN to "The link no longer allows uploads"),
+            at("/:f:/g/personal/u/MISTYPED") to (DestinationErrorCode.NOT_FOUND to "This link doesn't exist (deleted or mistyped)"),
+        )
+        for ((link, answer) in expected) {
+            val e = failure { SharePointLinkDestination(link, client).listFolders("") }
+            assertEquals(answer, e.code to e.message, link)
+        }
+        assertTrue(mock.calls.none { "/_api/" in it.path }, "no link got as far as the folder")
     }
 
     @Test

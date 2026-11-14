@@ -8,6 +8,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotEquals
 
 class FakeDestinationTest {
     private fun tmp(size: Int) = File.createTempFile("fake", ".bin").apply { deleteOnExit(); writeBytes(ByteArray(size) { it.toByte() }) }
@@ -87,6 +88,36 @@ class FakeDestinationTest {
         val d = FakeDestination().apply { ensureFolder("A") }
         val e = assertFailsWith<DestinationException> { d.uploadChunked("A/p.jpg", tmp(10), 5, ChunkSession("nope", 5)) {} }
         assertEquals(DestinationErrorCode.UPLOAD_SESSION_LOST, e.code)
+    }
+
+    /** m3: with [FakeDestination.restartLostSessions] a lost session goes as it does through SharePoint's link (R94, m4). */
+    @Test
+    fun lostSessionsRestartIntoTheirOwnEmptyFileWhenAsked() {
+        val d = FakeDestination().apply { ensureFolder("A"); restartLostSessions = true; dropChunkAfter = 1 }
+        val f = tmp(100)
+        var last: ChunkSession? = null
+        assertEquals(DestinationErrorCode.NETWORK, assertFailsWith<DestinationException> { d.uploadChunked("A/p.jpg", f, 30, null) { last = it } }.code)
+        assertEquals(30L, last!!.offset)
+        d.expireSessions() // SharePoint dropped it overnight
+
+        val progress = mutableListOf<ChunkSession>()
+        d.uploadChunked("A/p.jpg", f, 30, last) { progress += it }
+        assertEquals(listOf(30L, 60L, 90L, 100L), progress.map { it.offset }, "its own empty file, restarted from the start")
+        assertEquals(1, progress.map { it.uploadId }.distinct().size)
+        assertNotEquals(last!!.uploadId, progress.first().uploadId, "under a new session")
+        assertContentEquals(f.readBytes(), d.files["A/p.jpg"])
+        assertEquals(1, d.files.size)
+
+        // Whole already (a FinishUpload whose answer was lost): done, nothing sent.
+        d.uploadChunked("A/p.jpg", f, 30, ChunkSession("gone", 60)) { error("nothing more to send") }
+        assertContentEquals(f.readBytes(), d.files["A/p.jpg"])
+        // Another file of another size under the name: never written over.
+        d.files["A/q.jpg"] = byteArrayOf(1, 2, 3)
+        assertEquals(DestinationErrorCode.EXISTS, assertFailsWith<DestinationException> { d.uploadChunked("A/q.jpg", f, 30, ChunkSession("gone", 60)) {} }.code)
+        assertContentEquals(byteArrayOf(1, 2, 3), d.files["A/q.jpg"])
+        // Nothing under the name: nothing to restart into.
+        assertEquals(DestinationErrorCode.NOT_FOUND, assertFailsWith<DestinationException> { d.uploadChunked("A/r.jpg", f, 30, ChunkSession("gone", 60)) {} }.code)
+        assertEquals(setOf("A/p.jpg", "A/q.jpg"), d.files.keys)
     }
 
     @Test

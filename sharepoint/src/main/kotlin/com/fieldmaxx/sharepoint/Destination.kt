@@ -30,8 +30,10 @@ interface PhotoDestination {
      * needs more than a chunk is created empty first and its session reported (offset 0) before any chunk, then reported
      * after each one; it reads as 0 bytes until its last chunk is in (R10). With [resume], the upload goes on in that
      * session; an id this destination never saw, at offset 0, opens a fresh session into the existing file: how an empty
-     * file of the same photo, left by another uploader, is filled instead of renamed around (R82). BUSY: SharePoint holds
-     * the file for another open session.
+     * file of the same photo, left by another uploader, is filled instead of renamed around (R82). A session SharePoint
+     * lost is restarted only into an empty file (m4): EXISTS when another file of another size is at the name now, so the
+     * caller takes a new counter, as for any other file there (R82). BUSY: SharePoint holds the file for another open
+     * session.
      */
     fun uploadChunked(relPath: String, file: File, chunkBytes: Int, resume: ChunkSession?, onProgress: (ChunkSession) -> Unit)
     fun download(relPath: String, out: OutputStream)

@@ -33,6 +33,32 @@ class MockSharePoint : Closeable {
         val SHARE_PATHS = setOf(BUSINESS_SHARE_PATH, PERSONAL_SHARE_PATH, PERSONAL_REDEEM_PATH)
         private val ROOTS = mapOf("/personal/u" to BUSINESS_ROOT, "/personal/cid" to PERSONAL_ROOT)
 
+        /**
+         * Links that aren't a OneDrive folder's: a plain web page, a redirect to itself, a redirect with no address, one to a
+         * folder path that isn't a OneDrive one, and a page that refuses the visitor.
+         */
+        const val PLAIN_PAGE_PATH = "/page"
+        const val LOOP_PATH = "/loop"
+        const val NO_LOCATION_PATH = "/no-location"
+        const val BAD_FOLDER_PATH = "/bad-folder"
+        const val FORBIDDEN_PATH = "/forbidden"
+
+        /** What live SharePoint answers a chunk sent to an upload session it no longer holds (T33 probe 2, R94). */
+        const val SESSION_NOT_FOUND = "-2146232832, Microsoft.SharePoint.Utilities.SPBITSSessionNotFoundException"
+
+        /** A SharePoint error answer: [code] with `{"odata.error":{"code":spCode,"message":{"value":message}}}`. */
+        fun spError(code: Int, spCode: String, message: String): MockResponse = MockResponse()
+            .setHeader("Content-Type", "application/json;odata=nometadata;streaming=true;charset=utf-8")
+            .setBody(
+                buildJsonObject {
+                    putJsonObject("odata.error") {
+                        put("code", spCode)
+                        putJsonObject("message") { put("lang", "en-US"); put("value", message) }
+                    }
+                }.toString(),
+            )
+            .setResponseCode(code)
+
         private const val LIT = "'((?:[^']|'')*)'"
         private const val GUID = "guid'([0-9a-fA-F-]{36})'"
         private val API = Regex("(/personal/[^/]+)/_api/(.*)")
@@ -77,6 +103,15 @@ class MockSharePoint : Closeable {
     /** A StartUpload on a file another open session writes to answers 423, SharePoint's file lock (R82); else it is let in. */
     @Volatile var lockWhileUploading = false
 
+    /**
+     * A ContinueUpload or FinishUpload to a session SharePoint no longer holds answers 500 [SESSION_NOT_FOUND], as live
+     * SharePoint does (R94); else 400 "The upload session was not found.", the mock's older answer.
+     */
+    @Volatile var lostSessionAnswers500 = false
+
+    /** The share links answer 404, as for a link that was deleted or has expired. */
+    @Volatile var linkGone = false
+
     private val lock = Any()
     private var cookie: String? = null
     private var cookiesIssued = 0
@@ -84,6 +119,8 @@ class MockSharePoint : Closeable {
     private var dropAt: Int? = null
     private var loseAnswerAt: Int? = null
     private var loseAnswer = false
+    private var failAt: Int? = null
+    private var failAnswer: MockResponse? = null
     private val uploads = mutableMapOf<String, Upload>()
 
     private class Upload(val path: String, val data: ByteArrayOutputStream = ByteArrayOutputStream())
@@ -102,6 +139,12 @@ class MockSharePoint : Closeable {
 
     /** On the [n]th chunk request from now, store the chunk, then drop the connection before answering. */
     fun loseAnswerOnChunk(n: Int) = synchronized(lock) { loseAnswerAt = chunkCalls + n }
+
+    /** The [n]th chunk request (Start/Continue/FinishUpload) from now is answered with [answer] and changes nothing. */
+    fun failChunk(n: Int, answer: MockResponse) = synchronized(lock) {
+        failAt = chunkCalls + n
+        failAnswer = answer
+    }
 
     init {
         server.dispatcher = object : Dispatcher() {
@@ -125,6 +168,7 @@ class MockSharePoint : Closeable {
         calls += Call(method, target, request.headers, body.size)
         if (offline) return dropped("offline $method ${target.substringBefore('?')}")
         val path = target.substringBefore('?')
+        notAFolderLink(path)?.let { return it }
         return when (path) {
             BUSINESS_SHARE_PATH -> share(
                 MockResponse().setResponseCode(302).setHeader(
@@ -164,6 +208,22 @@ class MockSharePoint : Closeable {
         cookie = value
         log += "share ${redirect.status.split(' ')[1]}"
         return redirect.addHeader("Set-Cookie", "FedAuth=$value; path=/; HttpOnly")
+    }
+
+    /** The share links once [linkGone], and the companion's links that lead to no shared folder; null for any other path. */
+    private fun notAFolderLink(path: String): MockResponse? {
+        if (linkGone && path in SHARE_PATHS) {
+            log += "share 404 (gone)"
+            return status(404, "<html>This item might not exist or is no longer available</html>")
+        }
+        return when (path) {
+            PLAIN_PAGE_PATH -> MockResponse().setResponseCode(200).setBody("<html>A web page, not a folder</html>")
+            LOOP_PATH -> MockResponse().setResponseCode(302).setHeader("Location", LOOP_PATH)
+            NO_LOCATION_PATH -> MockResponse().setResponseCode(302)
+            BAD_FOLDER_PATH -> MockResponse().setResponseCode(302).setHeader("Location", "/?spopath=Documents")
+            FORBIDDEN_PATH -> status(403, "<html>Access denied</html>")
+            else -> null
+        }
     }
 
     private fun api(method: String, path: String, request: RecordedRequest, body: ByteArray): MockResponse {
@@ -252,6 +312,7 @@ class MockSharePoint : Closeable {
         START.matchEntire(op)?.let { r ->
             val line = "start $rel ${body.size}"
             if (dropChunk()) return dropped(line)
+            injected(line)?.let { return it }
             if (p !in files) return notFound(line)
             if (r.groupValues[1] in uploads) return chunkError(line, "The upload session already exists.")
             if (lockWhileUploading && uploads.values.any { it.path == p }) {
@@ -267,8 +328,13 @@ class MockSharePoint : Closeable {
             val offset = r.groupValues[2].toLong()
             val line = "${if (finish) "finish" else "continue"} $rel @$offset ${body.size}"
             if (dropChunk()) return dropped(line)
+            injected(line)?.let { return it }
             val upload = uploads[r.groupValues[1]]
-            if (upload == null || upload.path != p) return chunkError(line, "The upload session was not found.")
+            if (upload == null || upload.path != p) {
+                if (!lostSessionAnswers500) return chunkError(line, "The upload session was not found.")
+                log += "$line 500"
+                return spError(500, SESSION_NOT_FOUND, "Error in the application.")
+            }
             if (upload.data.size().toLong() != offset) return chunkError(line, "The fileOffset parameter does not match the upload session.")
             upload.data.write(body)
             log += "$line 200"
@@ -279,6 +345,16 @@ class MockSharePoint : Closeable {
         }
         log += "${op.removePrefix("/")} 400 (unknown call)"
         return status(400, "unsupported call")
+    }
+
+    /** The answer [failChunk] set, on its chunk request. */
+    private fun injected(line: String): MockResponse? {
+        if (failAt != chunkCalls) return null
+        val answer = failAnswer!!
+        failAt = null
+        failAnswer = null
+        log += "$line ${answer.status.split(' ')[1]} (injected)"
+        return answer
     }
 
     private fun dropChunk(): Boolean {
@@ -303,14 +379,7 @@ class MockSharePoint : Closeable {
 
     private fun json(body: String) = MockResponse().setHeader("Content-Type", "application/json;odata=nometadata;streaming=true;charset=utf-8").setBody(body)
 
-    private fun error(code: Int, spCode: String, message: String) = json(
-        buildJsonObject {
-            putJsonObject("odata.error") {
-                put("code", spCode)
-                putJsonObject("message") { put("lang", "en-US"); put("value", message) }
-            }
-        }.toString(),
-    ).setResponseCode(code)
+    private fun error(code: Int, spCode: String, message: String) = spError(code, spCode, message)
 
     private fun notFound(line: String): MockResponse {
         log += "$line 404"
