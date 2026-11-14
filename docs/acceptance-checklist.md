@@ -17,6 +17,7 @@ those three things to fix it.
 - **Two files on the phone,** for example in Downloads: the job file `A05J9XE.pdf` and the query file
   `QUERY_1_-_A05K51V.docx`.
 - **Your test folder's link** (the OneDrive folder you use for testing), copied so you can paste it.
+- **Two days.** Step 25 runs overnight: start it in the evening and carry on with step 26 the next morning.
 
 Good to know:
 
@@ -125,9 +126,9 @@ Good to know:
 24. ☐ **Cut off halfway through an upload.** Take a photo of POLE 4. While it shows ⬆, turn on airplane mode and
     force stop Fieldmaxx straight away. Turn airplane mode off and open Fieldmaxx.
     **Expect:** the photo goes ✓, with exactly one file for it in POLE/POLE_4.
-25. ☐ **Cut off overnight.** In the evening, take a photo of POLE 5 and turn on airplane mode while it shows ⬆. Leave
-    the phone like that until the next morning (OneDrive gives up on an unfinished upload after a while). Turn
-    airplane mode off and open Fieldmaxx.
+25. ☐ **Cut off overnight.** Start this step in the evening, then carry on with step 26 the next morning. Take a photo
+    of POLE 5 and turn on airplane mode while it shows ⬆. Leave the phone like that until the next morning (OneDrive
+    gives up on an unfinished upload after a while). Turn airplane mode off and open Fieldmaxx.
     **Expect:** the photo goes ✓, with exactly one file for it in POLE/POLE_5, full size. Write down how long it took
     to reach ✓, and whether it showed ⚠ first.
 26. ☐ **Dead battery (only if you're willing).** Right after taking a photo, let the battery run out, or take it out
@@ -192,10 +193,11 @@ Good to know:
     Go back and tap **Menu > Field Notes link** too.
     **Expect:** every photo with its place in OneDrive (like "→ Field Notes/POLE/POLE_1/POLE_1_…jpg") and its mark.
     The button and the menu entry both open your test folder, in the browser or the OneDrive app.
-38. ☐ **Export photos to the OneDrive app.** Turn on airplane mode and take a photo, so it waits. Open
+38. ☐ **Export photos to the OneDrive app.** Turn on airplane mode and take a photo of POLE 2, so it waits. Open
     **Menu > Export photos to OneDrive app** and choose the OneDrive app or Files in the share sheet. Turn airplane
-    mode off afterwards.
-    **Expect:** a ZIP laid out like Field Notes (POLE/POLE_…/…jpg) that holds the waiting photo.
+    mode off afterwards, before step 40.
+    **Expect:** a ZIP laid out like Field Notes (POLE/POLE_2/…jpg) that holds the waiting photo. Back online, the photo
+    goes ✓.
 39. ☐ **Pole data export.** On POLE 1, fill in **Line height (ft)**, **Anchor**, **Self-supporting** or **Lashed**,
     a tag and a comment. Then open **Menu > Pole data export**, choose **Excel (.xlsx)** and **Save to Downloads**.
     Do it again with **CSV (.csv)**.
@@ -206,7 +208,8 @@ Good to know:
     **Expect:** the first time, "Not finished yet" lists what's left. The second time, **Finish** marks the job
     Finished on the Jobs screen, and your test folder gets `A05J9XE_pole_data.xlsx` at its top level.
 41. ☐ **In-app update.** Ask your developer to publish the newer test version. Restart Fieldmaxx, or tap
-    **Menu > Check for update**.
+    **Menu > Check for update**. The first update may open Android's "Install unknown apps" page for Fieldmaxx
+    instead of the installer: allow it, then come back to Fieldmaxx.
     **Expect:** **"Update available — tap to install"**. Tapping it downloads the update and opens Android's
     installer. After **Install**, Fieldmaxx opens with your jobs and photos still there, and the menu shows the new
     version.
@@ -227,10 +230,14 @@ photo that isn't in OneDrive yet. Do it only when every photo on that phone show
     POLE and QUERY 1, and `A05J9XE_pole_data.xlsx`. Also delete the folder `_fieldmaxx_it`: the automatic tests left
     it there. On the Jobs screen, delete the test job (⋮ > Delete).
     **Expect:** your test folder holds only what you want to keep.
+43. ☐ **The first upload test's folder.** In job A05J9XE's real Field Notes folder, the very first upload test (before
+    Fieldmaxx was built) left a folder `_FIELDMAXX_TEST_DELETE_ME`. The link can't delete, so ask someone with full
+    access to that folder to delete it.
+    **Expect:** job A05J9XE's Field Notes folder has no `_FIELDMAXX_TEST_DELETE_ME` folder.
 
 ## L. The pilot
 
-43. ☐ **Pilot on one real EES job.** Run one real EES job with Fieldmaxx alongside the normal process, using that
+44. ☐ **Pilot on one real EES job.** Run one real EES job with Fieldmaxx alongside the normal process, using that
     job's real Field Notes link, before the crew switches.
     **Expect:** **Check** on the link says ✓. That is the first time Fieldmaxx uses a company OneDrive link (your test
     folder is a personal one). The photos land in the job's own point folders (for example a folder named 1 for
@@ -238,6 +245,3 @@ photo that isn't in OneDrive yet. Do it only when every photo on that phone show
     nothing is overwritten. **Finish this job** writes the pole data file into the job's Field Notes folder, and
     everything matches the normal process. Only then does the crew switch: jobs already started finish the old way,
     and new jobs start in Fieldmaxx.
-
-While you're in job A05J9XE's real Field Notes folder: the very first upload test left a folder
-`_FIELDMAXX_TEST_DELETE_ME` there. Someone with full access to that folder should delete it.
