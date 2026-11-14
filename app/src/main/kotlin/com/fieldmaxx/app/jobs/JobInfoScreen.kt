@@ -72,7 +72,8 @@ object JobInfoTags {
 fun JobInfoScreen(jobId: String, api: Api, sync: SyncEngine, sharedLink: String?, onBack: () -> Unit) {
     val job by remember(jobId) { sync.job(jobId) }.collectAsState(null)
     val extras by remember(jobId) { sync.extras(jobId) }.collectAsState(null)
-    var loadProblem by remember { mutableStateOf<String?>(null) }
+    var offline by remember { mutableStateOf(false) }
+    var refused by remember { mutableStateOf<String?>(null) }
     var typedLink by rememberSaveable { mutableStateOf(sharedLink) } // null: the job's own link
     var linkNote by remember { mutableStateOf<String?>(null) }
     var savingLink by remember { mutableStateOf(false) }
@@ -82,13 +83,12 @@ fun JobInfoScreen(jobId: String, api: Api, sync: SyncEngine, sharedLink: String?
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(jobId) {
-        loadProblem = try {
+        try {
             sync.openJob(jobId)
-            null
         } catch (e: IOException) {
-            NO_SIGNAL_INFO
+            offline = true // what the phone kept still shows
         } catch (e: ApiException) {
-            e.message
+            refused = e.message // gone, say, or no longer readable
         }
     }
     val savedLink = job?.fieldNotesUrl.orEmpty()
@@ -107,7 +107,8 @@ fun JobInfoScreen(jobId: String, api: Api, sync: SyncEngine, sharedLink: String?
             Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(24.dp),
         ) {
-            loadProblem?.takeIf { extras == null }?.let { Text(it, color = FmxColors.Warning) }
+            refused?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            if (offline && extras == null) Text(NO_SIGNAL_INFO, color = FmxColors.Warning)
 
             Section("Notes") {
                 Text(job?.notes?.ifBlank { null } ?: "No notes", color = if (job?.notes.isNullOrBlank()) MaterialTheme.colorScheme.onSurfaceVariant else Color.Unspecified)

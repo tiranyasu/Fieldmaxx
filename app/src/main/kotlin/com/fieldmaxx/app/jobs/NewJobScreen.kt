@@ -1,5 +1,6 @@
 package com.fieldmaxx.app.jobs
 
+import android.content.ActivityNotFoundException
 import android.content.ContentResolver
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -46,7 +47,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private const val NO_SIGNAL_IMPORT = "No signal. Reading a job file needs signal: the server reads it."
-private const val NO_SIGNAL_SAVE = "Can't reach the server. Nothing was saved yet; try again with signal."
+private const val NO_SIGNAL_SAVE = "Can't reach the server. Check your signal and try again."
 private const val CANT_READ_FILE = "Couldn't open this file on the phone. Pick or share it again."
 
 /** A file that couldn't be read, and why. "Try again" reads it again from [uri]. */
@@ -202,10 +203,17 @@ fun NewJobScreen(
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isEmpty() && model.state == null && model.failed.isEmpty()) onBack() else model.read(uris)
     }
+    val pick = {
+        try {
+            picker.launch(JOB_FILE_TYPES)
+        } catch (e: ActivityNotFoundException) {
+            // No document picker on this phone: the screen's "Pick" button stays, and shares still work.
+        }
+    }
     LaunchedEffect(model) {
         if (model.started) return@LaunchedEffect
         model.started = true
-        if (sharedFiles.isNotEmpty()) model.read(sharedFiles) else picker.launch(JOB_FILE_TYPES)
+        if (sharedFiles.isNotEmpty()) model.read(sharedFiles) else pick()
     }
     val saved = model.savedJobId
     LaunchedEffect(saved) { if (saved != null) onDone(saved) }
@@ -213,7 +221,7 @@ fun NewJobScreen(
     if (model.state != null) {
         CheckScreen(model, api, onBack)
     } else {
-        Reading(model, onPick = { picker.launch(JOB_FILE_TYPES) }, onBack = onBack)
+        Reading(model, onPick = pick, onBack = onBack)
     }
 }
 

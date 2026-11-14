@@ -14,6 +14,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -226,7 +227,7 @@ fun JobListScreen(
                         )
                     }
                 }
-                items(active, key = { it.job.id }) { item ->
+                items(active, key = { "job:" + it.job.id }) { item ->
                     JobRow(
                         item,
                         onOpen = { onOpenJob(item.job.id) },
@@ -244,7 +245,7 @@ fun JobListScreen(
                             modifier = Modifier.padding(start = 16.dp, top = 24.dp, bottom = 8.dp),
                         )
                     }
-                    items(finished, key = { it.job.id }) { item ->
+                    items(finished, key = { "job:" + it.job.id }) { item ->
                         JobRow(
                             item,
                             onOpen = { onOpenJob(item.job.id) },
@@ -363,8 +364,9 @@ private fun DeleteJobDialog(job: Job, jobs: JobList, onDismiss: () -> Unit, onDe
                     }
                 },
                 enabled = contents != null && !busy,
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
                 modifier = Modifier.testTag(JobListTags.DELETE_CONFIRM),
-            ) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+            ) { Text("Delete") }
         },
         dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") } },
     )

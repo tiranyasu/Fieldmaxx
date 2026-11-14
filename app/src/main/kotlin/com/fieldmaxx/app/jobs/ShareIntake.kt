@@ -4,6 +4,7 @@ import android.content.ContentResolver
 import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.util.Log
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -58,6 +59,7 @@ const val ONLY_JOB_FILES = "Only PDF and Word (.docx) files"
 const val FILE_TOO_LARGE = "File is too large (max 50 MB)"
 const val MAX_JOB_FILE_BYTES = 50L * 1024 * 1024
 private const val CANT_OPEN = "Couldn't open this file. Share or pick it again."
+private const val LOG_TAG = "ShareIntake"
 
 /** What the file picker offers: PDF and Word (.docx). */
 val JOB_FILE_TYPES = arrayOf("application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
@@ -80,7 +82,7 @@ fun parseShareIntent(intent: Intent): SharedIntake? {
         else -> return null
     }
     val files = streams.ifEmpty { intent.clipData?.let { clip -> (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri } }.orEmpty() }
-    if (files.isNotEmpty()) return SharedIntake.Files(files)
+    if (files.isNotEmpty()) return SharedIntake.Files(files.distinct())
     val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString() ?: return null
     return oneDriveLink(text)?.let { SharedIntake.Link(it) }
 }
@@ -105,6 +107,7 @@ class JobFile(val name: String, val bytes: ByteArray)
  * be read throws [IOException] or [SecurityException].
  */
 fun readJobFile(resolver: ContentResolver, uri: Uri): JobFile {
+    requireDocument(uri)
     val info = fileInfo(resolver, uri)
     if (info.size != null && info.size > MAX_JOB_FILE_BYTES) throw IllegalArgumentException(FILE_TOO_LARGE)
     val kind = jobFileKind(info.name) { open(resolver, uri) } ?: throw IllegalArgumentException(ONLY_JOB_FILES)
@@ -115,6 +118,7 @@ fun readJobFile(resolver: ContentResolver, uri: Uri): JobFile {
 
 /** Why [uri] can't be imported, or null when it is a PDF or a Word file. Reads no more of it than it must. */
 internal fun refusalOf(resolver: ContentResolver, uri: Uri): String? = try {
+    requireDocument(uri)
     val info = fileInfo(resolver, uri)
     when {
         info.size != null && info.size > MAX_JOB_FILE_BYTES -> FILE_TOO_LARGE
@@ -127,17 +131,31 @@ internal fun refusalOf(resolver: ContentResolver, uri: Uri): String? = try {
     CANT_OPEN
 }
 
+/**
+ * Only documents another app hands over (content://), as the picker and share senders do. A file:// address could
+ * point into this app's own storage, so it isn't read.
+ */
+private fun requireDocument(uri: Uri) {
+    if (uri.scheme != ContentResolver.SCHEME_CONTENT) throw FileNotFoundException("Not a shared document: ${uri.scheme}")
+}
+
 internal class FileInfo(val name: String, val size: Long?)
 
 /** The name and size the sharing app reports, else the last part of the address. */
 internal fun fileInfo(resolver: ContentResolver, uri: Uri): FileInfo {
     var name: String? = null
     var size: Long? = null
-    resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
-        if (c.moveToFirst()) {
-            c.getColumnIndex(OpenableColumns.DISPLAY_NAME).takeIf { it >= 0 && !c.isNull(it) }?.let { name = c.getString(it) }
-            c.getColumnIndex(OpenableColumns.SIZE).takeIf { it >= 0 && !c.isNull(it) }?.let { size = c.getLong(it) }
+    try {
+        resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                c.getColumnIndex(OpenableColumns.DISPLAY_NAME).takeIf { it >= 0 && !c.isNull(it) }?.let { name = c.getString(it) }
+                c.getColumnIndex(OpenableColumns.SIZE).takeIf { it >= 0 && !c.isNull(it) }?.let { size = c.getLong(it) }
+            }
         }
+    } catch (e: SecurityException) {
+        throw e
+    } catch (e: RuntimeException) { // a provider that can't describe its files: the address names it, the read limits it
+        Log.w(LOG_TAG, "No name or size for $uri", e)
     }
     val fallback = uri.lastPathSegment?.substringAfterLast('/')
     return FileInfo(name?.trim()?.ifEmpty { null } ?: fallback?.ifEmpty { null } ?: "file", size)
@@ -257,6 +275,7 @@ fun ShareIntakeScreen(
                     }
                 }
             }
+            if (intake is SharedIntake.Files && files == null) item { Text("Checking the files…", color = MaterialTheme.colorScheme.onSurfaceVariant) }
             items(files.orEmpty(), key = { it.uri.toString() }) { f ->
                 if (f.refusal == null) Text(f.name) else Text("${f.name}: ${f.refusal}", color = MaterialTheme.colorScheme.error)
             }

@@ -91,6 +91,8 @@ class ShareIntakeTest {
         val docx = SharedFilesProvider.share("42", "QUERY_1_-_A05K51V.docx", docxBytes())
         val two = Intent(Intent.ACTION_SEND_MULTIPLE).setType("application/*").putParcelableArrayListExtra(Intent.EXTRA_STREAM, arrayListOf(pdf, docx))
         assertEquals(SharedIntake.Files(listOf(pdf, docx)), parseShareIntent(two))
+        val twice = Intent(Intent.ACTION_SEND_MULTIPLE).setType("application/*").putParcelableArrayListExtra(Intent.EXTRA_STREAM, arrayListOf(pdf, docx, pdf))
+        assertEquals(SharedIntake.Files(listOf(pdf, docx)), parseShareIntent(twice), "the same file shared twice is read once")
 
         assertNull(parseShareIntent(Intent(Intent.ACTION_MAIN)), "an ordinary launch shares nothing")
     }
@@ -126,6 +128,13 @@ class ShareIntakeTest {
         // No usable extension: the first bytes tell, and the name gets the extension the server reads by.
         assertEquals("Field notes.docx", readJobFile(context.contentResolver, SharedFilesProvider.share("52", "Field notes", docxBytes())).name)
         assertEquals("A05J9XE.pdf", readJobFile(context.contentResolver, SharedFilesProvider.share("53", "A05J9XE", PDF_BYTES)).name)
+    }
+
+    @Test fun ownFilesAreNeverRead() {
+        // A share naming a file inside the app's storage (file://) could hand the session or the database to the reader.
+        val own = File(context.filesDir, "A05J9XE.pdf").apply { writeBytes(PDF_BYTES) }
+        assertFailsWith<FileNotFoundException> { readJobFile(context.contentResolver, Uri.fromFile(own)) }
+        assertEquals("Couldn't open this file. Share or pick it again.", refusalOf(context.contentResolver, Uri.fromFile(own)))
     }
 
     @Test fun txtShareIsRefused() {
