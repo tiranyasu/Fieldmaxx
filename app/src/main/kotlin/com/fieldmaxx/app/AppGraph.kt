@@ -12,6 +12,7 @@ import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import coil3.request.CachePolicy
 import coil3.request.ImageRequest
 import com.fieldmaxx.app.data.AppDatabase
+import com.fieldmaxx.app.jobs.JobList
 import com.fieldmaxx.app.net.AndroidKeystoreTokenVault
 import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.AuthInterceptor
@@ -79,6 +80,9 @@ class AppGraph(context: Context, val vault: TokenVault = AndroidKeystoreTokenVau
     val tracker: ForegroundTracker by lazy {
         ForegroundTracker(ProcessLifecycleOwner.get().lifecycle, location, compass, live, SystemClock::elapsedRealtime, scope)
     }
+
+    /** The job list and what the job screens ask of it; the last list is kept per server for work without signal. */
+    val jobList: JobList by lazy { JobList(api, db, server::get) }
 
     val sync: SyncEngine by lazy {
         SyncEngine(api, db, live, scope, System::currentTimeMillis, server::get) { urls -> prefetch(urls) }

@@ -27,9 +27,12 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 import kotlinx.coroutines.runBlocking
+import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
 import org.junit.Rule
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -96,7 +99,10 @@ class LoginScreenTest {
         vault.save("tok-old")
         graph.server.set(server.url("/").toString().trimEnd('/'))
         runBlocking { graph.db.meta().put(MetaEntity(MetaKeys.USER, FmxJson.encodeToString(User.serializer(), ALICE))) }
-        server.enqueue(MockResponse().setResponseCode(401).setBody("""{"error":"Sign in required"}"""))
+        // The socket and the job list both ask at launch, in no fixed order; the ended session refuses both.
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest) = MockResponse().setResponseCode(401).setBody("""{"error":"Sign in required"}""")
+        }
 
         compose.setContent {
             nav = rememberNavController()
@@ -108,6 +114,7 @@ class LoginScreenTest {
         assertEquals(Routes.LOGIN, nav.currentDestination?.route)
         assertNull(vault.load(), "the ended session's token is dropped")
         assertNull(nav.previousBackStackEntry, "the jobs screen is gone from the back stack")
-        assertEquals("/api/ws?token=tok-old", server.takeRequest().path, "the launch started syncing as the saved user")
+        val paths = List(server.requestCount) { server.takeRequest().path }
+        assertTrue("/api/ws?token=tok-old" in paths, "the launch started syncing as the saved user: $paths")
     }
 }
