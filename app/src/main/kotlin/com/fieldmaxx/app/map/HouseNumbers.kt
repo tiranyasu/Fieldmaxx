@@ -9,7 +9,10 @@ import androidx.datastore.preferences.core.emptyPreferences
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.cos
+import kotlin.math.floor
 import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToLong
@@ -82,12 +85,26 @@ fun viewBBox(view: CameraView, widthDp: Int, heightDp: Int): BBox {
     return BBox(view.lat - halfLat, view.lon - halfLon, view.lat + halfLat, view.lon + halfLon)
 }
 
+/**
+ * [b] grown outward to the 0.001 degree grid (about 110 m): south and west down, north and east up. What is asked, kept
+ * and looked up is this box, so a kept answer always covers the whole view it is used for (R89).
+ */
+fun snapToGrid(b: BBox): BBox = BBox(gridDown(b.s), gridDown(b.w), gridUp(b.n), gridUp(b.e))
+
+// A value already on the grid stays (39.634 * 1000 is 39634.00000000001 in floating point).
+private fun gridDown(v: Double): Double = onGrid(v) ?: (floor(v * 1000) / 1000)
+private fun gridUp(v: Double): Double = onGrid(v) ?: (ceil(v * 1000) / 1000)
+private fun onGrid(v: Double): Double? = (v * 1000).let { if (abs(it - it.roundToLong()) < 1e-6) it.roundToLong() / 1000.0 else null }
+
+/** The client for Overpass, built from the app's [signedIn] one: same connections, none of its interceptors (R74). */
+fun plainClient(signedIn: OkHttpClient): OkHttpClient = signedIn.newBuilder().apply { interceptors().clear() }.build()
+
 /** How long to stay away after the [failures]'th refusal in a row (0 = the first): 30 s, doubling, at most 5 min. */
 fun backoffMs(failures: Int): Long = min(BACKOFF_FIRST_MS * 2.0.pow(min(failures, 20)).toLong(), BACKOFF_MAX_MS)
 
 /**
  * Address numbers from OpenStreetMap through the public Overpass service. [client] must be a plain one: nothing of the
- * session may reach a third party (R74). Answers are kept per box rounded to 3 decimals. After HTTP 429 or 504 it
+ * session may reach a third party (R74). Each view is snapped outward to the 0.001 degree grid and the answer kept per snapped box (R89). After HTTP 429 or 504 it
  * stays away for a while ([backoffMs]) and fails with [IOException]; so does any other failure, and the caller keeps
  * the labels it has.
  */
@@ -103,7 +120,8 @@ class HouseNumberLoader(
     private var failures = 0
     private var notBefore = 0L
 
-    suspend fun load(b: BBox): List<HouseNumber> {
+    suspend fun load(view: BBox): List<HouseNumber> {
+        val b = snapToGrid(view)
         val key = listOf(b.s, b.w, b.n, b.e).map { (it * 1000).roundToLong() }
         cache[key]?.let { return it }
         synchronized(lock) {

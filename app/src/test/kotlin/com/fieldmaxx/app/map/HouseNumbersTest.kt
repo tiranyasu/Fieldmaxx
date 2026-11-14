@@ -9,6 +9,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.runBlocking
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -61,7 +62,6 @@ class HouseNumbersTest {
 
     @Test fun postsOnlyTheQueryWithAGenericUserAgentAndNoAuth() = withServer { server, loader ->
         server.enqueue(MockResponse().setBody(body))
-        // The same kind of client the app builds, but with a session interceptor that must not be on the Overpass client.
         val client = OkHttpClient.Builder().build()
         val numbers = runBlocking { loader(client).load(box) }
 
@@ -76,18 +76,67 @@ class HouseNumbersTest {
         assertTrue(java.net.URLDecoder.decode(form.removePrefix("data="), "UTF-8") == overpassQuery(box), "only the bbox query is sent: $form")
     }
 
-    @Test fun cachesPerBboxRoundedToThreeDecimals() = withServer { server, loader ->
+    @Test fun snapsOutwardToTheThousandthGrid() {
+        assertEquals(BBox(39.634, -119.693, 39.638, -119.689), snapToGrid(BBox(39.63404, -119.69296, 39.63796, -119.68904)))
+        assertEquals(box, snapToGrid(box), "a box already on the grid stays")
+    }
+
+    private fun queriedBoxes(server: MockWebServer) =
+        generateSequence { server.takeRequest(10, java.util.concurrent.TimeUnit.MILLISECONDS) }
+            .map { java.net.URLDecoder.decode(it.body.readUtf8().removePrefix("data="), "UTF-8") }.toList()
+
+    @Test fun twoViewsInsideOneSnappedBoxHitTheCacheOnce() = withServer { server, loader ->
         server.enqueue(MockResponse().setBody(body))
         val l = loader(OkHttpClient())
         runBlocking {
-            val first = l.load(box)
-            val nearby = l.load(BBox(39.63404, -119.69296, 39.63796, -119.68904)) // same 3-decimal box
-            assertEquals(first, nearby)
+            val first = l.load(BBox(39.63404, -119.69296, 39.63796, -119.68904))
+            val second = l.load(BBox(39.63420, -119.69250, 39.63780, -119.68950))
+            assertEquals(first, second)
         }
-        assertEquals(1, server.requestCount)
-        server.enqueue(MockResponse().setBody("""{"elements":[]}"""))
-        assertEquals(emptyList(), runBlocking { l.load(BBox(39.7, -119.7, 39.704, -119.696)) })
-        assertEquals(2, server.requestCount)
+        val sent = queriedBoxes(server)
+        assertEquals(1, sent.size)
+        assertTrue("(39.634,-119.693,39.638,-119.689)" in sent[0], "the snapped box is what is asked: ${sent[0]}")
+    }
+
+    @Test fun panAcrossAGridLineQueriesTheNewSnappedBox() = withServer { server, loader ->
+        server.enqueue(MockResponse().setBody(body))
+        server.enqueue(MockResponse().setBody("""{"elements":[{"type":"node","id":9,"lat":39.6396,"lon":-119.6911,"tags":{"addr:housenumber":"77"}}]}"""))
+        val l = loader(OkHttpClient())
+        val answers = runBlocking {
+            listOf(l.load(BBox(39.6342, -119.6930, 39.6388, -119.6890)), l.load(BBox(39.6352, -119.6930, 39.6398, -119.6890)))
+        }
+        assertEquals("123", answers[0].single().text)
+        assertEquals("77", answers[1].single().text, "the new area's houses come from a new query")
+        assertEquals(2, queriedBoxes(server).size)
+    }
+
+    @Test fun atZoom19ASmallPanStillDrawsTheNewAreasHouses() = withServer { server, loader ->
+        // Houses 40 m apart in latitude; each view at zoom 19 is well under 0.001 deg tall.
+        server.enqueue(MockResponse().setBody("""{"elements":[{"type":"node","id":1,"lat":39.63449,"lon":-119.6911,"tags":{"addr:housenumber":"1"}}]}"""))
+        server.enqueue(MockResponse().setBody("""{"elements":[{"type":"node","id":2,"lat":39.63551,"lon":-119.6911,"tags":{"addr:housenumber":"2"}}]}"""))
+        val l = loader(OkHttpClient())
+        val south = viewBBox(CameraView(39.63449, -119.6911, 19.0), 300, 400)
+        val north = viewBBox(CameraView(39.63485, -119.6911, 19.0), 300, 400)
+        assertTrue(north.s > south.s && north.s < south.n, "the views overlap, a pan of tens of metres")
+        val got = runBlocking { l.load(south).map { it.text } + l.load(north).map { it.text } }
+        assertEquals(listOf("1", "2"), got)
+    }
+
+    @Test fun overpassClientCarriesNoSessionAuth() = withServer { server, _ ->
+        // The app's client adds the session token to every request; the Overpass client built from it must not.
+        val session = OkHttpClient.Builder().addInterceptor(Interceptor { c ->
+            c.proceed(c.request().newBuilder().header("Authorization", "Bearer secret").header("Cookie", "s=1").build())
+        }).build()
+        server.enqueue(MockResponse().setBody(body))
+        server.enqueue(MockResponse().setBody(body))
+        // Control: the source client really does add them.
+        session.newCall(okhttp3.Request.Builder().url(server.url("/")).build()).execute().close()
+        assertEquals("Bearer secret", server.takeRequest().getHeader("Authorization"))
+
+        runBlocking { HouseNumberLoader(plainClient(session), "Fieldmaxx/9.9 (Android)", server.url("/api/interpreter").toString(), log = {}).load(box) }
+        val req = server.takeRequest()
+        assertNull(req.getHeader("Authorization"))
+        assertNull(req.getHeader("Cookie"))
     }
 
     @Test fun backsOffOn429AndOn504DoublingToFiveMinutes() = withServer { server, loader ->

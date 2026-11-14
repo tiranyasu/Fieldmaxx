@@ -22,6 +22,7 @@ import com.fieldmaxx.app.jobs.JobList
 import com.fieldmaxx.app.map.DataStoreViewMemory
 import com.fieldmaxx.app.map.HouseNumberLoader
 import com.fieldmaxx.app.map.HouseNumberSetting
+import com.fieldmaxx.app.map.plainClient
 import com.fieldmaxx.app.map.ViewMemory
 import com.fieldmaxx.app.menu.StuckPhotos
 import com.fieldmaxx.app.net.AndroidKeystoreTokenVault
@@ -84,7 +85,7 @@ class AppGraph(context: Context, val vault: TokenVault = AndroidKeystoreTokenVau
     private val oneDriveHttp: OkHttpClient by lazy { http.newBuilder().apply { interceptors().clear() }.build() }
 
     /** Overpass's client: the same connections and threads, without the session interceptor (R74: nothing of ours goes to a third party). */
-    private val overpassHttp: OkHttpClient by lazy { http.newBuilder().apply { interceptors().clear() }.build() }
+    private val overpassHttp: OkHttpClient by lazy { plainClient(http) }
 
     /** OpenStreetMap address numbers for the map's "123" overlay; only a bounding-box query is ever sent. */
     val houseNumbers: HouseNumberLoader by lazy { HouseNumberLoader(overpassHttp, "Fieldmaxx/${BuildConfig.VERSION_NAME} (Android)") }
