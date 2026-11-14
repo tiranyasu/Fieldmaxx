@@ -13,6 +13,7 @@ import com.fieldmaxx.app.AppGraph
 import com.fieldmaxx.app.FieldmaxxApp
 import com.fieldmaxx.app.data.AppDatabase
 import com.fieldmaxx.app.data.toOp
+import com.fieldmaxx.app.data.toOutbox
 import com.fieldmaxx.app.net.ApiException
 import com.fieldmaxx.app.net.InMemoryTokenVault
 import com.fieldmaxx.core.FmxJson
@@ -35,8 +36,10 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -46,8 +49,10 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -460,6 +465,82 @@ class SyncEngineTest {
         } finally {
             graph.close()
             server.shutdown()
+        }
+    }
+
+    @Test fun flushSendsBatchesOfAtMostFiftyInOrder() = runBlocking {
+        val engine = newEngine()
+        engine.openSeededJob()
+        val ops = (1..120).map { Op.PointUpdate("op-$it", if (it % 2 == 0) "p1" else "p2", comment = "c$it") }
+        ops.forEach { engine.enqueue(it) } // not started yet: nothing goes out
+
+        engine.start(ALICE)
+
+        db.outbox().observeCount().await { it == 0 }
+        assertEquals(listOf(50, 50, 20), api.sentBatches.map { it.size })
+        assertEquals(ops, api.sentBatches.flatten())
+    }
+
+    @Test fun failedBatchesKeepTheirOpsUntilTheServerTakesThem() = runBlocking {
+        val failures = ArrayDeque(
+            listOf(IOException("no signal"), ApiException(503, "Server restarting"), ApiException(429, "Too many requests"), ApiException(400, "Bad request")),
+        )
+        api.opsReply = { ops -> synchronized(failures) { failures.removeFirstOrNull() }?.let { throw it } ?: ops.map { OpResult(it.opId, true) } }
+        val engine = newEngine()
+        engine.openSeededJob()
+        val refused = CopyOnWriteArrayList<OpResult>()
+        val listening = launch(start = CoroutineStart.UNDISPATCHED) { engine.rejected.collect { refused += it } }
+        engine.enqueue(Op.PointUpdate("op-1", "p1", comment = "a"))
+        engine.enqueue(Op.PointUpdate("op-2", "p2", comment = "b"))
+        engine.start(ALICE)
+
+        for (attempt in 1..4) {
+            awaitTrue("attempt $attempt") { api.sentBatches.size >= attempt }
+            assertEquals(listOf("op-1", "op-2"), outboxIds(), "kept after failed attempt $attempt")
+            live.serverReconnects(ServerMessage.Hello(10)) // the server is back: no need to wait the backoff out
+        }
+
+        db.outbox().observeCount().await { it == 0 }
+        assertEquals(List(5) { listOf("op-1", "op-2") }, api.sentBatches.map { batch -> batch.map { it.opId } }, "always the whole batch, in order")
+        assertEquals(emptyList(), refused.toList(), "nothing refused")
+        listening.cancel()
+    }
+
+    @Test fun statusShowsOpsStillWaiting() = runBlocking {
+        api.opsReply = { throw ApiException(503, "Server restarting") }
+        db.outbox().insert(Op.PointUpdate("op-1", "p1", comment = "from the last run").toOutbox())
+        val engine = newEngine()
+        assertEquals(SyncStatus.OFFLINE, engine.status.value, "not started")
+
+        engine.start(ALICE)
+        awaitTrue("a send attempt") { api.sentBatches.isNotEmpty() }
+        val online = withTimeoutOrNull(500) { engine.status.first { it == SyncStatus.ONLINE } }
+        assertNull(online, "never online while an op waits")
+        assertEquals(SyncStatus.SYNCING, engine.status.value)
+
+        api.opsReply = { ops -> ops.map { OpResult(it.opId, true) } }
+        live.serverReconnects(ServerMessage.Hello(0))
+        engine.status.await { it == SyncStatus.ONLINE }
+        assertEquals(emptyList(), outboxIds())
+    }
+
+    @Test fun unauthorizedFetchSnapshotOrPositionsPausesTheEngine() = runBlocking {
+        val ended = ApiException(401, "Sign in required")
+        for (endpoint in listOf("changes", "positions", "snapshot")) {
+            api.changesError = ended.takeIf { endpoint == "changes" }
+            api.positionsError = ended.takeIf { endpoint == "positions" }
+            api.snapshotError = ended.takeIf { endpoint == "snapshot" }
+            val engine = newEngine()
+            val signedOut = async(start = CoroutineStart.UNDISPATCHED) { engine.authRequired.first() }
+            engine.start(ALICE)
+
+            if (endpoint == "snapshot") assertFailsWith<ApiException> { engine.openJob("j1") } else live.serverSends(ServerMessage.Hello(0))
+
+            withTimeout(5_000) { signedOut.await() }
+            assertFalse(live.connected.value, "$endpoint: socket closed")
+            assertEquals(SyncStatus.OFFLINE, engine.status.value, endpoint)
+            assertEquals(FlushResult.PAUSED, engine.flushOutbox(), "$endpoint: outbox paused")
+            engine.stop()
         }
     }
 

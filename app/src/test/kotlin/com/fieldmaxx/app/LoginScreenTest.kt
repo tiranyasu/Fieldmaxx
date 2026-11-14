@@ -2,6 +2,7 @@ package com.fieldmaxx.app
 
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -12,14 +13,21 @@ import androidx.navigation.NavHostController
 import androidx.navigation.compose.rememberNavController
 import androidx.test.core.app.ApplicationProvider
 import com.fieldmaxx.app.auth.LoginTags
+import com.fieldmaxx.app.data.MetaEntity
 import com.fieldmaxx.app.net.InMemoryTokenVault
+import com.fieldmaxx.app.sync.ALICE
+import com.fieldmaxx.app.sync.MetaKeys
+import com.fieldmaxx.app.sync.awaitTrue
 import com.fieldmaxx.app.ui.FieldmaxxNav
 import com.fieldmaxx.app.ui.FieldmaxxTheme
 import com.fieldmaxx.app.ui.Routes
+import com.fieldmaxx.core.FmxJson
+import com.fieldmaxx.core.model.User
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.Rule
@@ -80,5 +88,26 @@ class LoginScreenTest {
         assertEquals("/api/auth/login", request.path)
         assertEquals("""{"username":"alice","password":"right-one"}""", request.body.readUtf8())
         assertEquals(server.url("/").toString().trimEnd('/'), graph.server.get(), "the typed server address is kept")
+        runBlocking { awaitTrue("syncing started as the signed-in user") { graph.sync.savedUser()?.username == "alice" } }
+    }
+
+    @Test fun endedSessionReturnsToLogin() {
+        // Signed in at an earlier launch: the token and its user are stored, but the server has ended the session since.
+        vault.save("tok-old")
+        graph.server.set(server.url("/").toString().trimEnd('/'))
+        runBlocking { graph.db.meta().put(MetaEntity(MetaKeys.USER, FmxJson.encodeToString(User.serializer(), ALICE))) }
+        server.enqueue(MockResponse().setResponseCode(401).setBody("""{"error":"Sign in required"}"""))
+
+        compose.setContent {
+            nav = rememberNavController()
+            FieldmaxxTheme { FieldmaxxNav(graph, nav) }
+        }
+
+        // A semantics query idles the main looper, where the navigation runs.
+        compose.waitUntil(10_000) { compose.onAllNodesWithTag(LoginTags.SUBMIT).fetchSemanticsNodes().isNotEmpty() }
+        assertEquals(Routes.LOGIN, nav.currentDestination?.route)
+        assertNull(vault.load(), "the ended session's token is dropped")
+        assertNull(nav.previousBackStackEntry, "the jobs screen is gone from the back stack")
+        assertEquals("/api/ws?token=tok-old", server.takeRequest().path, "the launch started syncing as the saved user")
     }
 }

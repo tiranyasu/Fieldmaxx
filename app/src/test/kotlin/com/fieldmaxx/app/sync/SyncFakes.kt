@@ -84,6 +84,11 @@ class FakeApi : Api by unused() {
     val snapshotCalls = CopyOnWriteArrayList<String>()
     @Volatile var positionsReply: List<CrewPosition> = emptyList()
 
+    /** Set to make that endpoint fail (an ended session, say). */
+    @Volatile var changesError: Exception? = null
+    @Volatile var snapshotError: Exception? = null
+    @Volatile var positionsError: Exception? = null
+
     fun record(vararg changes: Change) = record(changes.toList())
 
     fun record(changes: List<Change>) = synchronized(log) {
@@ -93,6 +98,7 @@ class FakeApi : Api by unused() {
 
     override suspend fun changes(since: Long): Pair<List<Change>, Long> {
         sinceCalls += since
+        changesError?.let { throw it }
         return synchronized(log) {
             val page = log.filter { it.seq > since }.sortedBy { it.seq }.take(pageSize)
             page to (page.lastOrNull()?.seq ?: head)
@@ -106,10 +112,14 @@ class FakeApi : Api by unused() {
 
     override suspend fun snapshot(jobId: String): JobSnapshot {
         snapshotCalls += jobId
+        snapshotError?.let { throw it }
         return snapshots[jobId] ?: throw ApiException(404, "Job not found")
     }
 
-    override suspend fun positions(): List<CrewPosition> = positionsReply
+    override suspend fun positions(): List<CrewPosition> {
+        positionsError?.let { throw it }
+        return positionsReply
+    }
 }
 
 private fun unused(): Api = Proxy.newProxyInstance(Api::class.java.classLoader, arrayOf(Api::class.java)) { _, method, _ ->

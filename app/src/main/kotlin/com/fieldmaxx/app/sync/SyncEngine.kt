@@ -66,7 +66,7 @@ enum class FlushResult {
     /** Everything was sent. */
     EMPTY,
 
-    /** The server couldn't be reached, or answered 5xx/429: the ops are kept for later. */
+    /** The server couldn't be reached or didn't take the batch (5xx, 429, anything but 401): the ops are kept. */
     RETRY,
 
     /** The session has ended: the ops are kept until the next sign-in. */
@@ -87,16 +87,15 @@ private const val BACKOFF_FIRST_MS = 2_000L
 private const val BACKOFF_MAX_MS = 60_000L
 private const val CATCH_UP_DELAY_MS = 500L
 
-/** A whole batch the server can't read (an op kind it doesn't know, say): sent again one op at a time. */
-private val UNREADABLE_BATCH = setOf(400, 413, 422)
-
 private enum class Fetched { CAUGHT_UP, RETRY, PAUSED }
 
 /**
  * The phone's copy of the server's jobs, points and photos, kept in step both ways.
  *
- * - [enqueue] shows an op at once and queues it. The outbox goes out in order, in batches of ≤ 50; while the server can't
- *   be reached it waits 2 s, doubling to 60 s. [OutboxWorker] flushes the same outbox in the background.
+ * - [enqueue] shows an op at once and queues it. The outbox goes out in order, in batches of ≤ 50. A batch the server
+ *   doesn't take (no signal, 5xx, 429, any other failure but 401) is kept and sent again after 2 s, doubling to 60 s; an
+ *   op it answers is removed, and a refused one is reported on [rejected]. [OutboxWorker] flushes the same outbox in the
+ *   background.
  * - Server changes come over the [live] socket. On every connection the engine fetches everything after `lastSeq`, the
  *   last change applied with none missing before it, page by page until a page comes back empty.
  * - A change replaces only a row it is newer than; ops not yet sent are applied again on top.
@@ -145,7 +144,7 @@ class SyncEngine(
     private val catchUpPending = AtomicBoolean(false)
     private val staleJobs: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val busy = AtomicInteger()
-    @Volatile private var opsWaiting = false
+    @Volatile private var waiting = 0 // ops in the outbox, while a session runs
     @Volatile private var flushDelayMs = BACKOFF_FIRST_MS
     private var lastSeqRead: Long? = null // guarded by applyLock
 
@@ -209,8 +208,6 @@ class SyncEngine(
             db.outbox().insert(op.toOutbox())
             applier.applyLocally(op, userId, now())
         }
-        opsWaiting = true
-        refreshStatus()
         flushAsked.trySend(Unit)
     }
 
@@ -259,6 +256,12 @@ class SyncEngine(
         launch(start = CoroutineStart.UNDISPATCHED) { live.messages.collect { onMessage(it, user, this@coroutineScope) } }
         launch(start = CoroutineStart.UNDISPATCHED) { live.signInRequired.collect { pauseForAuth() } }
         launch(start = CoroutineStart.UNDISPATCHED) { live.connected.collect { refreshStatus() } }
+        launch {
+            db.outbox().observeCount().collect {
+                waiting = it
+                refreshStatus()
+            }
+        }
         launch { flushLoop() }
         launch { fetchLoop() }
         db.meta().put(MetaEntity(MetaKeys.USER, FmxJson.encodeToString(User.serializer(), user)))
@@ -297,7 +300,7 @@ class SyncEngine(
         synchronized(lock) {
             _status.value = when {
                 session == null || paused || !live.connected.value -> SyncStatus.OFFLINE
-                busy.get() > 0 || opsWaiting -> SyncStatus.SYNCING
+                busy.get() > 0 || waiting > 0 -> SyncStatus.SYNCING
                 else -> SyncStatus.ONLINE
             }
         }
@@ -435,7 +438,6 @@ class SyncEngine(
             if (paused) return FlushResult.PAUSED
             val batch = db.outbox().first(BATCH_SIZE)
             if (batch.isEmpty()) {
-                opsWaiting = false
                 staleJobs.toList().forEach { refetch(it) }
                 return FlushResult.EMPTY
             }
@@ -451,18 +453,9 @@ class SyncEngine(
         } catch (e: IOException) {
             return FlushResult.RETRY
         } catch (e: ApiException) {
-            return when {
-                e.status == 401 -> {
-                    pauseForAuth()
-                    FlushResult.PAUSED
-                }
-                e.status in UNREADABLE_BATCH && batch.size > 1 -> batch.firstNotNullOfOrNull { send(listOf(it)) }
-                e.status in UNREADABLE_BATCH -> {
-                    settle(batch, ops, listOf(OpResult(ops.single().opId, false, "http_${e.status}")))
-                    null
-                }
-                else -> FlushResult.RETRY // 5xx, 429 and the rest: keep them and try later
-            }
+            if (e.status != 401) return FlushResult.RETRY // 5xx, 429 and the rest: the ops answered nothing, so keep them
+            pauseForAuth()
+            return FlushResult.PAUSED
         }
         flushDelayMs = BACKOFF_FIRST_MS
         return if (settle(batch, ops, results)) null else FlushResult.RETRY
