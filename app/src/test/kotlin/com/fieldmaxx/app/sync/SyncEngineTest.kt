@@ -324,9 +324,10 @@ class SyncEngineTest {
                 graph.sync.enqueue(Op.PhotoFailed("op-1", "ph-1", "Read timed out", 1))
                 val first = queued()
                 driver.setAllConstraintsMet(first.id)
-                awaitTrue("the first flush done") { workManager.getWorkInfoById(first.id).get()?.state == WorkInfo.State.SUCCEEDED }
 
+                // KEEP lines up another flush only once the first has ended (WorkManager then prunes the finished one).
                 val second = queued(except = first.id)
+                assertEquals(1, runs.get(), "the first flush ran and ended")
                 driver.setAllConstraintsMet(second.id)
                 graph.db.outbox().observeCount().await { it == 0 }
             }
