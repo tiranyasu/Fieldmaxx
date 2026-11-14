@@ -39,6 +39,7 @@ import com.fieldmaxx.core.geo.LatLon
 import com.fieldmaxx.core.model.AppConfig
 import com.fieldmaxx.core.model.CrewPosition
 import com.fieldmaxx.core.model.Job
+import com.fieldmaxx.core.model.Op
 import com.fieldmaxx.core.model.OpResult
 import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.model.PointStatus
@@ -188,12 +189,16 @@ class FakeMapDeps : MapDeps {
     @Volatile var openJobError: Exception? = IOException("no signal")
     val opened = CopyOnWriteArrayList<String>()
     val permissionChanges = AtomicInteger()
+    val enqueued = CopyOnWriteArrayList<Op>()
 
     override fun job(jobId: String): Flow<Job?> = jobFlow
     override fun points(jobId: String): Flow<List<Point>> = pointsFlow
     override fun pendingPhotoPointIds(jobId: String): Flow<Set<String>> = pendingFlow
     override fun now(): Long = clock.value
     override suspend fun userId(): String = "u1"
+    override suspend fun enqueue(op: Op) {
+        enqueued += op
+    }
 
     override suspend fun openJob(jobId: String) {
         opened += jobId
@@ -227,7 +232,6 @@ class MapScreenTest {
     private val registry = RecordingRegistry()
     @Volatile private var gone: String? = null
     @Volatile private var selected: String? = null
-    private val adds = AtomicInteger()
     private val menus = AtomicInteger()
 
     private val pole1 = mapPoint("p1", lat = 39.6361)
@@ -249,7 +253,7 @@ class MapScreenTest {
             FieldmaxxTheme {
                 MapScreen(
                     "j1", deps, controller, onBack = {}, onJobGone = { gone = it },
-                    onAddPoint = { adds.incrementAndGet() }, onMenu = { menus.incrementAndGet() },
+                    onMenu = { menus.incrementAndGet() },
                     pointSheet = { pointId, _ -> selected = pointId },
                 )
             }
@@ -610,7 +614,7 @@ class MapScreenTest {
 
         compose.onNodeWithTag(MapTags.ADD).performClick()
         compose.onNodeWithTag(MapTags.MENU).performClick()
-        assertEquals(1, adds.get())
+        waitForTag(AddTags.CROSSHAIR) // "+" starts the add flow
         assertEquals(1, menus.get())
         assertEquals(emptyList(), map.fits)
     }

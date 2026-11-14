@@ -56,6 +56,7 @@ import com.fieldmaxx.core.geo.LatLon
 import com.fieldmaxx.core.model.AppConfig
 import com.fieldmaxx.core.model.CrewPosition
 import com.fieldmaxx.core.model.Job
+import com.fieldmaxx.core.model.Op
 import com.fieldmaxx.core.model.OpResult
 import com.fieldmaxx.core.model.Point
 import java.io.IOException
@@ -133,6 +134,9 @@ interface MapDeps {
     fun now(): Long
     suspend fun userId(): String
 
+    /** Shows [op] on the phone at once and queues it for the server; it waits there while there is no signal. */
+    suspend fun enqueue(op: Op)
+
     /** Refreshes the stored job; throws [IOException] or [ApiException]. */
     suspend fun openJob(jobId: String)
 
@@ -161,6 +165,7 @@ class GraphMapDeps(private val graph: AppGraph) : MapDeps {
     }
     override fun now(): Long = System.currentTimeMillis()
     override suspend fun userId(): String = graph.sync.savedUser()?.id.orEmpty()
+    override suspend fun enqueue(op: Op) = graph.sync.enqueue(op)
     override suspend fun openJob(jobId: String) = graph.sync.openJob(jobId)
     override fun permissionChanged() = graph.tracker.permissionChanged()
 }
@@ -176,8 +181,9 @@ class GraphMapDeps(private val graph: AppGraph) : MapDeps {
  * Opening refreshes the job in the background; without signal the stored job stays, and a job that is gone goes back
  * with [onJobGone] ("This job was deleted", R42). Refused changes show as a snackbar while the map is open.
  *
- * Hooks for later tasks (R43): [onAddPoint] is the "+" button (Task 26), [onMenu] the ☰ (Task 30), and [pointSheet]
- * shows the point a marker tap (or a search or "Left" pick) selected, with a way to close it (Task 25).
+ * "+" starts the add-point flow ([AddPointFlow]); the new point opens in [pointSheet]. [initialPointId] opens that point's
+ * sheet at once (from "Points I added"). Hooks (R43): [onMenu] is the ☰ (Task 30), and [pointSheet] shows the point a
+ * marker tap (or a search or "Left" pick) selected, with a way to close it (Task 25).
  */
 @Composable
 fun MapScreen(
@@ -187,7 +193,7 @@ fun MapScreen(
     onBack: () -> Unit,
     onJobGone: (message: String) -> Unit,
     mapView: @Composable (Modifier) -> Unit = {},
-    onAddPoint: () -> Unit = {},
+    initialPointId: String? = null,
     onMenu: () -> Unit = {},
     pointSheet: @Composable (pointId: String, close: () -> Unit) -> Unit = { _, _ -> },
 ) {
@@ -210,7 +216,8 @@ fun MapScreen(
     var labels by rememberSaveable { mutableStateOf(true) }
     var searching by rememberSaveable { mutableStateOf(false) }
     var showLeft by rememberSaveable { mutableStateOf(false) }
-    var selectedPointId by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedPointId by rememberSaveable { mutableStateOf(initialPointId) }
+    var adding by rememberSaveable { mutableStateOf(false) }
     val snackbar = remember { SnackbarHostState() }
 
     val progress = remember(points) { progress(points) }
@@ -274,8 +281,8 @@ fun MapScreen(
         )
         Column(Modifier.fillMaxWidth().align(Alignment.BottomCenter)) {
             Box(Modifier.fillMaxWidth().padding(12.dp)) {
-                FloatingActionButton(
-                    onClick = onAddPoint,
+                if (!adding) FloatingActionButton(
+                    onClick = { adding = true; selectedPointId = null },
                     containerColor = FmxColors.Accent,
                     contentColor = Color.White,
                     modifier = Modifier.align(Alignment.BottomStart).testTag(MapTags.ADD),
@@ -295,6 +302,13 @@ fun MapScreen(
         }
     }
 
+    if (adding) {
+        AddPointFlow(
+            jobId, points, controller, start = here, enqueue = deps::enqueue,
+            onAdded = { id -> adding = false; selectedPointId = id },
+            onCancel = { adding = false },
+        )
+    }
     if (searching) SearchSheet(points, onPick = { searching = false; focus(it) }, onDismiss = { searching = false })
     if (showLeft) LeftList(left, here, onPick = { showLeft = false; focus(it) }, onDismiss = { showLeft = false })
 

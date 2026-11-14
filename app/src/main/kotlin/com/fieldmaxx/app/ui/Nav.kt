@@ -25,6 +25,7 @@ import com.fieldmaxx.app.jobs.SharedIntake
 import com.fieldmaxx.app.map.GraphMapDeps
 import com.fieldmaxx.app.map.MapScreen
 import com.fieldmaxx.app.map.rememberMapLibreController
+import com.fieldmaxx.app.menu.PointsIAddedScreen
 import com.fieldmaxx.app.net.ApiException
 import com.fieldmaxx.app.point.GraphPointDeps
 import com.fieldmaxx.app.point.PointSheet
@@ -44,13 +45,17 @@ object Routes {
     const val JOB_INFO = "jobInfo/{jobId}?link={link}"
 
     /** The job's map (Task 24). */
-    const val MAP = "map/{jobId}"
+    const val MAP = "map/{jobId}?select={select}"
+
+    /** Menu → "Points I added" (Task 26); Task 30's menu links here. */
+    const val POINTS_ADDED = "pointsAdded/{jobId}"
 
     /** [files]: picked or shared files to read at once, instead of opening the picker. */
     fun newJob(files: List<Uri> = emptyList(), link: String? = null) = "newJob" + query("files" to filesArg(files), "link" to link)
     fun addFiles(jobId: String, files: List<Uri> = emptyList()) = "addFiles/${Uri.encode(jobId)}" + query("files" to filesArg(files))
     fun jobInfo(jobId: String, link: String? = null) = "jobInfo/${Uri.encode(jobId)}" + query("link" to link)
-    fun map(jobId: String) = "map/${Uri.encode(jobId)}"
+    fun map(jobId: String, select: String? = null) = "map/${Uri.encode(jobId)}" + query("select" to select)
+    fun pointsAdded(jobId: String) = "pointsAdded/${Uri.encode(jobId)}"
 
     private fun filesArg(files: List<Uri>) = files.joinToString("\n").ifEmpty { null }
 
@@ -151,12 +156,14 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
         composable(Routes.JOB_INFO, arguments = listOf(jobIdArg, optional("link"))) { entry ->
             JobInfoScreen(entry.jobId(), graph.api, graph.sync, sharedLink = entry.arguments?.getString("link"), onBack = back)
         }
-        composable(Routes.MAP, arguments = listOf(jobIdArg)) { entry ->
+        composable(Routes.MAP, arguments = listOf(jobIdArg, optional("select"))) { entry ->
             val controller = rememberMapLibreController(graph.compass.heading)
             val pointDeps = remember(graph) { GraphPointDeps(graph) }
             MapScreen(
                 entry.jobId(), remember(graph) { GraphMapDeps(graph) }, controller, mapView = { controller.View(it) },
                 onBack = back,
+                initialPointId = entry.arguments?.getString("select"),
+                onMenu = { navController.navigate(Routes.pointsAdded(entry.jobId())) }, // until Task 30's menu: its one entry
                 onJobGone = { message ->
                     jobsNotice = message
                     if (!navController.popBackStack(Routes.JOBS, inclusive = false)) {
@@ -164,6 +171,14 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
                     }
                 },
                 pointSheet = { pointId, close -> PointSheet(entry.jobId(), pointId, pointDeps, controller, onClose = close) },
+            )
+        }
+        composable(Routes.POINTS_ADDED, arguments = listOf(jobIdArg)) { entry ->
+            val jobId = entry.jobId()
+            PointsIAddedScreen(
+                remember(graph, jobId) { graph.sync.points(jobId) }, { graph.sync.savedUser()?.id.orEmpty() },
+                onOpen = { pointId -> navController.navigate(Routes.map(jobId, pointId)) { popUpTo(Routes.MAP) { inclusive = true } } },
+                onBack = back,
             )
         }
     }
