@@ -9,6 +9,8 @@ import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.testing.SynchronousExecutor
 import androidx.work.testing.WorkManagerTestInitHelper
+import coil3.SingletonImageLoader
+import coil3.annotation.DelicateCoilApi
 import com.fieldmaxx.app.AppGraph
 import com.fieldmaxx.app.FieldmaxxApp
 import com.fieldmaxx.app.data.AppDatabase
@@ -40,6 +42,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -541,6 +544,42 @@ class SyncEngineTest {
             assertEquals(SyncStatus.OFFLINE, engine.status.value, endpoint)
             assertEquals(FlushResult.PAUSED, engine.flushOutbox(), "$endpoint: outbox paused")
             engine.stop()
+        }
+    }
+
+    @Test fun startAndStopAreIdempotentAndStopKeepsEverything() = runBlocking<Unit> {
+        api.opsReply = { throw IOException("no signal") }
+        val engine = newEngine()
+        engine.openSeededJob()
+        engine.start(ALICE)
+        engine.start(ALICE)
+        live.connects.await { it > 0 }
+        engine.enqueue(Op.PointUpdate("op-1", "p1", comment = "kept"))
+        assertEquals(1, live.connects.value, "started once")
+
+        engine.stop()
+        engine.stop()
+
+        assertFalse(live.connected.value)
+        assertEquals(SyncStatus.OFFLINE, engine.status.value)
+        assertEquals(listOf("op-1"), outboxIds(), "the outbox stays")
+        assertEquals(listOf("p1", "p2"), engine.points("j1").first().map { it.id }, "and so does everything stored")
+        assertEquals("kept", engine.points("j1").first().first().comment)
+        engine.start(ALICE)
+        live.connects.await { it == 2 } // started again after a stop
+    }
+
+    @OptIn(DelicateCoilApi::class)
+    @Test fun appImageLoaderIsTheGraphs() {
+        val app = context as FieldmaxxApp
+        val graph = AppGraph(app, InMemoryTokenVault("tok-i")).also { app.graph = it }
+        SingletonImageLoader.reset() // the singleton outlives a test's application
+        try {
+            assertSame(graph.imageLoader, SingletonImageLoader.get(app), "screens load images through the signed-in client")
+            assertNotNull(graph.imageLoader.diskCache, "reference images stay on disk for work without signal")
+        } finally {
+            SingletonImageLoader.reset()
+            graph.close()
         }
     }
 
