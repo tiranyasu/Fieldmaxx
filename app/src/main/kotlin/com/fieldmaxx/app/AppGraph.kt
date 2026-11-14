@@ -1,7 +1,9 @@
 package com.fieldmaxx.app
 
 import android.content.Context
+import android.os.SystemClock
 import androidx.annotation.VisibleForTesting
+import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import coil3.ImageLoader
@@ -10,7 +12,6 @@ import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import coil3.request.CachePolicy
 import coil3.request.ImageRequest
 import com.fieldmaxx.app.data.AppDatabase
-import androidx.lifecycle.ProcessLifecycleOwner
 import com.fieldmaxx.app.net.AndroidKeystoreTokenVault
 import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.AuthInterceptor
@@ -68,14 +69,15 @@ class AppGraph(context: Context, val vault: TokenVault = AndroidKeystoreTokenVau
 
     /** The map and the camera stamp read these; they only produce values while the app is on screen. */
     val location: LocationSource by lazy { FusedLocationSource(app) }
-    val compass: CompassSource by lazy { SensorCompassSource(app) }
+    val compass: CompassSource by lazy { SensorCompassSource(app, fix = { location.fixes.value }) }
 
     /**
-     * Starts and stops location and compass with the process lifecycle and shares the position over [live]. Must be touched
-     * once at startup ([MainActivity] does) or nothing observes the lifecycle.
+     * Starts and stops location and compass with the process lifecycle and shares the position over [live].
+     * [FieldmaxxApp] builds it at startup on the main thread, or nothing would observe the lifecycle. Its clock is elapsed
+     * time, so a wall-clock correction can't stall the 15 s heartbeat.
      */
     val tracker: ForegroundTracker by lazy {
-        ForegroundTracker(ProcessLifecycleOwner.get().lifecycle, location, compass, live, System::currentTimeMillis, scope)
+        ForegroundTracker(ProcessLifecycleOwner.get().lifecycle, location, compass, live, SystemClock::elapsedRealtime, scope)
     }
 
     val sync: SyncEngine by lazy {

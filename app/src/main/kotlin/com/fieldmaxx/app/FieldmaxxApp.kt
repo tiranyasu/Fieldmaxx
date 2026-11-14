@@ -19,6 +19,11 @@ class FieldmaxxApp : Application(), SingletonImageLoader.Factory {
             built = value
         }
 
+    override fun onCreate() {
+        super.onCreate()
+        graph.tracker // starts watching the process lifecycle: location and compass run only while the app is on screen
+    }
+
     /** Coil's singleton loader is the graph's: signed-in requests and the reference-image disk cache. */
     override fun newImageLoader(context: PlatformContext): ImageLoader = graph.imageLoader
 }

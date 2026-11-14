@@ -6,6 +6,7 @@ import androidx.lifecycle.testing.TestLifecycleOwner
 import com.fieldmaxx.app.sync.LiveSocket
 import com.fieldmaxx.core.model.ClientMessage
 import com.fieldmaxx.core.model.ServerMessage
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
@@ -40,6 +41,7 @@ private class FakeLocation : LocationSource {
 
 private class FakeCompass : CompassSource {
     override val heading: StateFlow<Heading?> = MutableStateFlow(null)
+    override val cameraHeading: StateFlow<Heading?> = MutableStateFlow(null)
     var running = false
     override fun start() { running = true }
     override fun stop() { running = false }
@@ -109,35 +111,92 @@ class PlatformTest {
 
     private fun v(e: Double, n: Double, u: Double) = doubleArrayOf(e, n, u)
 
+    private val s45 = sin(Math.PI / 4)
+
+    /** Compass degrees wrap: 359.99 is 0. */
+    private fun assertDeg(expected: Double, actual: Double) {
+        val d = abs(((actual - expected) % 360.0 + 540.0) % 360.0 - 180.0)
+        assertTrue(d < 1.0, "expected $expected but was $actual")
+    }
+
+    // --- heading: the top of the screen (the map) ---
+
     @Test fun azimuthNorthPortrait() {
         // Flat, screen to the sky, top pointing north.
-        assertEquals(0.0, azimuthFromRotationVector(rotationVector(v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), v(0.0, 0.0, 1.0)), Surface.ROTATION_0), 1.0)
+        assertDeg(0.0, azimuthFromRotationVector(rotationVector(v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), v(0.0, 0.0, 1.0)), Surface.ROTATION_0))
         // Flat, top pointing east (x then points south).
-        assertEquals(90.0, azimuthFromRotationVector(rotationVector(v(0.0, -1.0, 0.0), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0)), Surface.ROTATION_0), 1.0)
+        assertDeg(90.0, azimuthFromRotationVector(rotationVector(v(0.0, -1.0, 0.0), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0)), Surface.ROTATION_0))
     }
 
     @Test fun azimuthRemappedForLandscape() {
-        // Flat in ROTATION_90: the screen's top is the device's +x axis, pointing north (y then points west).
-        assertEquals(0.0, azimuthFromRotationVector(rotationVector(v(0.0, 1.0, 0.0), v(-1.0, 0.0, 0.0), v(0.0, 0.0, 1.0)), Surface.ROTATION_90), 1.0)
+        // Flat; the screen's top is the device's +x in ROTATION_90, -y in ROTATION_180 and -x in ROTATION_270. Each pose
+        // turns that axis to north.
+        assertDeg(0.0, azimuthFromRotationVector(rotationVector(v(0.0, 1.0, 0.0), v(-1.0, 0.0, 0.0), v(0.0, 0.0, 1.0)), Surface.ROTATION_90))
+        assertDeg(0.0, azimuthFromRotationVector(rotationVector(v(-1.0, 0.0, 0.0), v(0.0, -1.0, 0.0), v(0.0, 0.0, 1.0)), Surface.ROTATION_180))
+        assertDeg(0.0, azimuthFromRotationVector(rotationVector(v(0.0, -1.0, 0.0), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0)), Surface.ROTATION_270))
     }
 
-    @Test fun azimuthUprightPortraitFollowsTheCamera() {
-        // Upright, screen facing the user who stands north of it: the back camera faces south.
-        val pose = rotationVector(v(-1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), v(0.0, 1.0, 0.0))
-        assertEquals(180.0, azimuthFromRotationVector(pose, Surface.ROTATION_0), 1.0)
+    // --- cameraHeading: where the back camera (-z) points (stamp, EXIF) ---
+
+    private val uprightCameraSouth = rotationVector(v(-1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), v(0.0, 1.0, 0.0))
+
+    @Test fun cameraUprightPortraitSouth() {
+        val r = cameraAzimuth(uprightCameraSouth, Surface.ROTATION_0, previouslyFallback = false)
+        assertDeg(180.0, r.deg)
+        assertFalse(r.fallback)
     }
 
-    @Test fun azimuthUprightTippedPastVerticalStillFollowsTheCamera() {
-        // The same pose with the top tipped 10 degrees toward the user: the screen-up rule would now say north.
+    @Test fun cameraTippedPastVerticalStillSouth() {
         val tilt = Math.toRadians(10.0)
         val pose = rotationVector(v(-1.0, 0.0, 0.0), v(0.0, sin(tilt), cos(tilt)), v(0.0, cos(tilt), -sin(tilt)))
-        assertEquals(180.0, azimuthFromRotationVector(pose, Surface.ROTATION_0), 1.0)
+        assertDeg(180.0, cameraAzimuth(pose, Surface.ROTATION_0, false).deg)
     }
 
-    @Test fun azimuthUprightLandscapeFollowsTheCamera() {
-        // Upright landscape (ROTATION_90: the device's +x is up), screen facing east, so the camera faces west.
+    @Test fun cameraUprightLandscapeWest() {
+        // Upright landscape: the device's +x is up, the screen faces east, so the camera faces west.
         val pose = rotationVector(v(0.0, 0.0, 1.0), v(0.0, -1.0, 0.0), v(1.0, 0.0, 0.0))
-        assertEquals(270.0, azimuthFromRotationVector(pose, Surface.ROTATION_90), 1.0)
+        assertDeg(270.0, cameraAzimuth(pose, Surface.ROTATION_90, false).deg)
+        // Auto-rotate locked: the display stays ROTATION_0 and the camera still faces west.
+        assertDeg(270.0, cameraAzimuth(pose, Surface.ROTATION_0, false).deg)
+    }
+
+    @Test fun cameraFortyFiveDownAndRolledKeepsItsOwnDirection() {
+        // Camera 45 degrees down toward the south (screen normal back toward the user and up), then rolled 20 degrees
+        // about the camera axis: the camera's horizontal direction is still south, the screen's top is not.
+        val c = s45
+        val x = v(-1.0, 0.0, 0.0)
+        val y = v(0.0, -c, c)
+        val z = v(0.0, c, c)
+        val roll = Math.toRadians(20.0)
+        val xr = v(x[0] * cos(roll) + y[0] * sin(roll), x[1] * cos(roll) + y[1] * sin(roll), x[2] * cos(roll) + y[2] * sin(roll))
+        val yr = v(-x[0] * sin(roll) + y[0] * cos(roll), -x[1] * sin(roll) + y[1] * cos(roll), -x[2] * sin(roll) + y[2] * cos(roll))
+        val pose = rotationVector(xr, yr, z)
+        assertDeg(180.0, cameraAzimuth(pose, Surface.ROTATION_0, false).deg)
+    }
+
+    @Test fun cameraStraightDownFallsBackToTheScreenTop() {
+        // Flat, screen to the sky, top pointing east: the camera points at the ground.
+        val pose = rotationVector(v(0.0, -1.0, 0.0), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0))
+        val r = cameraAzimuth(pose, Surface.ROTATION_0, previouslyFallback = false)
+        assertDeg(90.0, r.deg)
+        assertTrue(r.fallback)
+    }
+
+    @Test fun cameraHysteresisBetween15And25Degrees() {
+        // Camera 20 degrees off straight down, pointing south; the screen's top points north.
+        val a = Math.toRadians(20.0)
+        val pose = rotationVector(v(1.0, 0.0, 0.0), v(0.0, cos(a), -sin(a)), v(0.0, sin(a), cos(a)))
+        val fromCamera = cameraAzimuth(pose, Surface.ROTATION_0, previouslyFallback = false)
+        assertDeg(180.0, fromCamera.deg)
+        assertFalse(fromCamera.fallback)
+        val fromFallback = cameraAzimuth(pose, Surface.ROTATION_0, previouslyFallback = true)
+        assertDeg(0.0, fromFallback.deg)
+        assertTrue(fromFallback.fallback)
+        // 10 degrees off straight down falls back whatever came before; 30 degrees leaves fallback.
+        val near = Math.toRadians(10.0)
+        assertTrue(cameraAzimuth(rotationVector(v(1.0, 0.0, 0.0), v(0.0, cos(near), -sin(near)), v(0.0, sin(near), cos(near))), Surface.ROTATION_0, false).fallback)
+        val far = Math.toRadians(30.0)
+        assertFalse(cameraAzimuth(rotationVector(v(1.0, 0.0, 0.0), v(0.0, cos(far), -sin(far)), v(0.0, sin(far), cos(far))), Surface.ROTATION_0, true).fallback)
     }
 
     // --- lifecycle ---
@@ -179,6 +238,9 @@ class PlatformTest {
         location.emit(northOf(a, 9.0))
         assertEquals(2, positions().size)
         assertEquals(ClientMessage.PositionUpdate(northOf(a, 9.0).lat, a.lon, 4.0, 1350.0), positions().last())
+        clock += 15_000 // same spot, 15 s after the last send: the heartbeat goes out
+        location.emit(northOf(a, 9.0).copy(at = 5))
+        assertEquals(3, positions().size)
     }
 
     // --- R28 ---
