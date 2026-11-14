@@ -20,6 +20,8 @@ import coil3.request.ImageRequest
 import com.fieldmaxx.app.data.AppDatabase
 import com.fieldmaxx.app.jobs.JobList
 import com.fieldmaxx.app.map.DataStoreViewMemory
+import com.fieldmaxx.app.map.HouseNumberLoader
+import com.fieldmaxx.app.map.HouseNumberSetting
 import com.fieldmaxx.app.map.ViewMemory
 import com.fieldmaxx.app.menu.StuckPhotos
 import com.fieldmaxx.app.net.AndroidKeystoreTokenVault
@@ -80,6 +82,15 @@ class AppGraph(context: Context, val vault: TokenVault = AndroidKeystoreTokenVau
 
     /** OneDrive's client: the same connections and threads, without the session interceptor (the token is our server's alone). */
     private val oneDriveHttp: OkHttpClient by lazy { http.newBuilder().apply { interceptors().clear() }.build() }
+
+    /** Overpass's client: the same connections and threads, without the session interceptor (R74: nothing of ours goes to a third party). */
+    private val overpassHttp: OkHttpClient by lazy { http.newBuilder().apply { interceptors().clear() }.build() }
+
+    /** OpenStreetMap address numbers for the map's "123" overlay; only a bounding-box query is ever sent. */
+    val houseNumbers: HouseNumberLoader by lazy { HouseNumberLoader(overpassHttp, "Fieldmaxx/${BuildConfig.VERSION_NAME} (Android)") }
+
+    /** Whether the "123" overlay is on (R75). */
+    val houseNumberSetting: HouseNumberSetting by lazy { HouseNumberSetting(dataStore("house_numbers")) }
 
     /** Lives as long as the process: the sync engine and the outbox watch run here. */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)

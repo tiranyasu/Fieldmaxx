@@ -186,6 +186,10 @@ class FakeMapDeps : MapDeps {
     override val config = MutableStateFlow(DEFAULT_CONFIG)
     override val views = FakeViewMemory()
     override val clock = MutableStateFlow(NOW)
+    val houseOn = MutableStateFlow(false)
+    override val houseNumbersOn: Flow<Boolean> = houseOn
+    val houseRequests = CopyOnWriteArrayList<BBox>()
+    @Volatile var houseAnswer: () -> List<HouseNumber> = { emptyList() }
     @Volatile var openJobError: Exception? = IOException("no signal")
     val opened = CopyOnWriteArrayList<String>()
     val permissionChanges = AtomicInteger()
@@ -197,6 +201,14 @@ class FakeMapDeps : MapDeps {
     override fun pendingPhotoPointIds(jobId: String): Flow<Set<String>> = pendingFlow
     override fun now(): Long = clock.value
     override suspend fun userId(): String = "u1"
+    override suspend fun setHouseNumbersOn(on: Boolean) {
+        houseOn.value = on
+    }
+
+    override suspend fun houseNumbers(box: BBox): List<HouseNumber> {
+        houseRequests += box
+        return houseAnswer()
+    }
     override suspend fun enqueue(op: Op) {
         enqueueError?.let { throw it }
         enqueued += op
@@ -289,7 +301,7 @@ class MapScreenTest {
         assertEquals(listOf("j1"), deps.opened, "the job is refreshed in the background")
         assertNull(gone, "no signal: the stored job stays on screen")
         assertEquals(DEFAULT_CONFIG, map.shownConfig, "imagery works before the server's settings ever arrived")
-        assertEquals(emptyList(), map.shownHouseNumbers)
+        assertEquals(emptyList(), map.shownHouseNumbers, "off by default")
         assertEquals(true, map.labels)
     }
 
@@ -619,6 +631,79 @@ class MapScreenTest {
         waitForTag(AddTags.CROSSHAIR) // "+" starts the add flow
         assertEquals(1, menus.get())
         assertEquals(emptyList(), map.fits)
+    }
+
+    private val sixHouses = listOf(HouseNumber(39.6400, -119.6900, "12"), HouseNumber(39.6401, -119.6901, "14"))
+
+    @Test fun houseNumbersAreOffByDefaultAndAskNothingOfOverpass() {
+        deps.views.views["u1" to "j1"] = CameraView(39.6400, -119.6900, 18.0)
+        deps.houseAnswer = { sixHouses }
+        show()
+        waitFor { map.moves.isNotEmpty() }
+        waitForTag(MapTags.HOUSES)
+        Thread.sleep(HOUSE_NUMBER_DEBOUNCE_MS + 300)
+        compose.waitForIdle()
+
+        assertTrue(deps.houseRequests.isEmpty(), "off: no request goes out")
+        assertEquals(emptyList(), map.shownHouseNumbers)
+        assertFalse(deps.houseOn.value)
+    }
+
+    @Test fun the123ButtonTurnsHouseNumbersOnAndOffAndRemembersIt() {
+        deps.views.views["u1" to "j1"] = CameraView(39.6400, -119.6900, 18.0)
+        deps.houseAnswer = { sixHouses }
+        show()
+        waitFor { map.moves.isNotEmpty() }
+        map.settle()
+
+        compose.onNodeWithTag(MapTags.HOUSES).performClick()
+        waitFor { deps.houseOn.value }
+        waitFor { map.shownHouseNumbers == sixHouses }
+        assertEquals(1, deps.houseRequests.size, "asked once, for the box around the view")
+        val box = deps.houseRequests[0]
+        assertTrue(box.s < 39.6400 && 39.6400 < box.n && box.w < -119.6900 && -119.6900 < box.e)
+
+        compose.onNodeWithTag(MapTags.HOUSES).performClick()
+        waitFor { !deps.houseOn.value }
+        waitFor { map.shownHouseNumbers == emptyList<HouseNumber>() }
+    }
+
+    @Test fun houseNumbersClearBelowZoom17AndComeBackAtZoom17() {
+        deps.houseOn.value = true
+        deps.views.views["u1" to "j1"] = CameraView(39.6400, -119.6900, 18.0)
+        deps.houseAnswer = { sixHouses }
+        show()
+        waitFor { map.moves.isNotEmpty() }
+        map.settle()
+        waitFor { map.shownHouseNumbers == sixHouses }
+
+        map.userMoves(CameraView(39.6400, -119.6900, 16.9))
+        map.rest()
+        waitFor { map.shownHouseNumbers == emptyList<HouseNumber>() }
+        val asked = deps.houseRequests.size
+
+        map.userMoves(CameraView(39.6400, -119.6900, 17.0))
+        map.rest()
+        waitFor { deps.houseRequests.size > asked }
+        waitFor { map.shownHouseNumbers == sixHouses }
+    }
+
+    @Test fun failedHouseNumberRequestKeepsTheLabelsDrawn() {
+        deps.houseOn.value = true
+        deps.views.views["u1" to "j1"] = CameraView(39.6400, -119.6900, 18.0)
+        deps.houseAnswer = { sixHouses }
+        show()
+        waitFor { map.moves.isNotEmpty() }
+        map.settle()
+        waitFor { map.shownHouseNumbers == sixHouses }
+
+        deps.houseAnswer = { throw IOException("Overpass busy (429)") }
+        map.userMoves(CameraView(39.6410, -119.6910, 18.0))
+        map.rest()
+        waitFor { deps.houseRequests.size == 2 }
+        Thread.sleep(300)
+        compose.waitForIdle()
+        assertEquals(sixHouses, map.shownHouseNumbers, "no signal or a refusal: the overlay stays as it was")
     }
 
     @Test fun waitingPhotoQueries() {

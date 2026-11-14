@@ -30,6 +30,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -39,6 +40,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.vector.addPathNodes
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
@@ -79,6 +81,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /** "Center on me" goes at least this close; a search or "Left" pick at least [POINT_ZOOM]. */
@@ -101,6 +104,7 @@ object MapTags {
     const val LOCATION_OFF = "map.locationOff"
     const val CENTER_ON_ME = "map.centerOnMe"
     const val LABELS = "map.labels"
+    const val HOUSES = "map.houseNumbers"
     const val ZOOM_IN = "map.zoomIn"
     const val ZOOM_OUT = "map.zoomOut"
     const val ADD = "map.add"
@@ -134,6 +138,13 @@ interface MapDeps {
     val clock: Flow<Long>
     fun now(): Long
     suspend fun userId(): String
+
+    /** Whether the house-number overlay is on: off until the tech turns it on, then remembered (R75). */
+    val houseNumbersOn: Flow<Boolean>
+    suspend fun setHouseNumbersOn(on: Boolean)
+
+    /** The address numbers inside [box]; throws [IOException] with no signal or while Overpass asks for patience (R74). */
+    suspend fun houseNumbers(box: BBox): List<HouseNumber>
 
     /** Shows [op] on the phone at once and queues it for the server; it waits there while there is no signal. */
     suspend fun enqueue(op: Op)
@@ -170,6 +181,9 @@ class GraphMapDeps(private val graph: AppGraph) : MapDeps {
     }
     override fun now(): Long = System.currentTimeMillis()
     override suspend fun userId(): String = graph.sync.savedUser()?.id.orEmpty()
+    override val houseNumbersOn: Flow<Boolean> get() = graph.houseNumberSetting.on
+    override suspend fun setHouseNumbersOn(on: Boolean) = graph.houseNumberSetting.set(on)
+    override suspend fun houseNumbers(box: BBox): List<HouseNumber> = graph.houseNumbers.load(box)
     override suspend fun enqueue(op: Op) = graph.sync.enqueue(op)
     override suspend fun openJob(jobId: String) = graph.sync.openJob(jobId)
     override fun permissionChanged() = graph.tracker.permissionChanged()
@@ -221,6 +235,8 @@ fun MapScreen(
     var typeFilter by rememberSaveable { mutableStateOf<String?>(null) }
     var hideShot by rememberSaveable { mutableStateOf(false) }
     var labels by rememberSaveable { mutableStateOf(true) }
+    val houses by remember(deps) { deps.houseNumbersOn }.collectAsState(false, main)
+    val scope = rememberCoroutineScope()
     var searching by rememberSaveable { mutableStateOf(false) }
     var showLeft by rememberSaveable { mutableStateOf(false) }
     var selectedPointId by rememberSaveable { mutableStateOf(initialPointId) }
@@ -242,7 +258,10 @@ fun MapScreen(
     LaunchedEffect(controller, crew, now) { controller.setCrew(crew, now) }
     LaunchedEffect(controller, me) { controller.setMyFix(me) }
     LaunchedEffect(controller, labels) { controller.setLabelsVisible(labels) }
-    LaunchedEffect(controller) { controller.setHouseNumbers(emptyList()) } // the house-number overlay comes with Task 31
+    val screen = LocalConfiguration.current
+    LaunchedEffect(controller, deps, houses, screen.screenWidthDp, screen.screenHeightDp) {
+        withContext(main) { runHouseNumbers(houses, controller, deps::houseNumbers, screen.screenWidthDp, screen.screenHeightDp) }
+    }
     val addingNow by rememberUpdatedState(adding)
     LaunchedEffect(controller) { controller.pointTaps.collect { if (!addingNow) selectedPointId = it } }
     LaunchedEffect(controller, deps, jobId) { withContext(main) { placeCamera(jobId, deps, controller) } }
@@ -283,6 +302,8 @@ fun MapScreen(
         MapButtons(
             labels = labels,
             onLabels = { labels = !labels },
+            houses = houses,
+            onHouses = { scope.launch { deps.setHouseNumbersOn(!houses) } },
             onZoomIn = { zoomBy(1.0) },
             onZoomOut = { zoomBy(-1.0) },
             onCenter = me?.let { f -> { controller.moveTo(CameraView(f.lat, f.lon, zoomed(ME_ZOOM))) } },
@@ -355,6 +376,40 @@ private suspend fun placeCamera(jobId: String, deps: MapDeps, controller: MapCon
 }
 
 /**
+ * The house-number overlay (R74, R75). Off: nothing drawn. On: once the camera has rested [HOUSE_NUMBER_DEBOUNCE_MS]
+ * at zoom [HOUSE_NUMBER_MIN_ZOOM] or closer, the numbers of the screen's box are drawn; below that zoom they clear at
+ * once. A failed or refused request leaves what was drawn as it is (no signal, or Overpass asking for patience).
+ */
+private suspend fun runHouseNumbers(
+    on: Boolean,
+    controller: MapController,
+    load: suspend (BBox) -> List<HouseNumber>,
+    widthDp: Int,
+    heightDp: Int,
+) {
+    if (!on) {
+        controller.setHouseNumbers(emptyList()) // called on the main thread
+        return
+    }
+    // Waiting and asking happen off the main thread; the map is only touched on it.
+    withContext(Dispatchers.Default) {
+        controller.camera.filterNotNull().collectLatest { view ->
+            if (view.zoom < HOUSE_NUMBER_MIN_ZOOM) {
+                withContext(Dispatchers.Main.immediate) { controller.setHouseNumbers(emptyList()) }
+            } else {
+                delay(HOUSE_NUMBER_DEBOUNCE_MS)
+                try {
+                    val numbers = load(viewBBox(view, widthDp, heightDp))
+                    withContext(Dispatchers.Main.immediate) { controller.setHouseNumbers(numbers) }
+                } catch (e: IOException) {
+                    // The labels stay as they were.
+                }
+            }
+        }
+    }
+}
+
+/**
  * R41: only while-in-use location, asked each time the map opens without it (not again on a rotation). The answer
  * restarts location; refused, the map works without the blue dot. A change in the system settings shows on return.
  */
@@ -389,6 +444,8 @@ private fun hasLocationPermission(context: Context) =
 private fun MapButtons(
     labels: Boolean,
     onLabels: () -> Unit,
+    houses: Boolean,
+    onHouses: () -> Unit,
     onZoomIn: () -> Unit,
     onZoomOut: () -> Unit,
     onCenter: (() -> Unit)?,
@@ -397,6 +454,9 @@ private fun MapButtons(
     Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
         MapButton(onLabels, if (labels) "Hide street names" else "Show street names", selected = labels, modifier = Modifier.testTag(MapTags.LABELS)) {
             Text("Aa", fontWeight = FontWeight.Bold)
+        }
+        MapButton(onHouses, if (houses) "Hide house numbers" else "Show house numbers", selected = houses, modifier = Modifier.testTag(MapTags.HOUSES)) {
+            Text("123", fontWeight = FontWeight.Bold)
         }
         MapButton(onZoomIn, "Zoom in", modifier = Modifier.testTag(MapTags.ZOOM_IN)) { Text("+", style = MaterialTheme.typography.titleLarge) }
         MapButton(onZoomOut, "Zoom out", modifier = Modifier.testTag(MapTags.ZOOM_OUT)) { Text("−", style = MaterialTheme.typography.titleLarge) }
