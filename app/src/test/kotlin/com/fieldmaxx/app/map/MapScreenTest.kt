@@ -54,6 +54,7 @@ import kotlin.test.assertTrue
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -68,8 +69,15 @@ private const val FINE = Manifest.permission.ACCESS_FINE_LOCATION
 private const val COARSE = Manifest.permission.ACCESS_COARSE_LOCATION
 private const val BACKGROUND = "android.permission.ACCESS_BACKGROUND_LOCATION"
 
-/** The map as the screen drives it: every call is recorded; the camera settles wherever it was sent, as MapLibre's does. */
+/**
+ * The map as the screen drives it. Every call is recorded, and [camera] is reported by the adapter's own
+ * [CameraTracker], fed the way MapLibre feeds it: a move takes a while and only [settle]s when the test says so, and
+ * the tech's own drags and flings ([userMoves]) move the map, which may still be gliding until it [rest]s.
+ */
 class FakeMapController : MapController {
+    private val tracker = CameraTracker()
+    private val inFlight = CopyOnWriteArrayList<CameraView>()
+    @Volatile private var position: CameraView? = null
     val moves = CopyOnWriteArrayList<CameraView>()
     val fits = CopyOnWriteArrayList<List<Point>>()
     @Volatile var shown: List<Point> = emptyList()
@@ -79,7 +87,7 @@ class FakeMapController : MapController {
     @Volatile var shownConfig: AppConfig? = null
     @Volatile var labels: Boolean? = null
     @Volatile var shownHouseNumbers: List<HouseNumber>? = null
-    override val camera = MutableStateFlow<CameraView?>(null)
+    override val camera: StateFlow<CameraView?> = tracker.camera
     override val pointTaps = MutableSharedFlow<String>(extraBufferCapacity = 8)
 
     override fun setConfig(c: AppConfig) {
@@ -101,12 +109,42 @@ class FakeMapController : MapController {
 
     override fun moveTo(v: CameraView) {
         moves += v
-        camera.value = v
+        go(v)
     }
 
     override fun fitAll(points: List<Point>) {
         fits += points
-        camera.value = CameraView(points.map { it.lat }.average(), points.map { it.lon }.average(), 16.0)
+        go(CameraView(points.map { it.lat }.average(), points.map { it.lon }.average(), 16.0))
+    }
+
+    private fun go(destination: CameraView) {
+        inFlight += destination
+        tracker.asked(destination)
+        tracker.applied()
+    }
+
+    /** The map finishes the moves asked so far, as MapLibre's animations do a few hundred milliseconds later. */
+    fun settle() {
+        for (d in inFlight) tracker.ended(d, d)
+        inFlight.lastOrNull()?.let {
+            position = it
+            tracker.settled(it)
+        }
+        inFlight.clear()
+    }
+
+    /** The tech drags, flings or pinches the map through [path]; after a fling it may still be gliding. */
+    fun userMoves(vararg path: CameraView) {
+        tracker.gestureStarted()
+        for (p in path) {
+            position = p
+            tracker.moved(p)
+        }
+    }
+
+    /** The map comes to rest after the tech's gesture. */
+    fun rest() {
+        position?.let(tracker::settled)
     }
 
     override fun setLabelsVisible(v: Boolean) {
@@ -258,6 +296,7 @@ class MapScreenTest {
         waitFor { map.fits.isNotEmpty() }
         assertEquals(listOf(job), map.fits)
         assertEquals(emptyList(), map.moves)
+        map.settle()
         waitFor { deps.views.views["u1" to "j1"] != null }
         assertEquals(map.camera.value, deps.views.views["u1" to "j1"], "the fitted view is the one the next open restores")
 
@@ -271,10 +310,13 @@ class MapScreenTest {
         deps.views.views["u1" to "j1"] = saved
         show()
         waitFor { map.moves.isNotEmpty() }
+        map.settle()
 
-        map.camera.value = CameraView(39.7000, -119.8000, 16.0) // the tech pans and zooms out
+        map.userMoves(CameraView(39.6900, -119.7900, 16.5), CameraView(39.7000, -119.8000, 16.0)) // the tech pans and zooms out
+        map.rest()
         waitFor { deps.views.views["u1" to "j1"] == CameraView(39.7000, -119.8000, 16.0) }
-        map.camera.value = CameraView(39.7100, -119.8100, 18.0)
+        map.userMoves(CameraView(39.7100, -119.8100, 18.0))
+        map.rest()
         waitFor { deps.views.views["u1" to "j1"] == CameraView(39.7100, -119.8100, 18.0) }
 
         assertEquals(listOf(saved), map.moves, "saving never moves the map")
@@ -282,11 +324,13 @@ class MapScreenTest {
     }
 
     @Test fun pointsUpdateDoesNotMoveCamera() {
+        grantLocation()
         val saved = CameraView(39.6400, -119.6900, 17.5)
         deps.views.views["u1" to "j1"] = saved
         deps.pointsFlow.value = job
         show()
         waitFor { map.moves.size == 1 && map.shown.size == job.size }
+        map.settle()
 
         // After open: a sync update, a new point, a closed point, a re-snapshot, crew and GPS updates, the pill, the config.
         deps.pointsFlow.value = job + mapPoint("p4", lat = 39.70)
@@ -301,7 +345,11 @@ class MapScreenTest {
         waitFor { map.pending == setOf("p1") }
         deps.crew.value = listOf(CrewPosition("u2", "Bob Tech", 39.64, -119.69, 5.0, NOW - 60_000, paused = false))
         waitFor { map.crew.isNotEmpty() }
-        deps.fixes.value = Fix(39.6, -119.7, 4.0, null, NOW)
+        val fix = Fix(39.6, -119.7, 4.0, null, NOW)
+        deps.fixes.value = fix
+        waitFor { map.fix == fix } // the blue dot moves; the camera doesn't
+        deps.fixes.value = fix.copy(lat = 39.61, at = NOW + 2_000)
+        waitFor { map.fix?.lat == 39.61 }
         deps.status.value = SyncStatus.ONLINE
         deps.config.value = DEFAULT_CONFIG.copy(imageryKey = "k2")
         waitFor { map.shownConfig?.imageryKey == "k2" }
@@ -318,9 +366,11 @@ class MapScreenTest {
         var generation by mutableStateOf(0)
         compose.setContent { key(generation) { Screen(maps[generation]) } }
         waitFor { map.fits.size == 1 }
+        map.settle()
 
         val panned = CameraView(39.7000, -119.8000, 16.0)
-        map.camera.value = panned
+        map.userMoves(panned)
+        map.rest()
         waitFor { deps.views.views["u1" to "j1"] == panned }
 
         // A rotation, or coming back from another screen: a new screen with a new map.
@@ -329,6 +379,90 @@ class MapScreenTest {
         waitFor { maps[1].moves.isNotEmpty() }
         assertEquals(listOf(panned), maps[1].moves, "back where the tech left it")
         assertEquals(emptyList(), maps[1].fits)
+    }
+
+    @Test fun zoomTapDuringAGlideKeepsTheGlidesCentre() {
+        deps.views.views["u1" to "j1"] = CameraView(39.6400, -119.6900, 15.0)
+        show()
+        waitFor { map.moves.size == 1 }
+        map.settle()
+
+        // A fling: the map glides on after the finger lifts, and the tech taps + before it comes to rest.
+        val gliding = CameraView(39.6550, -119.7050, 15.0)
+        map.userMoves(CameraView(39.6500, -119.7000, 15.0), gliding)
+        compose.onNodeWithTag(MapTags.ZOOM_IN).performClick()
+
+        waitFor { map.moves.size == 2 }
+        assertEquals(gliding.copy(zoom = 16.0), map.moves[1], "zooms in where the map is, not back where it last rested")
+    }
+
+    @Test fun twoQuickZoomTapsGoTwoSteps() {
+        deps.views.views["u1" to "j1"] = CameraView(39.6400, -119.6900, 15.0)
+        show()
+        waitFor { map.moves.size == 1 }
+        map.settle()
+
+        // Quicker than the map's zoom animation: nothing settles in between.
+        compose.onNodeWithTag(MapTags.ZOOM_IN).performClick()
+        compose.onNodeWithTag(MapTags.ZOOM_IN).performClick()
+        waitFor { map.moves.size == 3 }
+        assertEquals(listOf(15.0, 16.0, 17.0), map.moves.map { it.zoom })
+
+        map.settle()
+        compose.onNodeWithTag(MapTags.ZOOM_OUT).performClick()
+        waitFor { map.moves.size == 4 }
+        assertEquals(16.0, map.moves[3].zoom)
+    }
+
+    @Test fun gestureBeforeTheFirstPointsStillFits() {
+        show() // nothing saved, and the job's points aren't stored yet (a slow snapshot on weak signal)
+        waitFor { deps.opened.isNotEmpty() }
+
+        // The tech pokes at the empty world map meanwhile (R61).
+        map.userMoves(CameraView(10.0, 20.0, 3.0), CameraView(12.0, 25.0, 4.0))
+        map.rest()
+        Thread.sleep(SAVE_QUIET_MS + 300) // longer than a save takes to follow a move
+        compose.waitForIdle()
+        assertTrue(deps.views.saves.isEmpty(), "no view is saved before the map was placed: ${deps.views.saves}")
+
+        deps.pointsFlow.value = job
+        waitFor { map.fits.isNotEmpty() }
+        assertEquals(listOf(job), map.fits, "the gesture didn't cancel the first fit")
+        map.settle()
+        waitFor { deps.views.views["u1" to "j1"] != null }
+        assertEquals(map.camera.value, deps.views.views["u1" to "j1"])
+    }
+
+    @Test fun centerOnMeBeforeTheFirstPointsCancelsTheFit() {
+        grantLocation()
+        val fix = Fix(39.6100, -119.7100, 4.0, null, NOW)
+        deps.fixes.value = fix
+        show() // nothing saved, no points yet
+        waitFor { map.fix == fix }
+
+        compose.onNodeWithTag(MapTags.CENTER_ON_ME).performClick() // an explicit action (R61)
+        waitFor { map.moves.size == 1 }
+        deps.pointsFlow.value = job
+        waitFor { map.shown.size == job.size }
+        compose.waitForIdle()
+
+        assertEquals(emptyList(), map.fits, "the tech's own move stands")
+        waitFor { deps.views.views["u1" to "j1"] == CameraView(39.6100, -119.7100, 17.0) }
+    }
+
+    @Test fun leavingRightAfterAMoveStillSavesIt() {
+        deps.views.views["u1" to "j1"] = CameraView(39.6400, -119.6900, 15.0)
+        var showing by mutableStateOf(true)
+        compose.setContent { if (showing) Screen(map) }
+        waitFor { map.moves.size == 1 }
+        map.settle()
+
+        // The tech pans and leaves at once, before the map has even come to rest.
+        val panned = CameraView(39.7000, -119.8000, 15.0)
+        map.userMoves(panned)
+        showing = false
+
+        waitFor { deps.views.views["u1" to "j1"] == panned }
     }
 
     @Test fun hideShotFilters() {
@@ -437,7 +571,7 @@ class MapScreenTest {
         waitFor { deps.rejected.subscriptionCount.value > 0 }
 
         deps.rejected.tryEmit(OpResult("op-1", ok = false, error = "photos_delivered"))
-        waitForText("Only an admin can delete a point whose photos reached OneDrive, so the point was kept.")
+        waitForText("A change couldn't be saved: only an admin can delete a point whose photos reached OneDrive.")
     }
 
     @Test fun userActionsMoveTheCamera() {
@@ -447,6 +581,7 @@ class MapScreenTest {
         deps.pointsFlow.value = job
         show()
         waitFor { map.moves.size == 1 && map.shown.size == job.size }
+        map.settle()
 
         // A marker tap opens the point (Task 25's sheet) where it is: the camera stays.
         map.pointTaps.tryEmit("p2")

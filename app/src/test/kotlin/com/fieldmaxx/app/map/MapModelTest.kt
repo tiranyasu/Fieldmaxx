@@ -100,6 +100,7 @@ class MapModelTest {
         assertEquals("☀️ 5h 40m until sunset", sunsetText(sunset.minus(Duration.ofMinutes(340)).toEpochMilli(), 39.53, -119.81, zone))
         assertEquals("🌙 After sunset", sunsetText(sunset.plus(Duration.ofMinutes(1)).toEpochMilli(), 39.53, -119.81, zone))
         assertEquals("☀️ 25m until sunset", sunsetText(sunset.minus(Duration.ofMinutes(25)).toEpochMilli(), 39.53, -119.81, zone))
+        assertEquals("☀️ <1m until sunset", sunsetText(sunset.minusSeconds(30).toEpochMilli(), 39.53, -119.81, zone), "not 0m")
     }
 
     @Test fun crewDots() {
@@ -181,10 +182,13 @@ class MapModelTest {
     }
 
     @Test fun refusalsReadAsSentences() {
-        assertEquals("Only an admin can delete a point whose photos reached OneDrive, so the point was kept.", rejectionText("photos_delivered"))
-        assertEquals("That point was deleted, so the change was undone.", rejectionText("point_deleted"))
-        assertEquals("The server refused a change, so it was undone.", rejectionText("something_new"))
-        assertEquals("The server refused a change, so it was undone.", rejectionText(null))
+        // Refusals come from any job's queued changes, so the sentences name nothing on screen.
+        assertEquals("A change couldn't be saved: the job was deleted.", rejectionText("job_deleted"))
+        assertEquals("A change couldn't be saved: the job no longer exists.", rejectionText("job_not_found"))
+        assertEquals("A change couldn't be saved: the point was deleted.", rejectionText("point_deleted"))
+        assertEquals("A change couldn't be saved: only an admin can delete a point whose photos reached OneDrive.", rejectionText("photos_delivered"))
+        assertEquals("A change couldn't be saved: the server refused it.", rejectionText("something_new"))
+        assertEquals("A change couldn't be saved: the server refused it.", rejectionText(null))
     }
 
     @Test fun imageryKeyGoesAsToken() {
@@ -193,6 +197,72 @@ class MapModelTest {
         assertEquals(esri, tileUrl(esri, " "))
         assertEquals("$esri?token=a%2Bb", tileUrl(esri, "a+b"))
         assertEquals("https://tiles.example.com/{z}/{x}/{y}?style=sat&token=k1", tileUrl("https://tiles.example.com/{z}/{x}/{y}?style=sat", "k1"))
+    }
+
+    // ---- CameraTracker: what MapController.camera reports (B1, R61) ----
+
+    private val rest = CameraView(39.6400, -119.6900, 15.0)
+
+    @Test fun anAskedMoveShowsAtOnceSoStepsAddUp() {
+        val t = CameraTracker()
+        t.asked(rest)
+        t.applied()
+        t.ended(rest, rest)
+        val one = rest.copy(zoom = 16.0)
+        t.asked(one)
+        t.applied()
+        assertEquals(one, t.camera.value, "the destination, before the map gets there")
+        t.moved(rest.copy(zoom = 15.3)) // a frame of the zoom animation
+        assertEquals(one, t.camera.value)
+
+        val two = one.copy(zoom = 17.0)
+        t.asked(two) // tapped again before the first zoom finished
+        t.applied()
+        t.ended(one, rest.copy(zoom = 15.4)) // MapLibre gives up the first animation for the second
+        t.settled(rest.copy(zoom = 15.4))
+        assertEquals(two, t.camera.value, "the second step builds on the first")
+        t.ended(two, two)
+        assertEquals(two, t.camera.value)
+    }
+
+    @Test fun cameraFollowsTheUsersGlide() {
+        val t = CameraTracker()
+        t.asked(rest)
+        t.applied()
+        t.ended(rest, rest)
+        val glide = listOf(CameraView(39.6500, -119.7000, 15.0), CameraView(39.6550, -119.7050, 15.0))
+        t.gestureStarted()
+        glide.forEach(t::moved)
+        assertEquals(glide.last(), t.camera.value, "where the map is while it still glides after a fling")
+
+        // A gesture during an asked move takes over from it.
+        val asked = rest.copy(zoom = 18.0)
+        t.asked(asked)
+        t.applied()
+        t.gestureStarted()
+        t.ended(asked, glide.first()) // the gesture cancelled it
+        t.moved(glide.last())
+        assertEquals(glide.last(), t.camera.value)
+        t.settled(glide.first())
+        assertEquals(glide.first(), t.camera.value, "where it came to rest")
+    }
+
+    @Test fun gesturesBeforeTheFirstPlacementDontCount() {
+        val t = CameraTracker()
+        val world = CameraView(10.0, 20.0, 3.0)
+        t.gestureStarted()
+        t.moved(world)
+        t.settled(world)
+        assertNull(t.camera.value, "the empty world map a tech pokes at while the job loads isn't a view")
+
+        t.asked(rest) // the first fit, waiting for the map
+        t.gestureStarted()
+        t.moved(world)
+        t.settled(world)
+        assertEquals(rest, t.camera.value, "an incidental gesture doesn't cancel the first placement")
+        t.applied()
+        t.ended(rest, rest)
+        assertEquals(rest, t.camera.value)
     }
 
     @Test fun viewMemoryPerUserPerJob() = runBlocking {

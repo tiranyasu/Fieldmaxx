@@ -9,13 +9,15 @@ import com.fieldmaxx.core.FmxJson
 import com.fieldmaxx.core.model.AppConfig
 import java.io.IOException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.retryWhen
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -29,16 +31,38 @@ val DEFAULT_CONFIG = AppConfig(
 )
 
 private val CONFIG = stringPreferencesKey("config")
+private const val READ_RETRY_FIRST_MS = 1_000L
+private const val READ_RETRY_MAX_MS = 60_000L
 
 /**
  * The server's map and photo settings (`/api/config`), kept on the phone: [config] holds the last ones fetched, or
  * [DEFAULT_CONFIG] until a fetch ever succeeded. [refresh] runs after sign-in and each time sync comes online.
  */
 class ConfigStore(private val api: Api, private val store: DataStore<Preferences>, private val scope: CoroutineScope) {
+    /**
+     * For screens: starts as [DEFAULT_CONFIG] before the kept settings are read, so it can't tell "not read yet" from
+     * "the server sent the defaults"; [current] can. A failed read shows the defaults and the file is read again, so a
+     * later refresh still arrives (R62).
+     */
     val config: StateFlow<AppConfig> = store.data
-        .map { it[CONFIG]?.let(::decode) ?: DEFAULT_CONFIG }
-        .catch { e -> if (e is IOException) emit(DEFAULT_CONFIG) else throw e }
+        .map(::configOf)
+        .retryWhen { cause, attempt ->
+            if (cause !is IOException) return@retryWhen false
+            emit(DEFAULT_CONFIG)
+            delay((READ_RETRY_FIRST_MS shl attempt.coerceAtMost(6L).toInt()).coerceAtMost(READ_RETRY_MAX_MS))
+            true
+        }
         .stateIn(scope, SharingStarted.Eagerly, DEFAULT_CONFIG)
+
+    /**
+     * The kept settings once they have been read (the defaults when none are kept, or the file can't be read): what to
+     * use right after a cold start or a process-death restore, the photo quality at the shutter say (R62).
+     */
+    suspend fun current(): AppConfig = try {
+        configOf(store.data.first())
+    } catch (e: IOException) {
+        DEFAULT_CONFIG
+    }
 
     /** Fetches and keeps the server's settings; false when the server couldn't be reached or refused (the last ones stay). */
     suspend fun refresh(): Boolean {
@@ -67,10 +91,12 @@ class ConfigStore(private val api: Api, private val store: DataStore<Preferences
         }
     }
 
-    /** Null for settings written by another version of the app: [DEFAULT_CONFIG] until the next fetch. */
-    private fun decode(json: String): AppConfig? = try {
-        FmxJson.decodeFromString(AppConfig.serializer(), json)
-    } catch (e: IllegalArgumentException) {
-        null
-    }
+    /** Settings written by another version of the app read as [DEFAULT_CONFIG] until the next fetch. */
+    private fun configOf(prefs: Preferences): AppConfig = prefs[CONFIG]?.let { json ->
+        try {
+            FmxJson.decodeFromString(AppConfig.serializer(), json)
+        } catch (e: IllegalArgumentException) {
+            null
+        }
+    } ?: DEFAULT_CONFIG
 }

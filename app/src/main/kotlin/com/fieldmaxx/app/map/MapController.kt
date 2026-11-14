@@ -6,8 +6,10 @@ import com.fieldmaxx.core.model.AppConfig
 import com.fieldmaxx.core.model.CrewPosition
 import com.fieldmaxx.core.model.Point
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /** An OpenStreetMap address number to show at high zoom (Task 31). */
 data class HouseNumber(val lat: Double, val lon: Double, val text: String)
@@ -36,7 +38,10 @@ interface MapController {
     /** Shows every one of [points]. */
     fun fitAll(points: List<Point>)
 
-    /** Where the map looks once it has settled after a move; null until the map has been placed or moved. */
+    /**
+     * Where the map looks, kept up to date as it moves ([CameraTracker]): the destination of a move asked for, at once,
+     * and otherwise the map itself, while the user drags or it glides. Null until the map's first placement.
+     */
     val camera: StateFlow<CameraView?>
 
     /** Ids of the markers the user taps. */
@@ -51,4 +56,59 @@ interface MapController {
     fun beginDrag(pointId: String): Flow<LatLon>
 
     fun endDrag()
+}
+
+/**
+ * Keeps a map's [MapController.camera] from the map's own events, so it says where the map is (B1, R61). The MapLibre
+ * adapter feeds it from MapLibre's listeners; the tests' fake feeds it the same events, so the screen is tested
+ * against the adapter's real reporting.
+ * - A move asked for ([asked]: moveTo, fitAll, a cluster tap) shows as its destination at once and stays until it
+ *   [ended] or the user takes over, so a second zoom step builds on the first.
+ * - Otherwise the camera follows the map as it moves ([moved], every frame) and where it comes to rest ([settled]):
+ *   a zoom tap while the map still glides after a fling starts from where the map is.
+ * - Nothing the map does counts before a move asked for has been carried out ([applied]): pans and pinches on the
+ *   empty map a tech pokes at while the job loads neither show nor cancel the first placement (R61).
+ */
+class CameraTracker {
+    private val view = MutableStateFlow<CameraView?>(null)
+    val camera: StateFlow<CameraView?> = view.asStateFlow()
+    private var placed = false
+    private var heading: CameraView? = null
+
+    /** A move to [destination] was asked for; it may wait for the map before it is [applied]. */
+    @Synchronized
+    fun asked(destination: CameraView) {
+        heading = destination
+        view.value = destination
+    }
+
+    /** The map has started the move asked for last. */
+    @Synchronized
+    fun applied() {
+        placed = true
+    }
+
+    /** The user touched the map: once it has been placed, a move asked for gives way to the gesture. */
+    @Synchronized
+    fun gestureStarted() {
+        if (placed) heading = null
+    }
+
+    /** The map is at [at] (a frame of a drag, a glide or an animation). */
+    @Synchronized
+    fun moved(at: CameraView) {
+        if (placed && heading == null) view.value = at
+    }
+
+    /** The map came to rest at [at]. */
+    @Synchronized
+    fun settled(at: CameraView) = moved(at)
+
+    /** The move to [destination] finished or was given up, with the map at [at]; a newer move asked for stands. */
+    @Synchronized
+    fun ended(destination: CameraView, at: CameraView) {
+        if (heading != destination) return
+        heading = null
+        view.value = at
+    }
 }

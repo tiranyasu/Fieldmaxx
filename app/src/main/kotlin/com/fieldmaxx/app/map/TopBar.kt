@@ -27,7 +27,7 @@ import com.fieldmaxx.app.ui.FmxColors
 
 private val BannerRed = Color(0xFFB91C1C) // white text stays readable on it
 private val Slate = Color(0xFF334155)
-private val Ink = Color(0xFF0F172A)
+private val Ink = FmxColors.Bar.copy(alpha = 1f) // dark text on the amber and green pills
 
 /** The top bar (spec §6.3): back, the job's name, search, the connection pill and the menu ☰. */
 @Composable

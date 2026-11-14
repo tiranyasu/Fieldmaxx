@@ -11,6 +11,7 @@ import android.graphics.Typeface
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.ViewGroup
@@ -21,6 +22,8 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.doOnLayout
@@ -29,11 +32,13 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.fieldmaxx.app.platform.Fix
 import com.fieldmaxx.app.platform.Heading
+import com.fieldmaxx.app.ui.FmxColors
 import com.fieldmaxx.core.geo.LatLon
 import com.fieldmaxx.core.model.AppConfig
 import com.fieldmaxx.core.model.CrewPosition
 import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.naming.markerCode
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.hypot
@@ -42,14 +47,13 @@ import kotlin.math.pow
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.callbackFlow
 import org.maplibre.android.MapLibre
 import org.maplibre.android.camera.CameraPosition
+import org.maplibre.android.camera.CameraUpdate
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.geometry.LatLngBounds
@@ -150,15 +154,15 @@ private const val IMG_HOUSE = "fmx-house:"
 private const val IMG_BADGE = "fmx-badge"
 private const val IMG_BEAM = "fmx-beam"
 
-private const val ACCENT = "#2563eb"
+// The binding colours come from FmxColors (ui/Theme.kt); MapLibre takes them as "#rrggbb" and an opacity.
+private val ACCENT = FmxColors.Accent.hex()
+private val INK = FmxColors.Bar.hex() // the bars' colour, opaque
+private val SHOT = FmxColors.ShotMarker.hex()
+private val SHOT_OPACITY = FmxColors.ShotMarker.alpha
 private const val CREW_COLOR = "#f8fafc"
-private const val INK = "#0f172a"
-private const val BADGE_COLOR = 0xFFFBBF24.toInt()
 private const val LABELS_OPACITY = 0.9f
 private const val TILE_SIZE = 256
 private const val SOURCE_MAX_ZOOM = 19f // Esri's imagery stops around here; MapLibre over-zooms the last tiles beyond it
-private const val MIN_ZOOM = 2.0
-private const val MAX_ZOOM = 22.0
 private const val CLUSTER_MAX_ZOOM = 17
 private const val FIT_MAX_ZOOM = 18.0
 private const val MARKER_RADIUS = 12f
@@ -182,13 +186,14 @@ private const val BASE_STYLE =
  * [MapController] on MapLibre Native, built by [rememberMapLibreController] and shown with [View]:
  * - the server's raster imagery, with the street-name overlay at 90% opacity above it;
  * - the points as one GeoJSON source, clustered up to zoom 17: circles in the type's colour (grey at 55% once shot,
- *   [SHOT_COLOR]), the type's code on each (struck through once shot), and a badge on points with photos not in
+ *   [FmxColors.ShotMarker]), the type's code on each (struck through once shot), and a badge on points with photos not in
  *   OneDrive yet;
  * - the crew as their own source, your position as a pulsing blue dot with its accuracy and heading.
  * Tiles once viewed stay in MapLibre's ambient cache, so viewed areas show without signal (spec §6.8).
  *
  * The camera moves only through [moveTo], [fitAll], a cluster tap (zooms into it) and the user's gestures (R38).
- * [camera] reports a view once the map has been placed or moved by the user, never the map's starting view.
+ * [camera] comes from a [CameraTracker] fed by MapLibre's camera listeners and each move's end; it is null until the
+ * first move asked for is carried out, so the map's starting view (and gestures on it) never count (R61).
  */
 @SuppressLint("ClickableViewAccessibility") // dragging a marker is a map gesture; the point sheet has the accessible move
 class MapLibreController(context: Context) : MapController {
@@ -210,13 +215,14 @@ class MapLibreController(context: Context) : MapController {
     private var labelsVisible = true
     private var houseNumbers: List<HouseNumber> = emptyList()
 
-    /** The screen's opening camera move, waiting for the style; dropped if the user moves the map first. */
+    /** The latest camera move asked for while the map wasn't ready; it runs once the style is there. */
     private var waitingMove: ((MapLibreMap) -> Unit)? = null
 
-    /** Placed by the screen or moved by the user: from then on each settled view is reported. */
-    private var placed = false
-    private val view = MutableStateFlow<CameraView?>(null)
-    override val camera: StateFlow<CameraView?> = view.asStateFlow()
+    private val tracker = CameraTracker()
+    override val camera: StateFlow<CameraView?> = tracker.camera
+
+    /** The first move jumps there (the map was just opened); the ones after glide. */
+    private var jumped = false
     private val taps = MutableSharedFlow<String>(extraBufferCapacity = 16)
     override val pointTaps: SharedFlow<String> = taps.asSharedFlow()
 
@@ -328,11 +334,9 @@ class MapLibreController(context: Context) : MapController {
         style?.let(::drawHouses)
     }
 
-    override fun moveTo(v: CameraView) = whenPlaced { m ->
-        val update = CameraUpdateFactory.newLatLngZoom(LatLng(v.lat, v.lon), v.zoom)
-        // The first placement jumps there (the map was just opened); the user's own moves glide.
-        if (placed) m.animateCamera(update, ANIMATE_MS) else m.moveCamera(update)
-        placed = true
+    override fun moveTo(v: CameraView) {
+        tracker.asked(v) // at once, even while the map isn't ready: a second zoom step builds on this one (B1)
+        whenPlaced { m -> go(m, CameraUpdateFactory.newLatLngZoom(LatLng(v.lat, v.lon), v.zoom), v) }
     }
 
     override fun fitAll(points: List<Point>) {
@@ -340,13 +344,23 @@ class MapLibreController(context: Context) : MapController {
         whenPlaced { m ->
             val targets = points.map { LatLng(it.lat, it.lon) }
             val fitted = if (targets.size < 2) null else m.getCameraForLatLngBounds(LatLngBounds.Builder().includes(targets).build(), fitPadding())
-            val position = CameraPosition.Builder()
-                .target(fitted?.target ?: targets.first())
-                .zoom(min(fitted?.zoom ?: FIT_MAX_ZOOM, FIT_MAX_ZOOM)) // a tight group of points isn't shown closer than this
-                .build()
-            placed = true
-            m.moveCamera(CameraUpdateFactory.newCameraPosition(position))
+            val target = fitted?.target ?: targets.first()
+            val zoom = min(fitted?.zoom ?: FIT_MAX_ZOOM, FIT_MAX_ZOOM) // a tight group of points isn't shown closer than this
+            val destination = CameraView(target.latitude, target.longitude, zoom)
+            tracker.asked(destination)
+            go(m, CameraUpdateFactory.newCameraPosition(CameraPosition.Builder().target(target).zoom(zoom).build()), destination)
         }
+    }
+
+    /** Carries out a move asked for; the tracker hears how it ends (finished, or given up for a newer move or a gesture). */
+    private fun go(m: MapLibreMap, update: CameraUpdate, destination: CameraView) {
+        tracker.applied()
+        val ended = object : MapLibreMap.CancelableCallback {
+            override fun onFinish() = tracker.ended(destination, m.view() ?: destination)
+            override fun onCancel() = tracker.ended(destination, m.view() ?: destination)
+        }
+        if (jumped) m.animateCamera(update, ANIMATE_MS, ended) else m.moveCamera(update, ended)
+        jumped = true
     }
 
     override fun beginDrag(pointId: String): Flow<LatLon> = callbackFlow {
@@ -377,16 +391,10 @@ class MapLibreController(context: Context) : MapController {
     private fun onMapReady(m: MapLibreMap) {
         if (shown == Lifecycle.State.DESTROYED) return
         map = m
-        m.addOnCameraMoveStartedListener { reason ->
-            if (reason == MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE) {
-                placed = true
-                waitingMove = null // the user took over before the opening move could run: it would be a jump now
-            }
-        }
-        m.addOnCameraIdleListener {
-            val target = m.cameraPosition.target
-            if (placed && target != null) view.value = CameraView(target.latitude, target.longitude, m.cameraPosition.zoom)
-        }
+        // Gestures before the first placement change nothing (R61): the opening move still runs, and nothing is reported.
+        m.addOnCameraMoveStartedListener { reason -> if (reason == MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE) tracker.gestureStarted() }
+        m.addOnCameraMoveListener { m.view()?.let(tracker::moved) }
+        m.addOnCameraIdleListener { m.view()?.let(tracker::settled) }
         m.addOnMapClickListener(::onMapClick)
         m.setStyle(Style.Builder().fromJson(BASE_STYLE), ::onStyleLoaded)
     }
@@ -492,7 +500,7 @@ class MapLibreController(context: Context) : MapController {
         val crewFade = switchCase(eq(get(P_STATE), literal(CrewDot.FADED.name)), literal(0.4f), literal(1f))
         s.addLayer(
             CircleLayer(L_CREW, SRC_CREW).withProperties(
-                circleColor(switchCase(eq(get(P_PAUSED), literal(true)), literal(SHOT_COLOR), literal(CREW_COLOR))),
+                circleColor(switchCase(eq(get(P_PAUSED), literal(true)), literal(SHOT), literal(CREW_COLOR))),
                 circleOpacity(crewFade),
                 circleStrokeOpacity(crewFade),
                 circleRadius(7f),
@@ -567,7 +575,7 @@ class MapLibreController(context: Context) : MapController {
             val shot = isShot(p)
             feature(p.lat, p.lon) {
                 addStringProperty(P_ID, p.id)
-                addStringProperty(P_COLOR, if (shot) SHOT_COLOR else typeColor(p.type))
+                addStringProperty(P_COLOR, if (shot) SHOT else typeColor(p.type))
                 addNumberProperty(P_OPACITY, if (shot) SHOT_OPACITY else 1f)
                 addStringProperty(P_ICON, (if (shot) IMG_SHOT else IMG_CODE) + markerCode(p.type))
                 addBooleanProperty(P_PENDING, p.id in pending)
@@ -653,8 +661,10 @@ class MapLibreController(context: Context) : MapController {
         val cluster = hits.firstOrNull { it.hasProperty(CLUSTER_COUNT) } ?: return false
         val source = style?.getSourceAs<GeoJsonSource>(SRC_POINTS) ?: return false
         val center = (cluster.geometry() as? GeoPoint)?.let { LatLng(it.latitude(), it.longitude()) } ?: at
-        placed = true
-        m.animateCamera(CameraUpdateFactory.newLatLngZoom(center, source.getClusterExpansionZoom(cluster).toDouble()), ANIMATE_MS)
+        val zoom = source.getClusterExpansionZoom(cluster).toDouble()
+        val destination = CameraView(center.latitude, center.longitude, zoom)
+        tracker.asked(destination)
+        go(m, CameraUpdateFactory.newLatLngZoom(center, zoom), destination)
         return true
     }
 
@@ -716,7 +726,7 @@ class MapLibreController(context: Context) : MapController {
             val outline = Paint(paint).apply {
                 style = Paint.Style.STROKE
                 strokeWidth = 2.5f * density
-                this.color = 0xCC0F172A.toInt()
+                this.color = FmxColors.Bar.copy(alpha = 0.8f).toArgb()
             }
             canvas.drawText(text, width / 2f, baseline, outline)
         }
@@ -733,8 +743,8 @@ class MapLibreController(context: Context) : MapController {
         val bitmap = newBitmap(size, size)
         val canvas = Canvas(bitmap)
         val r = size / 2f
-        canvas.drawCircle(r, r, r, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF0F172A.toInt() })
-        canvas.drawCircle(r, r, r - 1.5f * density, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = BADGE_COLOR })
+        canvas.drawCircle(r, r, r, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = FmxColors.Bar.copy(alpha = 1f).toArgb() })
+        canvas.drawCircle(r, r, r - 1.5f * density, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = FmxColors.Warning.toArgb() })
         return bitmap
     }
 
@@ -750,7 +760,8 @@ class MapLibreController(context: Context) : MapController {
             close()
         }
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            shader = android.graphics.LinearGradient(c, c, c, 0f, 0xFF2563EB.toInt(), 0x002563EB, android.graphics.Shader.TileMode.CLAMP)
+            val accent = FmxColors.Accent.toArgb()
+            shader = android.graphics.LinearGradient(c, c, c, 0f, accent, accent and 0x00FFFFFF, android.graphics.Shader.TileMode.CLAMP)
         }
         Canvas(bitmap).drawPath(path, paint)
         return bitmap
@@ -771,18 +782,27 @@ class MapLibreController(context: Context) : MapController {
 
     private fun angleBetween(a: Double, b: Double): Double = abs(((a - b) % 360.0 + 540.0) % 360.0 - 180.0)
 
+    private fun MapLibreMap.view(): CameraView? = cameraPosition.target?.let { CameraView(it.latitude, it.longitude, cameraPosition.zoom) }
+
     private companion object {
+        const val LOG_TAG = "MapLibreController"
+
+        /** Set once MapLibre took the cache size; until then each new map asks again. */
         @Volatile var cacheSet = false
 
         /** Viewed tiles are kept for work without signal (spec §6.8); bulk downloading isn't allowed for Esri imagery. */
         fun keepViewedTiles(context: Context) {
             if (cacheSet) return
-            cacheSet = true
             OfflineManager.getInstance(context).setMaximumAmbientCacheSize(
                 AMBIENT_CACHE_BYTES,
                 object : OfflineManager.FileSourceCallback {
-                    override fun onSuccess() {}
-                    override fun onError(message: String) {}
+                    override fun onSuccess() {
+                        cacheSet = true
+                    }
+
+                    override fun onError(message: String) {
+                        Log.w(LOG_TAG, "Couldn't set the map's tile cache size (tried again with the next map): $message")
+                    }
                 },
             )
         }
@@ -810,3 +830,6 @@ fun rememberMapLibreController(heading: StateFlow<Heading?>): MapLibreController
     LaunchedEffect(controller, h) { controller.setMyHeading(h) }
     return controller
 }
+
+/** "#rrggbb", the colour without its alpha (an opacity goes separately). */
+private fun Color.hex(): String = String.format(Locale.US, "#%06x", toArgb() and 0xFFFFFF)

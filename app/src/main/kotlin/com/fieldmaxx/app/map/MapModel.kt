@@ -36,9 +36,9 @@ const val JOB_DELETED = "This job was deleted"
 /** Shown instead of the blue dot when location isn't allowed (R41). */
 const val LOCATION_OFF = "Location off"
 
-/** Shot markers: #9ca3af at 55% opacity (global constraints). */
-const val SHOT_COLOR = "#9ca3af"
-const val SHOT_OPACITY = 0.55f
+/** The map's zoom range; a saved view outside it isn't restored. */
+const val MIN_ZOOM = 2.0
+const val MAX_ZOOM = 22.0
 
 private const val SUN = "☀️" // ☀️ with the emoji presentation selector, as the brief writes it
 private const val AFTER_SUNSET = "🌙 After sunset"
@@ -76,13 +76,20 @@ fun chipLabel(t: TypeProgress): String {
     return if (t.total > 0 && t.done == t.total) "✓ $text" else text
 }
 
-/** "☀️ 5h 40m until sunset" (whole minutes left), or "🌙 After sunset" once today's sunset at the spot has passed. */
+/**
+ * "☀️ 5h 40m until sunset" (whole minutes left; "<1m" in the last minute), or "🌙 After sunset" once today's sunset at
+ * the spot has passed.
+ */
 fun sunsetText(nowMs: Long, lat: Double, lon: Double, zone: ZoneId): String {
     val now = Instant.ofEpochMilli(nowMs)
     val sunset = SunTimes.compute().on(now.atZone(zone)).midnight().at(lat, lon).execute().set?.toInstant()
     if (sunset == null || !now.isBefore(sunset)) return AFTER_SUNSET
     val minutes = Duration.between(now, sunset).toMinutes()
-    val left = if (minutes >= 60) "${minutes / 60}h ${minutes % 60}m" else "${minutes}m"
+    val left = when {
+        minutes >= 60 -> "${minutes / 60}h ${minutes % 60}m"
+        minutes >= 1 -> "${minutes}m"
+        else -> "<1m"
+    }
     return "$SUN $left until sunset"
 }
 
@@ -148,21 +155,22 @@ private fun photoCount(n: Int) = if (n == 1) "1 photo" else "$n photos"
 fun deliveryBannerText(reason: String): String = "Photos can't reach OneDrive: $reason"
 
 /**
- * A refused op in plain words (R42): the server's codes from ops/Ops.kt and photos/PhotoService.kt. The phone has put
- * the server's state back by the time this shows, so each sentence says what became of the change.
+ * A refused op in plain words (R42): the server's codes from ops/Ops.kt and photos/PhotoService.kt. Refusals come from
+ * any job's queued changes, not only this map's, so the sentence names nothing on screen. By the time it shows, the
+ * phone has put the server's state back.
  */
-fun rejectionText(code: String?): String = when (code) {
-    "not_found" -> "That point or photo no longer exists, so the change was undone."
-    "job_not_found" -> "This job no longer exists, so the change was undone."
-    "job_deleted" -> "This job was deleted, so the change was undone."
-    "point_deleted" -> "That point was deleted, so the change was undone."
-    "needs_photo" -> "A point needs at least one photo before it can be closed, so the change was undone."
-    "needs_text" -> "\"Can't shoot\" with Other needs a reason in words, so the change was undone."
-    "photos_delivered" -> "Only an admin can delete a point whose photos reached OneDrive, so the point was kept."
-    "admin_only" -> "Only an admin can do that, so the change was undone."
-    "forbidden" -> "Only the tech who took a photo, or an admin, can change it, so the change was undone."
-    "exists" -> "That was already saved on the server, so the change was undone."
-    else -> "The server refused a change, so it was undone."
+fun rejectionText(code: String?): String = "A change couldn't be saved: " + when (code) {
+    "not_found" -> "the point or photo no longer exists."
+    "job_not_found" -> "the job no longer exists."
+    "job_deleted" -> "the job was deleted."
+    "point_deleted" -> "the point was deleted."
+    "needs_photo" -> "a point needs at least one photo before it can be closed."
+    "needs_text" -> "\"Can't shoot\" with Other needs a reason in words."
+    "photos_delivered" -> "only an admin can delete a point whose photos reached OneDrive."
+    "admin_only" -> "only an admin can do that."
+    "forbidden" -> "only the tech who took a photo, or an admin, can change it."
+    "exists" -> "it was already saved on the server."
+    else -> "the server refused it."
 }
 
 /** A tile URL template with the server's optional imagery key, sent as ArcGIS's `token` parameter. */

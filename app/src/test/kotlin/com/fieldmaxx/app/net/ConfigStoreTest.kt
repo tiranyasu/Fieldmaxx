@@ -1,6 +1,8 @@
 package com.fieldmaxx.app.net
 
+import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
+import androidx.datastore.preferences.core.Preferences
 import com.fieldmaxx.app.sync.SyncStatus
 import com.fieldmaxx.app.sync.awaitTrue
 import com.fieldmaxx.core.model.AppConfig
@@ -12,13 +14,17 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.job
 import kotlinx.coroutines.runBlocking
 
@@ -30,6 +36,20 @@ private class ConfigApi : Api by unusedApi() {
         calls.incrementAndGet()
         return reply()
     }
+}
+
+/** A DataStore whose first [failReads] reads fail, as a damaged or busy disk would; writes go through. */
+private class FlakyStore(private val real: DataStore<Preferences>, private val failReads: Int) : DataStore<Preferences> {
+    val failures = AtomicInteger()
+    override val data: Flow<Preferences> = flow {
+        if (failures.get() < failReads) {
+            failures.incrementAndGet()
+            throw IOException("read failed")
+        }
+        emitAll(real.data)
+    }
+
+    override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences = real.updateData(transform)
 }
 
 private fun unusedApi(): Api = Proxy.newProxyInstance(Api::class.java.classLoader, arrayOf(Api::class.java)) { _, method, _ ->
@@ -76,6 +96,38 @@ class ConfigStoreTest {
         val again = ConfigStore(api, PreferenceDataStoreFactory.create(scope = scope) { file }, scope)
         awaitTrue("the kept settings") { again.config.value == admin }
     }
+
+    @Test fun currentWaitsForTheKeptSettings() = runBlocking {
+        val first = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val store = ConfigStore(api, PreferenceDataStoreFactory.create(scope = first) { file }, first)
+        assertEquals(DEFAULT_CONFIG, store.current(), "nothing kept yet: the defaults")
+        api.reply = { admin }
+        store.refresh()
+        assertEquals(admin, store.current())
+
+        // A cold start or a process-death restore: read at once, before the state flow may have caught up (Task 28).
+        first.coroutineContext.job.cancelAndJoin()
+        val again = ConfigStore(api, PreferenceDataStoreFactory.create(scope = scope) { file }, scope)
+        assertEquals(admin, again.current())
+        assertEquals(DEFAULT_CONFIG, ConfigStore(api, FlakyStore(freshDisk(), failReads = Int.MAX_VALUE), scope).current(), "unreadable: the defaults")
+    }
+
+    @Test fun flowSurvivesAReadError() = runBlocking {
+        val disk = FlakyStore(freshDisk(), failReads = 1)
+        val store = ConfigStore(api, disk, scope)
+        awaitTrue("the first read failed") { disk.failures.get() == 1 }
+        assertEquals(DEFAULT_CONFIG, store.config.value)
+
+        api.reply = { admin }
+        assertTrue(store.refresh())
+        awaitTrue("a later refresh still arrives") { store.config.value == admin }
+    }
+
+    /** The real store behind a [FlakyStore], on a file of its own. */
+    private fun freshDisk(): DataStore<Preferences> =
+        PreferenceDataStoreFactory.create(scope = scope) { File(dir, "flaky${flaky.incrementAndGet()}.preferences_pb") }
+
+    private val flaky = AtomicInteger()
 
     @Test fun refreshesEachTimeSyncComesOnline() = runBlocking {
         val store = ConfigStore(api, PreferenceDataStoreFactory.create(scope = scope) { file }, scope)

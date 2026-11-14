@@ -111,6 +111,9 @@ class AppGraph(context: Context, val vault: TokenVault = AndroidKeystoreTokenVau
      */
     val config: StateFlow<AppConfig> get() = configStore.config
 
+    /** The kept settings once read from the phone (R62): for reads that must not see the defaults by mistake, like the photo quality. */
+    suspend fun currentConfig(): AppConfig = configStore.current()
+
     fun refreshConfig() {
         scope.launch { configStore.refresh() }
     }

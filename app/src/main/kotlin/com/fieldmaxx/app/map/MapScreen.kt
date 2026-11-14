@@ -62,12 +62,15 @@ import java.io.IOException
 import java.time.ZoneId
 import kotlin.math.max
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
@@ -79,8 +82,9 @@ import kotlinx.coroutines.withContext
 /** "Center on me" goes at least this close; a search or "Left" pick at least [POINT_ZOOM]. */
 private const val ME_ZOOM = 17.0
 private const val POINT_ZOOM = 18.0
-private const val MIN_ZOOM = 2.0
-private const val MAX_ZOOM = 22.0
+
+/** A view is saved once the map has held it this long, so a pan isn't written frame by frame. */
+internal const val SAVE_QUIET_MS = 500L
 
 /** How often crew ages and the sunset countdown are worked out again. */
 private const val TICK_MS = 30_000L
@@ -95,6 +99,8 @@ object MapTags {
     const val LOCATION_OFF = "map.locationOff"
     const val CENTER_ON_ME = "map.centerOnMe"
     const val LABELS = "map.labels"
+    const val ZOOM_IN = "map.zoomIn"
+    const val ZOOM_OUT = "map.zoomOut"
     const val ADD = "map.add"
     const val MENU = "map.menu"
     const val SEARCH = "map.search"
@@ -164,7 +170,8 @@ class GraphMapDeps(private val graph: AppGraph) : MapDeps {
  * chip row, the progress strip, the crew and your own position. [mapView] draws [controller]'s map underneath.
  *
  * The camera never moves by itself (R38): on open it goes to the view saved for this user and job, or, with none saved,
- * fits all points once; after that only the user's own actions move it. Every view it settles on is saved.
+ * fits all points once; after that only the user's own actions move it. Each view the map holds is saved. Relative
+ * moves (zoom +/−) start from where the map is now, also mid-glide or mid-zoom (B1).
  *
  * Opening refreshes the job in the background; without signal the stored job stays, and a job that is gone goes back
  * with [onJobGone] ("This job was deleted", R42). Refused changes show as a snackbar while the map is open.
@@ -297,9 +304,11 @@ fun MapScreen(
 
 /**
  * The only camera moves that aren't the user's (R38): on open, to the view saved for this user and job, or with none
- * saved, a fit of all points once they are stored, unless the user has moved the map by then. Then every view the map
- * settles on is saved, until the screen goes.
+ * saved, a fit of all points once they are stored. Only the user's explicit moves ("center on me", a search result, a
+ * "Left" item) cancel that fit; pans and pinches on the map before it don't (R61). Then each view the map holds is
+ * saved, and the last one when the screen goes. Nothing is saved before the first placement: the camera is null till then.
  */
+@OptIn(FlowPreview::class)
 private suspend fun placeCamera(jobId: String, deps: MapDeps, controller: MapController) {
     val userId = deps.userId()
     val saved = deps.views.load(userId, jobId)
@@ -311,7 +320,15 @@ private suspend fun placeCamera(jobId: String, deps: MapDeps, controller: MapCon
             if (first.isNotEmpty()) controller.fitAll(first)
         }
     }
-    controller.camera.filterNotNull().collect { deps.views.save(userId, jobId, it) }
+    try {
+        // Off the main thread: the camera changes with every frame of a drag.
+        withContext(Dispatchers.Default) {
+            controller.camera.filterNotNull().debounce(SAVE_QUIET_MS).collect { deps.views.save(userId, jobId, it) }
+        }
+    } finally {
+        // Wherever the map was left, even mid-move.
+        controller.camera.value?.let { withContext(NonCancellable) { deps.views.save(userId, jobId, it) } }
+    }
 }
 
 /**
@@ -358,8 +375,8 @@ private fun MapButtons(
         MapButton(onLabels, if (labels) "Hide street names" else "Show street names", selected = labels, modifier = Modifier.testTag(MapTags.LABELS)) {
             Text("Aa", fontWeight = FontWeight.Bold)
         }
-        MapButton(onZoomIn, "Zoom in") { Text("+", style = MaterialTheme.typography.titleLarge) }
-        MapButton(onZoomOut, "Zoom out") { Text("−", style = MaterialTheme.typography.titleLarge) }
+        MapButton(onZoomIn, "Zoom in", modifier = Modifier.testTag(MapTags.ZOOM_IN)) { Text("+", style = MaterialTheme.typography.titleLarge) }
+        MapButton(onZoomOut, "Zoom out", modifier = Modifier.testTag(MapTags.ZOOM_OUT)) { Text("−", style = MaterialTheme.typography.titleLarge) }
         MapButton(onCenter ?: {}, "Center on me", enabled = onCenter != null, modifier = Modifier.testTag(MapTags.CENTER_ON_ME)) {
             Icon(MyLocation, contentDescription = null)
         }

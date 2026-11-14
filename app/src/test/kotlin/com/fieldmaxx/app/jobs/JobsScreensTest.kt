@@ -295,17 +295,25 @@ class JobsScreensTest {
 
     @Test fun jobListShowsNotice() {
         api.jobsReply = { listOf(item("j1", "A05J9XE", 5, 7)) }
+        var cleared = 0
+        var showing by mutableStateOf(true)
         compose.setContent {
             FieldmaxxTheme {
-                JobListScreen(
-                    jobs, status, currentUser = { ALICE }, onOpenJob = {}, onNewJob = {}, onAddFiles = {}, onJobInfo = {},
-                    notice = "This job was deleted",
-                )
+                if (showing) {
+                    JobListScreen(
+                        jobs, status, currentUser = { ALICE }, onOpenJob = {}, onNewJob = {}, onAddFiles = {}, onJobInfo = {},
+                        notice = "This job was deleted", onNoticeShown = { cleared++ },
+                    )
+                }
             }
         }
 
         waitForText("This job was deleted") // the map went back here because the job is gone (R42)
         waitForText("A05J9XE")
+
+        // Leaving while it shows clears it too, so it can't show a second time.
+        showing = false
+        waitFor { cleared == 1 }
     }
 
     @Test fun offlineShowsCachedList() {

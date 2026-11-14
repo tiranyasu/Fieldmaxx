@@ -212,8 +212,11 @@ fun JobListScreen(
 
     LaunchedEffect(notice) {
         if (notice == null) return@LaunchedEffect
-        snackbar.showSnackbar(notice)
-        noticeShown()
+        try {
+            snackbar.showSnackbar(notice)
+        } finally {
+            noticeShown() // also when the screen goes while it shows: a notice shows once
+        }
     }
 
     Scaffold(

@@ -40,7 +40,7 @@ class DataStoreViewMemory(private val store: DataStore<Preferences>) : ViewMemor
         val numbers = parts.mapNotNull { it.toDoubleOrNull() }
         if (parts.size != 3 || numbers.size != 3) return null
         val (lat, lon, zoom) = numbers
-        if (lat !in -90.0..90.0 || lon !in -180.0..180.0 || zoom !in 0.0..MAX_ZOOM) return null
+        if (lat !in -90.0..90.0 || lon !in -180.0..180.0 || zoom !in MIN_ZOOM..MAX_ZOOM) return null
         return CameraView(lat, lon, zoom)
     }
 
@@ -48,8 +48,4 @@ class DataStoreViewMemory(private val store: DataStore<Preferences>) : ViewMemor
     private fun key(userId: String, jobId: String) = stringPreferencesKey("view:" + encode(userId) + ":" + encode(jobId))
 
     private fun encode(id: String) = URLEncoder.encode(id, "UTF-8")
-
-    private companion object {
-        const val MAX_ZOOM = 25.0
-    }
 }
