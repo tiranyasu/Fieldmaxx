@@ -8,6 +8,7 @@ import androidx.work.WorkerParameters
 import com.fieldmaxx.app.data.LocalPhotoEntity
 import com.fieldmaxx.app.data.toPhoto
 import com.fieldmaxx.app.net.ApiException
+import com.fieldmaxx.core.model.JOB_WAS_DELETED
 import com.fieldmaxx.core.model.PhotoRegistration
 import com.fieldmaxx.core.model.PhotoStatus
 import java.io.File
@@ -17,9 +18,6 @@ import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
-
-/** The server's wording (photos/PhotoService.kt) when a photo's job was deleted: registration answers it with HTTP 410. */
-internal const val JOB_WAS_DELETED = "Job was deleted"
 
 /** Step 3 of spec §6.6, "stamped" → "registered". */
 class RegisterWorker internal constructor(context: Context, params: WorkerParameters, private val pipeline: PhotoPipeline) :

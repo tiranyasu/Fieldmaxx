@@ -3,8 +3,10 @@ package com.fieldmaxx.server.photos
 import com.fieldmaxx.core.geo.LatLon
 import com.fieldmaxx.core.geo.distanceMeters
 import com.fieldmaxx.core.model.Change
+import com.fieldmaxx.core.model.JOB_WAS_DELETED
 import com.fieldmaxx.core.model.Op
 import com.fieldmaxx.core.model.OpResult
+import com.fieldmaxx.core.model.PHOTO_WAS_REMOVED
 import com.fieldmaxx.core.model.PhotoInfo
 import com.fieldmaxx.core.model.PhotoRegistration
 import com.fieldmaxx.core.model.PhotoStatus
@@ -132,7 +134,7 @@ fun registerPhoto(ctx: Ctx, user: User, reg: PhotoRegistration): RegisteredPhoto
         if (prepareStatement("SELECT deleted_at FROM jobs WHERE id = ?").use { ps ->
                 ps.setString(1, point.jobId); ps.executeQuery().use { it.next(); it.getObject(1) != null }
             }
-        ) throw HttpError(HttpStatusCode.Gone, "Job was deleted")
+        ) throw HttpError(HttpStatusCode.Gone, JOB_WAS_DELETED)
         if (point.jobId != reg.jobId) throw HttpError(HttpStatusCode.BadRequest, "Point belongs to another job")
         val now = ctx.clock.millis()
         val name = cadastrusName(point, reg.lat, reg.lon, nextCounter("photo"))
@@ -197,7 +199,9 @@ fun appendBackupChunk(ctx: Ctx, user: User, photoId: String, offset: Long, bytes
     synchronized(chunkLocks.computeIfAbsent(photoId) { Any() }) {
         val row = ctx.db.read { photoRow(photoId) } ?: throw HttpError(HttpStatusCode.NotFound, "Photo not found")
         if (!canTouch(user, row.userId)) throw HttpError(HttpStatusCode.Forbidden, "Not your photo")
-        if (row.status == PhotoStatus.removed) throw HttpError(HttpStatusCode.Gone, "Photo was removed")
+        // R98: the only 410 a backup gets. A deleted job's photo is still backed up: the server copy is its protection
+        // while the job can be restored.
+        if (row.status == PhotoStatus.removed) throw HttpError(HttpStatusCode.Gone, PHOTO_WAS_REMOVED)
         if (row.backupReceivedAt != null) {
             if (offset == row.size && bytes.isEmpty()) return row.size to true
             throw BackupOffsetConflict(row.size, true)

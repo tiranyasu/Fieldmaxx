@@ -43,9 +43,11 @@ import com.fieldmaxx.app.sync.jobChange
 import com.fieldmaxx.app.sync.point
 import com.fieldmaxx.app.sync.snapshot
 import com.fieldmaxx.core.model.Change
+import com.fieldmaxx.core.model.JOB_WAS_DELETED
 import com.fieldmaxx.core.model.JobSnapshot
 import com.fieldmaxx.core.model.Op
 import com.fieldmaxx.core.model.OpResult
+import com.fieldmaxx.core.model.PHOTO_WAS_REMOVED
 import com.fieldmaxx.core.model.PhotoInfo
 import com.fieldmaxx.core.model.PhotoRegistration
 import com.fieldmaxx.core.model.PhotoStatus
@@ -1239,7 +1241,8 @@ class PipelineTest {
 
     /**
      * R96 (I4, spec §6.2): photos of a deleted job stay on the phone undelivered, registered and unregistered alike: held,
-     * never discarded, left out of the "waiting" pill, and on their way again once an admin restores the job.
+     * never discarded, left out of the "waiting" pill, and on their way again once an admin restores the job. R98: the
+     * registered one is still backed up to the server, whole; only its OneDrive step waits.
      */
     @Test fun deletedJobHoldsItsPhotosUntilRestored() {
         val registered = take()
@@ -1248,14 +1251,16 @@ class PipelineTest {
         await("stamped") { row(stamped)?.state == STAMPED } // the stamp needs no network; its registration waits for signal
         runBlocking { OpApplier(db).applyChange(jobChange(11, job("j1").copy(fieldNotesUrl = LINK, deletedAt = NOW))) }
 
-        runUntil("both looked at") {
-            work(Step.ONEDRIVE, registered).any { it.state == WorkInfo.State.SUCCEEDED } && work(Step.REGISTER, stamped).any { it.state == WorkInfo.State.SUCCEEDED }
+        runUntil("both looked at, and the backup in") {
+            work(Step.ONEDRIVE, registered).any { it.state == WorkInfo.State.SUCCEEDED } &&
+                work(Step.REGISTER, stamped).any { it.state == WorkInfo.State.SUCCEEDED } && row(registered)?.backupDone == true
         }
         awaitIdle()
         Thread.sleep(300)
         assertTrue(fake.calls.none { it.startsWith("uploadChunked") }, "nothing goes to the deleted job's Field Notes")
         assertNull(server.registrations[stamped], "nor is the other one registered")
-        assertNull(server.copies[registered], "its backup waits too, as a deleted point's does")
+        assertContentEquals(stamped(registered), server.copies[registered], "R98: backed up whole, for the restore window")
+        assertEquals(REGISTERED, row(registered)!!.state, "its OneDrive step still waits")
         for (id in listOf(registered, stamped)) {
             val r = assertNotNull(row(id), "never discarded")
             assertEquals(0, r.attempts, "not a failure")
@@ -1269,6 +1274,29 @@ class PipelineTest {
         runUntil("both delivered") { done(registered) && done(stamped) }
         assertDeliveredOnce(registered)
         assertDeliveredOnce(stamped)
+        assertEquals(2, fake.files.size, "one file each, full size")
+        assertEquals(2, server.registerCalls.get(), "each registered once: the held one only after the restore")
+    }
+
+    /** R98: a 410 that says the job was deleted is never a removal: the backup is tried again later, nothing is discarded. */
+    @Test fun backupAnswered410ForADeletedJobNeverDiscards() {
+        val id = take()
+        runStep(Step.REGISTER, id)
+        server.backupGone[id] = JOB_WAS_DELETED
+        await("the backup lined up") { work(Step.BACKUP, id).any { it.state == WorkInfo.State.ENQUEUED } }
+        work(Step.BACKUP, id).filter { it.state == WorkInfo.State.ENQUEUED }.forEach { driver.setAllConstraintsMet(it.id) }
+        val retry = pendingRetry(Step.BACKUP, id)
+        awaitIdle()
+        val kept = assertNotNull(row(id), "never discarded")
+        assertTrue(folder(id).isDirectory)
+        assertFalse(kept.backupDone)
+        assertTrue(work(Step.ONEDRIVE, id).any { it.state == WorkInfo.State.ENQUEUED }, "its OneDrive step is still lined up")
+
+        server.backupGone.remove(id)
+        driver.setInitialDelayMet(retry.id)
+        runUntil("delivered and backed up") { done(id) }
+        assertDeliveredOnce(id)
+        assertContentEquals(stamped(id), server.copies[id])
     }
 
     /** R96: the server answers a registration 410 "Job was deleted" before this phone heard of the delete: held the same way, never stuck. */
@@ -1312,7 +1340,7 @@ class PipelineTest {
     @Test fun backupAnswered410DiscardsThePhotoAndItsOneDriveStep() {
         val id = take()
         runStep(Step.REGISTER, id)
-        server.backupGone += id
+        server.backupGone[id] = PHOTO_WAS_REMOVED
         // Signal for the backup alone: the OneDrive step is still waiting for its turn.
         await("the backup lined up") { work(Step.BACKUP, id).any { it.state == WorkInfo.State.ENQUEUED } }
         work(Step.BACKUP, id).filter { it.state == WorkInfo.State.ENQUEUED }.forEach { driver.setAllConstraintsMet(it.id) }
@@ -1585,8 +1613,8 @@ private class PhotoServer : Api by notCalled() {
     /** R97: registering these answers "removed" (an admin deleted the photo before this phone heard of it). */
     val removedOnServer: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
-    /** R97: these photos' backups answer 410 "Photo was removed". */
-    val backupGone: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    /** R97, R98: these photos' backups answer 410 with this message ("Photo was removed", or another 410's). */
+    val backupGone = ConcurrentHashMap<String, String>()
 
     /** R96: every registration answers 410 "Job was deleted", as the server does for a deleted job's photo. */
     @Volatile var jobDeleted = false
@@ -1600,7 +1628,7 @@ private class PhotoServer : Api by notCalled() {
 
     override suspend fun registerPhoto(r: PhotoRegistration): RegisteredPhoto {
         registerCalls.incrementAndGet()
-        if (jobDeleted) throw ApiException(410, "Job was deleted")
+        if (jobDeleted) throw ApiException(410, JOB_WAS_DELETED)
         val reply = synchronized(lock) {
             registrations.putIfAbsent(r.id, r)
             val status = if (r.id in removedOnServer) PhotoStatus.removed else PhotoStatus.registered
@@ -1630,7 +1658,7 @@ private class PhotoServer : Api by notCalled() {
 
     override suspend fun backupChunk(id: String, offset: Long, bytes: ByteArray): Pair<Long, Boolean> {
         if (id in backupBlocked) throw IOException("Can't reach the server")
-        if (id in backupGone) throw ApiException(410, "Photo was removed")
+        backupGone[id]?.let { throw ApiException(410, it) }
         maxBackupsAtOnce.accumulateAndGet(backupsAtOnce.incrementAndGet(), ::maxOf)
         try {
             delay(backupDelayMs) // the chunk on its way

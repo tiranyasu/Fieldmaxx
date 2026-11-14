@@ -148,6 +148,15 @@ data class PhotoRegistration(
 @Serializable
 data class RegisteredPhoto(val fileName: String, val status: PhotoStatus, val backupOffset: Long)
 
+/**
+ * The server's HTTP 410 messages about photos, shared so the server's answer and the phone's match can't drift apart.
+ * [JOB_WAS_DELETED] answers a registration for a deleted job: the phone holds the photo until the job is restored
+ * (R96). [PHOTO_WAS_REMOVED] answers a removed photo's backup: the only 410 on which the phone discards a photo not yet
+ * in OneDrive (R97); a job deleted never discards one (R98).
+ */
+const val JOB_WAS_DELETED = "Job was deleted"
+const val PHOTO_WAS_REMOVED = "Photo was removed"
+
 @Serializable
 data class CrewPosition(
     val userId: String,

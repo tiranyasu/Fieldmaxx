@@ -1,6 +1,7 @@
 package com.fieldmaxx.server.delivery
 
 import com.fieldmaxx.core.model.Change
+import com.fieldmaxx.core.model.PHOTO_WAS_REMOVED
 import com.fieldmaxx.core.model.PhotoStatus
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
@@ -577,7 +578,7 @@ fun retryPhoto(ctx: Ctx, admin: User, photoId: String) {
     val change = ctx.db.tx {
         val p = photoInfo(photoId) ?: throw HttpError(HttpStatusCode.NotFound, "Photo not found")
         if (p.confirmedAt != null) throw HttpError(HttpStatusCode.Conflict, "Photo already delivered")
-        if (p.status == PhotoStatus.removed) throw HttpError(HttpStatusCode.Gone, "Photo was removed")
+        if (p.status == PhotoStatus.removed) throw HttpError(HttpStatusCode.Gone, PHOTO_WAS_REMOVED)
         prepareStatement(
             "UPDATE photos SET status = 'registered', attempts = 0, last_error = NULL, next_attempt_at = NULL, busy_checks = 0, " +
                 "od_upload_id = NULL, od_offset = NULL, od_upload_path = NULL WHERE id = ?",

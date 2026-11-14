@@ -156,8 +156,9 @@ internal sealed interface Outcome {
  *   next try with APPEND_OR_REPLACE after [nextDelayMs] (KEEP from a running worker would drop it, R55): 15 s doubling,
  *   stuck after 6 attempts and then every 30 min, reported to the server once stuck (R56 opIds).
  * - Waiting for a link, a folder choice or a deleted point's fate is not a failure (R58, R67): the photo waits, and
- *   in-process watchers line it up again when its job, point or the outbox change. A deleted job holds all its photos
- *   the same way, never discarding one, until an admin restores it (R96, spec §6.2).
+ *   in-process watchers line it up again when its job, point or the outbox change. A deleted job holds its photos'
+ *   delivery the same way, never discarding one, until an admin restores it (R96, spec §6.2); their server backup still
+ *   goes on (R98).
  * - A photo the server shows removed before it reached OneDrive (an admin's delete) is never delivered (R86): each step,
  *   and the watcher for a photo that waits, discard it as [discardIfRemoved] says.
  * - A photo deleted on this phone keeps a tombstone (fix round 1): each step finishes its delete instead of running

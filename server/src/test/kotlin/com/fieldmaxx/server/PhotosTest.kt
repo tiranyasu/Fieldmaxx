@@ -1,8 +1,10 @@
 package com.fieldmaxx.server
 
 import com.fieldmaxx.core.FmxJson
+import com.fieldmaxx.core.model.JOB_WAS_DELETED
 import com.fieldmaxx.core.model.Op
 import com.fieldmaxx.core.model.OpResult
+import com.fieldmaxx.core.model.PHOTO_WAS_REMOVED
 import com.fieldmaxx.core.model.PhotoInfo
 import com.fieldmaxx.core.model.PhotoRegistration
 import com.fieldmaxx.core.model.PhotoStatus
@@ -157,6 +159,42 @@ class PhotosTest {
         app.ctx.db.tx { createStatement().use { it.execute("UPDATE points SET deleted_at = 5 WHERE id = 'pt-1'") } }
         assertEquals(HttpStatusCode.Gone, register(tokenFor("ann"), reg("ph-1", jpeg())).status)
         assertEquals(HttpStatusCode.NotFound, register(tokenFor("ann"), reg("ph-1", jpeg(), pointId = "nope")).status)
+    }
+
+    /**
+     * R98: a deleted job's photo is still backed up, whole, with no 410: the server copy is its protection while the job
+     * can be restored. Its takeover still waits for the restore (R96).
+     */
+    @Test fun deletedJobsPhotoStillBacksUp() = TestApp().run { app ->
+        seed(app)
+        val t = tokenFor("ann")
+        val bytes = jpeg()
+        registered(t, reg("ph-1", bytes))
+        app.ctx.db.tx { createStatement().use { it.execute("UPDATE jobs SET deleted_at = 5, deleted_by = 'creator' WHERE id = 'job-1'") } }
+        uploadAll(t, "ph-1", bytes) // every chunk answered 200, none 410
+        assertNotNull(col(app, "ph-1", "backup_received_at"))
+        assertEquals(PhotoStatus.registered, photo(app, "ph-1").status)
+        assertTrue(bytes.contentEquals(client.get("/api/photos/ph-1/file") { bearerAuth(t) }.bodyAsBytes()))
+    }
+
+    /** R98: the two 410s about photos carry core's shared messages, which the phone matches; only one is a removal. */
+    @Test fun goneAnswersCarryTheSharedMessages() = TestApp().run { app ->
+        seed(app)
+        val t = tokenFor("ann")
+        fun error(text: String) = Json.parseToJsonElement(text).jsonObject.getValue("error").jsonPrimitive.content
+
+        app.ctx.db.tx { createStatement().use { it.execute("UPDATE jobs SET deleted_at = 5 WHERE id = 'job-2'") } }
+        val job = register(t, reg("ph-2", jpeg(), pointId = "pt-2", jobId = "job-2"))
+        assertEquals(HttpStatusCode.Gone, job.status)
+        assertEquals(JOB_WAS_DELETED, error(job.bodyAsText()))
+
+        val bytes = jpeg()
+        registered(t, reg("ph-1", bytes))
+        assertTrue(send(t, Op.PhotoRemove("r1", "ph-1")).single().ok)
+        val removed = chunk(t, "ph-1", 0, bytes)
+        assertEquals(HttpStatusCode.Gone, removed.status)
+        assertEquals(PHOTO_WAS_REMOVED, error(removed.bodyAsText()))
+        assertEquals(listOf("Job was deleted", "Photo was removed"), listOf(JOB_WAS_DELETED, PHOTO_WAS_REMOVED), "the wording the crew's phones match")
     }
 
     @Test fun backupChunksCompleteWithShaCheck() = TestApp().run { app ->

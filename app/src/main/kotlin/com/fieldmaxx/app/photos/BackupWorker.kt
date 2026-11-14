@@ -6,6 +6,8 @@ import androidx.work.ExistingWorkPolicy
 import androidx.work.WorkerParameters
 import com.fieldmaxx.app.data.toPhoto
 import com.fieldmaxx.app.net.ApiException
+import com.fieldmaxx.core.model.JOB_WAS_DELETED
+import com.fieldmaxx.core.model.PHOTO_WAS_REMOVED
 import com.fieldmaxx.core.retry.nextDelayMs
 import java.io.File
 import java.io.IOException
@@ -22,7 +24,10 @@ import kotlinx.coroutines.withContext
 /** The server takes backup chunks of up to 2 MB; smaller ones lose less to a dropped signal. */
 internal const val BACKUP_CHUNK_BYTES = 1 shl 20
 
-/** The server answers with 410 a removed photo's backup ("Photo was removed"), or a deleted job's registration. */
+/**
+ * HTTP 410: a removed photo's backup ([PHOTO_WAS_REMOVED]), or a deleted job's registration ([JOB_WAS_DELETED]). The
+ * message tells them apart, and only the first is a removal.
+ */
 internal const val GONE = 410
 
 /** Step 6 of spec §6.6: the server's backup copy. */
@@ -40,19 +45,17 @@ class BackupWorker internal constructor(context: Context, params: WorkerParamete
  * Sends the stamped photo to `PUT /api/photos/{id}/backup` in resumable chunks, from where the server's copy ends, so a
  * photo reaches safety as soon as there is any signal, whatever becomes of its OneDrive upload (spec §6.6 step 6). One
  * backup at a time, and after OneDrive (R59). Its failures are its own: they never count toward the photo's OneDrive
- * attempts; it tries again after [nextDelayMs] of its own count ([attempt]), every 30 min at most. A photo whose job or
- * point is deleted waits as its other steps do (R96, R67), unless it is in OneDrive already: then it follows the normal
- * cleanup. A 410 is the server's "removed" (R97): a photo not in OneDrive yet is discarded as R86 has it, and its OneDrive
- * step with it; one in OneDrive already is only hidden, so its backup is simply over.
+ * attempts; it tries again after [nextDelayMs] of its own count ([attempt]), every 30 min at most. A photo whose point is
+ * deleted waits as its other steps do (R67), unless it is in OneDrive already: then it follows the normal cleanup. A
+ * deleted job's photo is backed up all the same, only its OneDrive step waits (R98): while the job can be restored, the
+ * server copy is the photo's only protection if this phone is lost. A 410 [PHOTO_WAS_REMOVED] is the server's "removed"
+ * (R97): a photo not in OneDrive yet is discarded as R86 has it, and its OneDrive step with it; one in OneDrive already is
+ * only hidden, so its backup is simply over. Any other 410, a job deleted among them, discards nothing: it is tried again.
  */
 internal suspend fun PhotoPipeline.backUp(id: String, attempt: Int) {
     val row = photos.get(id) ?: return
     if (finishIfDeleted(row) || discardIfRemoved(row)) return // deleted here (fix round 1), removed on the server (R86)
     if (row.backupDone || row.fileName == null) return // registering starts it
-    if (row.state != CONFIRMED && jobDeleted(row)) {
-        waitFor(row, Wait.JOB_DELETED)
-        return
-    }
     if (row.state != CONFIRMED && pointDeleted(row)) {
         waitFor(row, Wait.DELETED)
         return
@@ -68,7 +71,7 @@ internal suspend fun PhotoPipeline.backUp(id: String, attempt: Int) {
     } catch (e: CancellationException) {
         throw e
     } catch (e: ApiException) {
-        if (e.status == GONE) {
+        if (e.status == GONE && e.message == PHOTO_WAS_REMOVED) {
             val current = photos.get(id)
             if (current != null && current.state != CONFIRMED && db.photos().get(id)?.toPhoto()?.delivered() != true) {
                 withContext(NonCancellable) { discard(current) } // never delivered: meta.json, folder, row; its OneDrive step stops
