@@ -65,6 +65,7 @@ import com.fieldmaxx.core.model.Point
 import java.io.IOException
 import java.time.ZoneId
 import kotlin.math.max
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.NonCancellable
@@ -378,7 +379,8 @@ private suspend fun placeCamera(jobId: String, deps: MapDeps, controller: MapCon
 /**
  * The house-number overlay (R74, R75). Off: nothing drawn. On: once the camera has rested [HOUSE_NUMBER_DEBOUNCE_MS]
  * at zoom [HOUSE_NUMBER_MIN_ZOOM] or closer, the numbers of the screen's box are drawn; below that zoom they clear at
- * once. A failed or refused request leaves what was drawn as it is (no signal, or Overpass asking for patience).
+ * once. A failed or refused request leaves what was drawn as it is (no signal, or Overpass asking for patience), and so
+ * does any other failure of the loader (a NaN camera value, say): the overlay is never worth ending the app for.
  */
 private suspend fun runHouseNumbers(
     on: Boolean,
@@ -401,7 +403,9 @@ private suspend fun runHouseNumbers(
                 try {
                     val numbers = load(viewBBox(view, widthDp, heightDp))
                     withContext(Dispatchers.Main.immediate) { controller.setHouseNumbers(numbers) }
-                } catch (e: IOException) {
+                } catch (e: CancellationException) {
+                    throw e // the camera moved on (collectLatest), or the overlay was turned off
+                } catch (e: Exception) {
                     // The labels stay as they were.
                 }
             }

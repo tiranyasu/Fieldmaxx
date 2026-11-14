@@ -6,6 +6,7 @@ import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
 import androidx.work.WorkerParameters
 import com.fieldmaxx.app.data.LocalPhotoEntity
+import com.fieldmaxx.app.data.toPhoto
 import com.fieldmaxx.app.net.ApiException
 import com.fieldmaxx.core.model.PhotoRegistration
 import com.fieldmaxx.core.model.PhotoStatus
@@ -16,6 +17,9 @@ import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+
+/** The server's wording (photos/PhotoService.kt) when a photo's job was deleted: registration answers it with HTTP 410. */
+internal const val JOB_WAS_DELETED = "Job was deleted"
 
 /** Step 3 of spec §6.6, "stamped" → "registered". */
 class RegisterWorker internal constructor(context: Context, params: WorkerParameters, private val pipeline: PhotoPipeline) :
@@ -38,6 +42,10 @@ class RegisterWorker internal constructor(context: Context, params: WorkerParame
  * work): the server has the photo now. One deleted on this phone while the call was out (fix round 1, I2) gets its
  * PhotoRemove and nothing more. Its tombstone is read in the same transaction as the step's own record, so a delete
  * either comes before it and is seen here, or after it and finds the photo registered.
+ *
+ * The server's answer can say what this phone hasn't heard yet. "Removed" (an admin deleted the photo, R97): it is never
+ * delivered, and goes from this phone as R86 has it, unless the server shows it in OneDrive already. 410 "Job was
+ * deleted" (R96): it waits on this phone, undelivered and never stuck, until the job is restored.
  */
 internal suspend fun PhotoPipeline.register(id: String) = runStep(Step.REGISTER, id) { row ->
     val stamped = row.stampedFile() ?: return@runStep restampOrStuck(row)
@@ -52,7 +60,19 @@ internal suspend fun PhotoPipeline.register(id: String) = runStep(Step.REGISTER,
     } catch (e: IOException) {
         return@runStep Outcome.Failed(CANT_REACH_SERVER)
     } catch (e: ApiException) {
+        if (e.status == GONE && e.message == JOB_WAS_DELETED) {
+            return@runStep if (noteJobDeleted(row.jobId)) Outcome.Waiting(Wait.JOB_DELETED) else Outcome.Waiting(Wait.ROWS)
+        }
         return@runStep Outcome.Failed(e.message)
+    }
+    if (registered.status == PhotoStatus.removed) {
+        val gone = withContext(NonCancellable) {
+            val inOneDrive = db.photos().get(id)?.toPhoto()?.delivered() == true
+            // Not in OneDrive: never delivered. Its work stops, and its meta.json, folder and row go (R86's order).
+            if (!inOneDrive) photos.get(id)?.let { discard(it) }
+            !inOneDrive
+        }
+        if (gone) return@runStep Outcome.Done
     }
     withContext(NonCancellable) {
         val marked = db.withTransaction {
@@ -64,8 +84,8 @@ internal suspend fun PhotoPipeline.register(id: String) = runStep(Step.REGISTER,
             return@withContext
         }
         if (marked == 0) return@withContext // deleted meanwhile
-        if (registered.status == PhotoStatus.confirmed) {
-            // The server delivered it already (an answer lost long ago): nothing left for OneDrive.
+        if (registered.status == PhotoStatus.confirmed || registered.status == PhotoStatus.removed) {
+            // The server delivered it already (an answer lost long ago; removed after that, it only hides): nothing for OneDrive.
             photos.get(id)?.let { confirmedByServer(it, null, cancelUpload = false) }
         } else {
             enqueue(Step.ONEDRIVE, id, ExistingWorkPolicy.KEEP)

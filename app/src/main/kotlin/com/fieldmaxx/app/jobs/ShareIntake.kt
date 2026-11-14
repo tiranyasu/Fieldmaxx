@@ -116,7 +116,11 @@ fun readJobFile(resolver: ContentResolver, uri: Uri): JobFile {
     return JobFile(name, bytes)
 }
 
-/** Why [uri] can't be imported, or null when it is a PDF or a Word file. Reads no more of it than it must. */
+/**
+ * Why [uri] can't be imported, or null when it is a PDF or a Word file. Reads no more of it than it must. Whatever goes
+ * wrong reading it, the sharing app's provider failing included (ledger item 1), is "Couldn't open this file": never a
+ * crash of the share screen.
+ */
 internal fun refusalOf(resolver: ContentResolver, uri: Uri): String? = try {
     requireDocument(uri)
     val info = fileInfo(resolver, uri)
@@ -127,7 +131,7 @@ internal fun refusalOf(resolver: ContentResolver, uri: Uri): String? = try {
     }
 } catch (e: IOException) {
     CANT_OPEN
-} catch (e: SecurityException) {
+} catch (e: RuntimeException) { // SecurityException (the sharer took its permission back), or its provider failing
     CANT_OPEN
 }
 
@@ -175,11 +179,19 @@ internal fun jobFileKind(name: String, open: () -> InputStream): String? {
 
 private val ZIP_MAGIC = byteArrayOf(0x50, 0x4B, 0x03, 0x04)
 
+/**
+ * A ZIP holding `word/document.xml`. One that can't be read as a ZIP isn't a Word file: a broken one (ZipException), or
+ * one whose entry names aren't UTF-8, which Java's reader refuses with IllegalArgumentException (ledger item 1).
+ */
 private fun holdsWordDocument(open: () -> InputStream): Boolean = try {
     open().use { input ->
         ZipInputStream(input).use { zip -> generateSequence { zip.nextEntry }.any { it.name == "word/document.xml" } }
     }
 } catch (e: ZipException) {
+    false
+} catch (e: SecurityException) {
+    throw e // the sharer took its permission back: the file can't be opened, which is another answer
+} catch (e: RuntimeException) {
     false
 }
 

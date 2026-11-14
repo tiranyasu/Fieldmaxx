@@ -13,7 +13,6 @@ import com.fieldmaxx.app.net.ApiException
 import com.fieldmaxx.core.model.Op
 import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.naming.PointKey
-import com.fieldmaxx.core.retry.BUSY_RECHECK_MS
 import com.fieldmaxx.core.retry.nextDelayMs
 import com.fieldmaxx.sharepoint.ChunkSession
 import com.fieldmaxx.sharepoint.DestinationErrorCode
@@ -41,7 +40,7 @@ class OneDriveWorker internal constructor(context: Context, params: WorkerParame
     constructor(context: Context, params: WorkerParameters) : this(context, params, pipelineOf(context))
 
     override suspend fun doWork(): Result {
-        pipeline.uploadToOneDrive(inputData.photoId)
+        pipeline.uploadToOneDrive(inputData.photoId, inputData.getInt(KEY_BUSY_CHECKS, 0))
         return Result.success()
     }
 }
@@ -55,8 +54,9 @@ class OneDriveWorker internal constructor(context: Context, params: WorkerParame
  *   several candidates and it waits for the tech to pick one on the point sheet;
  * - then [send], and once OneDrive shows the file whole, "confirmed" and its report in one transaction (R56).
  * OneDrive's refusals (sign-in needed, no upload permission, not found) and network errors are failed attempts (R58).
+ * [busyChecks]: the BUSY answers in a row before this run (ledger item 6), from the work request.
  */
-internal suspend fun PhotoPipeline.uploadToOneDrive(id: String) = runStep(Step.ONEDRIVE, id) { row ->
+internal suspend fun PhotoPipeline.uploadToOneDrive(id: String, busyChecks: Int = 0) = runStep(Step.ONEDRIVE, id) { row ->
     db.photos().get(id)?.toPhoto()?.takeIf { it.delivered() }?.let { info ->
         confirmedByServer(row, info, cancelUpload = false)
         return@runStep Outcome.Done
@@ -65,13 +65,15 @@ internal suspend fun PhotoPipeline.uploadToOneDrive(id: String) = runStep(Step.O
     val link = job.fieldNotesUrl?.trim()?.takeIf { it.isNotEmpty() } ?: return@runStep Outcome.Waiting(Wait.LINK)
     if (db.points().get(row.pointId) == null) return@runStep Outcome.Waiting(Wait.ROWS)
     val stamped = row.stampedFile() ?: return@runStep restampOrStuck(row)
-    UploadGate.withOneDrive { deliver(id, link, stamped) }
+    UploadGate.withOneDrive { deliver(id, link, stamped, busyChecks) }
 }
 
-private suspend fun PhotoPipeline.deliver(id: String, link: String, stamped: File): Outcome {
-    // Read again: it may have been confirmed by the server, renamed, removed (R86) or deleted while it waited for a stream.
+private suspend fun PhotoPipeline.deliver(id: String, link: String, stamped: File, busyChecks: Int): Outcome {
+    // Read again: it may have been confirmed by the server, renamed, removed (R86) or deleted while it waited for a stream,
+    // or its job deleted (R96).
     val row = photos.get(id)?.takeIf { it.state == REGISTERED } ?: return Outcome.Done
     if (finishIfDeleted(row) || discardIfRemoved(row)) return Outcome.Done
+    if (jobDeleted(row)) return Outcome.Waiting(Wait.JOB_DELETED)
     val point = db.points().get(row.pointId)?.toPoint() ?: return Outcome.Waiting(Wait.ROWS)
     val dest = destinations(link)
     val folder = folderOf(point, dest) ?: return Outcome.Waiting(Wait.FOLDER)
@@ -84,7 +86,7 @@ private suspend fun PhotoPipeline.deliver(id: String, link: String, stamped: Fil
             Outcome.Done
         }
         Sent.Moved -> afterMove(id)
-        Sent.Busy -> Outcome.Later(BUSY_RECHECK_MS) // the server's delivery holds the file: not a failed attempt
+        Sent.Busy -> Outcome.Busy(busyChecks + 1) // the server's delivery holds the file: rechecked, counted only if it lasts
     }
 }
 
@@ -181,8 +183,9 @@ private suspend fun PhotoPipeline.upload(
         return Sent.Moved
     } catch (e: DestinationException) {
         if (e.code == DestinationErrorCode.BUSY) return Sent.Busy
-        if (e.code == DestinationErrorCode.EXISTS && resume == null) {
-            // Someone made the name between the check and the upload (the server's takeover, say): look again.
+        if (e.code == DestinationErrorCode.EXISTS) {
+            // Someone made the name between the check and the upload (the server's takeover, say); or the destination found
+            // another file at the name of a session SharePoint lost, and wrote nothing (m4). Look again.
             return when (io { dest.fileInfo(path) }?.size) {
                 size -> Sent.Delivered(name, path)
                 0L -> adopt(dest, folder, path, stamped, id, name)

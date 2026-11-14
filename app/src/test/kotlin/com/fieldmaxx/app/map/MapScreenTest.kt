@@ -28,6 +28,7 @@ import androidx.core.app.ActivityOptionsCompat
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import com.fieldmaxx.app.data.AppDatabase
+import com.fieldmaxx.app.data.toEntity
 import com.fieldmaxx.app.net.ApiException
 import com.fieldmaxx.app.net.DEFAULT_CONFIG
 import com.fieldmaxx.app.platform.Fix
@@ -704,6 +705,19 @@ class MapScreenTest {
         Thread.sleep(300)
         compose.waitForIdle()
         assertEquals(sixHouses, map.shownHouseNumbers, "no signal or a refusal: the overlay stays as it was")
+
+        // Ledger T31 M1: any other failure of the loader (a NaN camera value reaching roundToLong, say) is no crash either.
+        deps.houseAnswer = { throw IllegalArgumentException("Cannot round NaN value.") }
+        map.userMoves(CameraView(39.6420, -119.6920, 18.0))
+        map.rest()
+        waitFor { deps.houseRequests.size == 3 }
+        Thread.sleep(300)
+        compose.waitForIdle()
+        assertEquals(sixHouses, map.shownHouseNumbers)
+        deps.houseAnswer = { sixHouses.take(1) }
+        map.userMoves(CameraView(39.6430, -119.6930, 18.0))
+        map.rest()
+        waitFor { map.shownHouseNumbers == sixHouses.take(1) }
     }
 
     @Test fun waitingPhotoQueries() {
@@ -719,6 +733,13 @@ class MapScreenTest {
                 assertEquals(4, db.localPhotos().observeWaitingCount().first(), "every job's photos not in OneDrive yet")
                 assertEquals(setOf("p1", "p2"), db.localPhotos().observeWaitingPointIds("j1").first().toSet())
                 assertTrue(db.localPhotos().observeWaitingPointIds("j3").first().isEmpty())
+
+                // R96: a deleted job's photos wait for its restore, uncounted; a live job's stay counted, quotes in its name or all.
+                db.jobs().upsert(job("j1", "Run \"deletedAt\":5").toEntity(seq = 1, storedAt = 0))
+                db.jobs().upsert(job("j2").copy(deletedAt = 1_762_000_000_000).toEntity(seq = 1, storedAt = 0))
+                assertEquals(3, db.localPhotos().observeWaitingCount().first(), "j2's photo is left out")
+                db.jobs().upsert(job("j2").toEntity(seq = 2, storedAt = 0)) // restored
+                assertEquals(4, db.localPhotos().observeWaitingCount().first())
             }
         } finally {
             db.close()

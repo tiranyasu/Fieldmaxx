@@ -105,28 +105,39 @@ fun flagText(f: ImportFlag): String = when (f) {
 }
 
 /**
- * The import's points as they will be saved. When a query file's layer is renamed (`QUERY 1` → `QUERY 2`), its items
- * follow: `Query 1-14` becomes `Query 2-14`, so the label, the layer and the photos' folder agree. Other files keep
- * their labels; the layer only names them.
+ * The import's points as they will be saved. When a query file's layer is renamed to another query layer (`QUERY 1` →
+ * `QUERY 2`), its items follow: `Query 1-14` becomes `Query 2-14`, so the label, the layer and the photos' folder agree.
+ * Any other rename (a pole file's, or a query file's to a name that isn't a query layer) keeps the labels, and the
+ * layer only names them (ledger item 2).
  */
 fun pointsOf(s: CheckState, importId: String): List<DraftPoint> {
-    val preview = previewOf(s, importId)
+    val points = stored(s, importId)
+    val (from, to) = queryRename(s, previewOf(s, importId)) ?: return points
+    return points.map { p -> if (p.layer == from && p.type == from) p.copy(layer = to, type = to, label = pointLabel(to, to, p.num)) else p }
+}
+
+/** The query layer rename that relabels the import's items (`QUERY 1` to `QUERY 2`), or null. */
+private fun queryRename(s: CheckState, preview: ImportPreview): Pair<String, String>? {
     val from = preview.layerSuggestion
     val to = layerOf(s, preview)
-    val points = stored(s, importId)
-    if (to.isEmpty() || to == from || !(isQueryLayer(from) || isQueryLayer(to))) return points
-    return points.map { p -> if (p.layer == from && p.type == from) p.copy(layer = to, type = to, label = pointLabel(to, to, p.num)) else p }
+    return if (to.isNotEmpty() && to != from && isQueryLayer(from) && isQueryLayer(to)) from to to else null
 }
 
 /**
  * Changes a point from the tech's form. [coords] may be blank (the point stays without coordinates); otherwise it must
  * read as one pair. Flags about the old position go when it moves, "No label" when the label changes. Throws
- * [IllegalArgumentException] with [COORDINATES_NOT_RECOGNISED] or [LABEL_NOT_RECOGNISED].
+ * [IllegalArgumentException] with [COORDINATES_NOT_RECOGNISED] or [LABEL_NOT_RECOGNISED]. The form shows a renamed
+ * query file's labels (`Query 2-14`); a label that still follows the rename is kept under the layer before it, so it goes
+ * on following the layer field like the file's other items (ledger item 2).
  */
 fun editPoint(s: CheckState, importId: String, index: Int, label: String, coords: String, description: String): CheckState {
     val points = stored(s, importId)
     val old = points[index]
-    val key = parseLabel(label)
+    val typed = parseLabel(label)
+    val rename = queryRename(s, previewOf(s, importId))
+    val key = if (rename != null && typed.label == pointLabel(rename.second, rename.second, typed.num)) {
+        LabelKey(rename.first, rename.first, typed.num)
+    } else typed
     val c = if (coords.isBlank()) null else parseCoordinates(coords)
     val moved = c?.lat != old.lat || c?.lon != old.lon
     var flags = old.flags

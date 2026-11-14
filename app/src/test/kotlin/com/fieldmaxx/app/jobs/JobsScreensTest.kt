@@ -40,8 +40,10 @@ import androidx.room.Room
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import com.fieldmaxx.app.data.AppDatabase
+import com.fieldmaxx.app.net.AddedImport
 import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.ApiException
+import com.fieldmaxx.app.net.CreatedJob
 import com.fieldmaxx.app.net.OkHttpApi
 import com.fieldmaxx.app.sync.ALICE
 import com.fieldmaxx.app.sync.FakeLiveSocket
@@ -99,6 +101,7 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.GraphicsMode
 
 private const val SERVER = "https://fmx.example.com"
+private const val LINK_FOR_SAVE = "https://1drv.ms/f/c/0000000000000000/Field-Notes"
 private val ADMIN = User("u7", "owner", "Owner Admin", Role.admin, disabled = false)
 
 /** The server as the job screens use it; every other call fails the test. */
@@ -117,6 +120,10 @@ class JobsFakeApi : Api by notUsed() {
     /** Thrown by the next creates instead of creating. */
     @Volatile var createError: Exception? = null
     val downloads = CopyOnWriteArrayList<String>()
+
+    /** The labels the server skips as already in the job, for each create or added import. */
+    @Volatile var skipped: (importIds: List<String>) -> List<String> = { emptyList() }
+    val added = CopyOnWriteArrayList<Pair<String, JobImportInput>>()
 
     override suspend fun jobs(include: String?): List<JobListItem> {
         jobsCalls += include
@@ -139,11 +146,16 @@ class JobsFakeApi : Api by notUsed() {
         return importReply(name, bytes)
     }
 
-    override suspend fun createJob(i: CreateJobInput, requestId: String): Job {
+    override suspend fun createJob(i: CreateJobInput, requestId: String): CreatedJob {
         createKeys += requestId
         createError?.let { throw it }
         created += i
-        return job("j-new", i.name).copy(fieldNotesUrl = i.fieldNotesUrl)
+        return CreatedJob(job("j-new", i.name).copy(fieldNotesUrl = i.fieldNotesUrl), skipped(i.imports.map { it.importId }))
+    }
+
+    override suspend fun addImport(jobId: String, i: JobImportInput, requestId: String): AddedImport {
+        added += jobId to i
+        return AddedImport(emptyList(), skipped(listOf(i.importId)))
     }
 
     override suspend fun download(path: String, to: File) {
@@ -405,6 +417,66 @@ class JobsScreensTest {
         assertEquals((1..7).map { "POLE $it" }, input.imports.single().points.map { it.label })
     }
 
+    /** m1, spec §6.2 ("skipped and reported"): once saved, the points the server skipped as already in the job are named. */
+    @Test fun saveReportsTheSkippedDuplicates() {
+        val file = SharedFilesProvider.share("86", "A05J9XE.pdf", PDF_BYTES)
+        api.importReply = { name, _ -> preview((1..7).map { draft("POLE $it") }, fileName = name) }
+        api.skipped = { listOf("POLE 1", "POLE 2") }
+        var done: String? = null
+        compose.setContent {
+            FieldmaxxTheme {
+                NewJobScreen(api, openJob = {}, addToJobId = null, sharedFiles = listOf(file), sharedLink = LINK_FOR_SAVE, onDone = { done = it }, onBack = {})
+            }
+        }
+        waitForText("Found 7 POLE points")
+        compose.onNodeWithTag(CheckTags.SAVE).performClick()
+        waitForText("2 points were already in the job and were skipped: POLE 1, POLE 2.")
+        assertNull(done, "the map waits until it has been read")
+        compose.onNodeWithText("OK").performClick()
+        waitFor { done == "j-new" }
+
+        // Nothing skipped: straight to the map, as before.
+        assertEquals("1 point was already in the job and was skipped: POLE 3.", skippedNotice(listOf("POLE 3")))
+        assertEquals(
+            "12 points were already in the job and were skipped: " + (1..10).joinToString(", ") { "POLE $it" } + " and 2 more.",
+            skippedNotice((1..12).map { "POLE $it" }),
+        )
+    }
+
+    /** m1: adding a file to a job reports what was skipped too, across every file added. */
+    @Test fun addReportsTheSkippedDuplicates() {
+        val file = SharedFilesProvider.share("88", "A05J9XE.pdf", PDF_BYTES)
+        api.importReply = { name, _ -> preview((1..7).map { draft("POLE $it") }, fileName = name) }
+        api.skipped = { listOf("POLE 3") }
+        var done: String? = null
+        compose.setContent {
+            FieldmaxxTheme { NewJobScreen(api, openJob = {}, addToJobId = "j1", sharedFiles = listOf(file), sharedLink = null, onDone = { done = it }, onBack = {}) }
+        }
+        waitForText("Found 7 POLE points")
+        compose.onNodeWithTag(CheckTags.SAVE).performClick()
+        waitForText("1 point was already in the job and was skipped: POLE 3.")
+        compose.onNodeWithText("OK").performClick()
+        waitFor { done == "j1" }
+        assertEquals(listOf("j1"), api.added.map { it.first })
+    }
+
+    /** Ledger item 1: a file the phone can't decode or open shows our own wording on the check screen, never a decoder's. */
+    @Test fun unreadableFilesSayWhyInOurWords() {
+        val zip = SharedFilesProvider.share("89", "photos.zip", zipWithLatin1Names())
+        val broken = SharedFilesProvider.share("90", "A05J9XE", PDF_BYTES)
+        SharedFilesProvider.failures["90"] = IllegalStateException("the sharing app's provider died")
+        try {
+            compose.setContent {
+                FieldmaxxTheme { NewJobScreen(api, openJob = {}, addToJobId = null, sharedFiles = listOf(zip, broken), sharedLink = null, onDone = {}, onBack = {}) }
+            }
+            waitForText("photos.zip: Only PDF and Word (.docx) files")
+            waitForText("A05J9XE: Couldn't open this file on the phone. Pick or share it again.")
+            assertTrue(api.imported.isEmpty())
+        } finally {
+            SharedFilesProvider.failures.remove("90")
+        }
+    }
+
     @Test fun unreadLinesStayUntilFixedOrIgnored() {
         val file = SharedFilesProvider.share("85", "A05J9XE.pdf", PDF_BYTES)
         val pole9 = UnreadLine("POLE 9 = 39.63,abc", 1, "type and number without readable coordinates")
@@ -652,6 +724,25 @@ class JobsScreensTest {
         assertEquals("${context.packageName}.files", view.data!!.authority)
         assertTrue(view.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0, "the viewer may read it")
         assertTrue(File(context.cacheDir, "shared").walk().any { it.name == "A05J9XE.pdf" }, "handed over from cacheDir/shared/")
+    }
+
+    /** Ledger item 1: a shared ZIP with undecodable names, or a sharing app that fails, is refused in words: never a crash. */
+    @Test fun shareOfUnreadableFilesIsRefusedNotACrash() {
+        val zip = SharedFilesProvider.share("93", "photos.zip", zipWithLatin1Names())
+        val broken = SharedFilesProvider.share("94", "A05J9XE", PDF_BYTES)
+        val pdf = SharedFilesProvider.share("95", "A05K51V.pdf", PDF_BYTES)
+        SharedFilesProvider.failures["94"] = IllegalStateException("the sharing app's provider died")
+        try {
+            compose.setContent {
+                FieldmaxxTheme { ShareIntakeScreen(SharedIntake.Files(listOf(zip, broken, pdf)), jobs, onNewJob = { _, _ -> }, onAddToJob = { _, _, _ -> }, onClose = {}) }
+            }
+            waitForText("photos.zip: Only PDF and Word (.docx) files")
+            waitForText("A05J9XE: Couldn't open this file. Share or pick it again.")
+            compose.onNodeWithText("A05K51V.pdf").assertIsDisplayed()
+            compose.onNodeWithText("New job").assertIsDisplayed()
+        } finally {
+            SharedFilesProvider.failures.remove("94")
+        }
     }
 
     @Test fun shareOffersNewJobOrAddToJob() {

@@ -131,6 +131,50 @@ class CheckModelTest {
         assertEquals(listOf("Found 1 QUERY 2 point"), summary(pointsOf(s, "imp2")))
     }
 
+    private fun queryPoint(num: String) = draft("Query 1-$num").copy(layer = "QUERY 1", type = "QUERY 1", num = num)
+
+    private val queryFile = preview(
+        listOf(queryPoint("14"), queryPoint("25A")), importId = "imp2", fileName = "QUERY_1_-_A05K51V.docx", layer = "QUERY 1", notes = "",
+    )
+
+    /** Ledger item 2: renaming a layer relabels a file's points only from one query layer to another. */
+    @Test fun layerRenameRelabelsOnlyQueryToQuery() {
+        val s = checkStateOf(listOf(preview(listOf(draft("POLE 1"), draft("POLE 2"))), queryFile))
+        fun keys(points: List<DraftPoint>) = points.map { listOf(it.layer, it.type, it.num, it.label) }
+
+        // Pole file → a query-like layer name: the poles stay poles.
+        assertEquals(
+            listOf(listOf("POLE", "POLE", "1", "POLE 1"), listOf("POLE", "POLE", "2", "POLE 2")),
+            keys(pointsOf(setLayer(s, "imp1", "QUERY 2"), "imp1")),
+        )
+        // Query file → a layer that isn't a query's: the items keep their query labels (and their photos' folder).
+        assertEquals(
+            listOf(listOf("QUERY 1", "QUERY 1", "14", "Query 1-14"), listOf("QUERY 1", "QUERY 1", "25A", "Query 1-25A")),
+            keys(pointsOf(setLayer(s, "imp2", "Extra photos"), "imp2")),
+        )
+        // Query → query: the items follow.
+        assertEquals(
+            listOf(listOf("QUERY 2", "QUERY 2", "14", "Query 2-14"), listOf("QUERY 2", "QUERY 2", "25A", "Query 2-25A")),
+            keys(pointsOf(setLayer(s, "imp2", "QUERY 2"), "imp2")),
+        )
+    }
+
+    /** Ledger item 2: a point edited under the renamed label keeps following the layer field, however often it changes. */
+    @Test fun editedPointKeepsFollowingTheRename() {
+        val renamed = setLayer(checkStateOf(listOf(queryFile)), "imp2", "QUERY 2")
+        val edited = editPoint(renamed, "imp2", 0, "Query 2-14", "39.636130, -119.691104", "Behind the shed") // as the screen shows it
+        assertEquals("Query 2-14", pointsOf(edited, "imp2")[0].label)
+        assertEquals(listOf("QUERY 1", "Query 1-14"), edited.edits.getValue("imp2")[0].let { listOf(it.layer, it.label) }, "kept under the layer before the rename")
+        assertEquals(listOf("Query 3-14", "Query 3-25A"), pointsOf(setLayer(edited, "imp2", "QUERY 3"), "imp2").map { it.label })
+        assertEquals(listOf("Query 1-14", "Query 1-25A"), pointsOf(setLayer(edited, "imp2", "QUERY 1"), "imp2").map { it.label })
+        assertEquals("Behind the shed", toJobImports(edited).single().points[0].description)
+
+        // A label moved to another query layer of the tech's own stays as typed.
+        val moved = editPoint(renamed, "imp2", 0, "Query 5-14", "39.636130, -119.691104", "")
+        assertEquals("Query 5-14", pointsOf(moved, "imp2")[0].label)
+        assertEquals("Query 5-14", pointsOf(setLayer(moved, "imp2", "QUERY 3"), "imp2")[0].label)
+    }
+
     @Test fun labelsAreReadLikeTheFile() {
         val s = checkStateOf(listOf(preview(listOf(draft("POLE 1")))))
 

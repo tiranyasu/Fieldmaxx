@@ -14,6 +14,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -23,11 +24,13 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -45,6 +48,7 @@ import com.fieldmaxx.core.model.CreateJobInput
 import com.fieldmaxx.core.model.ImportPreview
 import java.io.IOException
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -102,6 +106,13 @@ class NewJobModel(
     var savedJobId by mutableStateOf<String?>(null)
         private set
 
+    /**
+     * Spec §6.2 (m1): the labels of the points the server skipped as already in the job (same label within 1 m), from
+     * every file saved; named to the tech once the save is done ([skippedNotice]).
+     */
+    var skipped by mutableStateOf<List<String>>(emptyList())
+        private set
+
     /** Files were picked or taken from the share; a rotation doesn't ask again. */
     var started = false
     private var nameEdited = false
@@ -140,13 +151,15 @@ class NewJobModel(
                 reading = shown
                 val file = try {
                     withContext(Dispatchers.IO) { readJobFile(resolver, uri) }
-                } catch (e: IllegalArgumentException) { // not a PDF or a Word file, or too large
-                    bad += FailedFile(uri, shown, e.message ?: ONLY_JOB_FILES)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: IllegalArgumentException) { // not a PDF or a Word file, or too large: only our own words show
+                    bad += FailedFile(uri, shown, e.message?.takeIf { it == ONLY_JOB_FILES || it == FILE_TOO_LARGE } ?: CANT_READ_FILE)
                     continue
                 } catch (e: IOException) {
                     bad += FailedFile(uri, shown, CANT_READ_FILE)
                     continue
-                } catch (e: SecurityException) { // the sharing app took its permission back
+                } catch (e: RuntimeException) { // the sharing app took its permission back, or its provider failed
                     bad += FailedFile(uri, shown, CANT_READ_FILE)
                     continue
                 }
@@ -174,8 +187,9 @@ class NewJobModel(
 
     /**
      * Creates the job, or adds each file to [addToJobId] under its own key derived from [requestId]; a file added is
-     * dropped from the screen, so trying again after a failure sends only the rest. Then the job is opened on the phone
-     * (failures there don't matter: the map opens it again) and [savedJobId] is set.
+     * dropped from the screen, so trying again after a failure sends only the rest. What the server skipped as repeats
+     * goes into [skipped]. Then the job is opened on the phone (failures there don't matter: the map opens it again) and
+     * [savedJobId] is set.
      */
     fun save() {
         val s = state ?: return
@@ -186,10 +200,14 @@ class NewJobModel(
             try {
                 val jobId = addToJobId?.also { id ->
                     for (imp in toJobImports(s)) {
-                        api.addImport(id, imp, "$requestId/${imp.importId}")
+                        val added = api.addImport(id, imp, "$requestId/${imp.importId}")
+                        skipped = skipped + added.skippedDuplicates
                         state = state?.without(imp.importId)
                     }
-                } ?: api.createJob(CreateJobInput(name.trim(), link.trim().ifEmpty { null }, toJobImports(s)), requestId).id
+                } ?: api.createJob(CreateJobInput(name.trim(), link.trim().ifEmpty { null }, toJobImports(s)), requestId).let { created ->
+                    skipped = created.skippedDuplicates
+                    created.job.id
+                }
                 unsure = false
                 try {
                     openJob(jobId)
@@ -245,7 +263,21 @@ fun NewJobScreen(
         if (sharedFiles.isNotEmpty()) model.read(sharedFiles) else pick()
     }
     val saved = model.savedJobId
-    LaunchedEffect(saved) { if (saved != null) onDone(saved) }
+    // Saved with repeats skipped: the tech reads which first (spec §6.2: "skipped and reported"), then the map opens.
+    LaunchedEffect(saved) { if (saved != null && model.skipped.isEmpty()) onDone(saved) }
+    var noticeRead by rememberSaveable { mutableStateOf(false) }
+    if (saved != null && model.skipped.isNotEmpty() && !noticeRead) {
+        val read = {
+            noticeRead = true
+            onDone(saved)
+        }
+        AlertDialog(
+            onDismissRequest = read,
+            title = { Text("Saved") },
+            text = { Text(skippedNotice(model.skipped)) },
+            confirmButton = { TextButton(onClick = read) { Text("OK") } },
+        )
+    }
 
     if (model.state != null) {
         CheckScreen(model, api, onBack)
@@ -288,6 +320,20 @@ private fun Reading(model: NewJobModel, onPick: () -> Unit, onBack: () -> Unit) 
             }
         }
     }
+}
+
+/** How many labels [skippedNotice] names before it says how many more. */
+private const val SKIPPED_SHOWN = 10
+
+/**
+ * Spec §6.2 ("skipped and reported", m1): what the tech reads once a save is done when the server skipped points as
+ * already in the job: "2 points were already in the job and were skipped: POLE 1, POLE 2."
+ */
+internal fun skippedNotice(labels: List<String>): String {
+    val n = labels.size
+    val head = if (n == 1) "1 point was already in the job and was skipped" else "$n points were already in the job and were skipped"
+    val named = labels.take(SKIPPED_SHOWN).joinToString(", ") + if (n > SKIPPED_SHOWN) " and ${n - SKIPPED_SHOWN} more" else ""
+    return "$head: $named."
 }
 
 /** Every file that couldn't be read, with the reason: none is dropped without a word. */

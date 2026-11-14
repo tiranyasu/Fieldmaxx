@@ -1,5 +1,6 @@
 package com.fieldmaxx.app
 
+import com.fieldmaxx.app.net.AddedImport
 import com.fieldmaxx.app.net.ApiException
 import com.fieldmaxx.app.net.AuthInterceptor
 import com.fieldmaxx.app.net.InMemoryTokenVault
@@ -156,8 +157,10 @@ class ApiTest {
         server.enqueue(json("""{"job":$job,"skippedDuplicates":[]}""", code = 201))
         server.enqueue(json("""{"points":[],"skippedDuplicates":["POLE 1"]}""", code = 201))
 
-        assertEquals("j1", api.createJob(CreateJobInput("A05J9XE", null, emptyList()), requestId = "draft-7").id)
-        assertEquals(emptyList(), api.addImport("j1", JobImportInput("imp1", "POLE", "", emptyList()), requestId = "draft-8/imp1"))
+        val created = api.createJob(CreateJobInput("A05J9XE", null, emptyList()), requestId = "draft-7")
+        assertEquals("j1" to emptyList(), created.job.id to created.skippedDuplicates)
+        // m1: the points the server skipped as already in the job are read from its answer, to be shown.
+        assertEquals(AddedImport(emptyList(), listOf("POLE 1")), api.addImport("j1", JobImportInput("imp1", "POLE", "", emptyList()), requestId = "draft-8/imp1"))
         val create = server.takeRequest()
         assertEquals("POST /api/jobs", "${create.method} ${create.path}")
         assertEquals("draft-7", create.getHeader("Idempotency-Key"))

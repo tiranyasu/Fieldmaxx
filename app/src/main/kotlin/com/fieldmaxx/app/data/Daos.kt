@@ -16,6 +16,13 @@ const val DELETED_PHOTO_PREFIX = "photoDeleted:"
 /** SQL: the LocalPhotoEntity row's photo has no tombstone. Counts of this phone's photos leave deleted ones out. */
 private const val NOT_DELETED = "('" + DELETED_PHOTO_PREFIX + "' || id) NOT IN (SELECT `key` FROM MetaEntity)"
 
+/**
+ * SQL: the LocalPhotoEntity row's job isn't deleted on this phone (R96: a deleted job's photos wait, uncounted). The job is
+ * stored as FmxJson text, which always writes `"deletedAt":` with the time once deleted and `null` before; a quote inside a
+ * name or note is escaped there, so only the field itself can match. (No json_extract: older phones' SQLite lacks it.)
+ */
+private const val JOB_NOT_DELETED = "jobId NOT IN (SELECT id FROM JobEntity WHERE json GLOB '*\"deletedAt\":[0-9]*')"
+
 // Lists come back in insertion order (rowid): a job's points in the order its snapshot listed them, later ones after.
 // @Upsert updates an existing row in place, so a row keeps its place.
 
@@ -153,9 +160,9 @@ interface LocalPhotoDao {
 
     /**
      * This phone's photos that OneDrive hasn't confirmed yet, across all jobs: the map's "3 photos waiting" (R40).
-     * Deleted ones are left out.
+     * Deleted ones are left out, and so are those of a deleted job, which wait for its restore (R96).
      */
-    @Query("SELECT COUNT(*) FROM LocalPhotoEntity WHERE state != 'confirmed' AND " + NOT_DELETED)
+    @Query("SELECT COUNT(*) FROM LocalPhotoEntity WHERE state != 'confirmed' AND " + NOT_DELETED + " AND " + JOB_NOT_DELETED)
     fun observeWaitingCount(): Flow<Int>
 
     /** The job's points with a photo on this phone that OneDrive hasn't confirmed yet: the map's badge. Deleted ones left out. */

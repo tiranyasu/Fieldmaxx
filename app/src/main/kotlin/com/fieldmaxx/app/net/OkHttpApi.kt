@@ -51,8 +51,8 @@ import okhttp3.Response
 @Serializable private class ChangesReply(val changes: List<Change>, val seq: Long)
 @Serializable private class OpsBody(val ops: List<Op>)
 @Serializable private class OpsReply(val results: List<OpResult>)
-@Serializable private class CreateJobReply(val job: Job)
-@Serializable private class AddImportReply(val points: List<Point>)
+@Serializable private class CreateJobReply(val job: Job, val skippedDuplicates: List<String> = emptyList())
+@Serializable private class AddImportReply(val points: List<Point>, val skippedDuplicates: List<String> = emptyList())
 @Serializable private class PatchJobBody(val name: String?, val fieldNotesUrl: String?, val notes: String?)
 @Serializable private class LinkBody(val url: String)
 @Serializable private class PositionsReply(val positions: List<CrewPosition>)
@@ -98,11 +98,12 @@ class OkHttpApi(private val client: OkHttpClient, private val baseUrl: () -> Str
         return call("POST", endpoint("api", "imports"), form)
     }
 
-    override suspend fun createJob(i: CreateJobInput, requestId: String): Job =
-        call<CreateJobReply>("POST", endpoint("api", "jobs"), json(i), idempotencyKey = requestId).job
+    override suspend fun createJob(i: CreateJobInput, requestId: String): CreatedJob =
+        call<CreateJobReply>("POST", endpoint("api", "jobs"), json(i), idempotencyKey = requestId).let { CreatedJob(it.job, it.skippedDuplicates) }
 
-    override suspend fun addImport(jobId: String, i: JobImportInput, requestId: String): List<Point> =
-        call<AddImportReply>("POST", endpoint("api", "jobs", jobId, "imports"), json(i), idempotencyKey = requestId).points
+    override suspend fun addImport(jobId: String, i: JobImportInput, requestId: String): AddedImport =
+        call<AddImportReply>("POST", endpoint("api", "jobs", jobId, "imports"), json(i), idempotencyKey = requestId)
+            .let { AddedImport(it.points, it.skippedDuplicates) }
 
     override suspend fun patchJob(jobId: String, name: String?, fieldNotesUrl: String?, notes: String?): Job =
         call("PATCH", endpoint("api", "jobs", jobId), json(PatchJobBody(name, fieldNotesUrl, notes)))

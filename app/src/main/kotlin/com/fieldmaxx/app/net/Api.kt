@@ -27,6 +27,12 @@ import com.fieldmaxx.core.model.User
 /** The server answered with an error status; [message] is its `{"error"}` text, ready to show. */
 class ApiException(val status: Int, override val message: String) : Exception(message)
 
+/** A job [Api.createJob] made, and the labels of the points the server skipped as already in it (spec §6.2). */
+data class CreatedJob(val job: Job, val skippedDuplicates: List<String>)
+
+/** The points [Api.addImport] added, and the labels of those the server skipped as already in the job (spec §6.2). */
+data class AddedImport(val points: List<Point>, val skippedDuplicates: List<String>)
+
 /**
  * The Fieldmaxx server, signed in with the session token from the [TokenVault]. Every call throws [ApiException]
  * when the server answers with an error status (401 "Sign in required" once the session has ended) and an
@@ -56,15 +62,16 @@ interface Api {
 
     /**
      * [requestId] goes as the `Idempotency-Key` header: sent again (a retry after a lost reply), the server answers with
-     * the job it created the first time and creates no other (R44).
+     * the job it created the first time and creates no other (R44). A point repeated within the files (same label within
+     * 1 m) is made once; the rest are skipped and named in the answer.
      */
-    suspend fun createJob(i: CreateJobInput, requestId: String): Job
+    suspend fun createJob(i: CreateJobInput, requestId: String): CreatedJob
 
     /**
-     * Adds a checked import to an existing job; returns the points created (identical ones are skipped). A [requestId]
-     * sent again adds nothing more (R44).
+     * Adds a checked import to an existing job; returns the points created, and the labels of those skipped as already in
+     * the job (same label within 1 m). A [requestId] sent again adds nothing more (R44).
      */
-    suspend fun addImport(jobId: String, i: JobImportInput, requestId: String): List<Point>
+    suspend fun addImport(jobId: String, i: JobImportInput, requestId: String): AddedImport
 
     /** Changes only the fields given; an empty [fieldNotesUrl] removes the link. */
     suspend fun patchJob(jobId: String, name: String? = null, fieldNotesUrl: String? = null, notes: String? = null): Job

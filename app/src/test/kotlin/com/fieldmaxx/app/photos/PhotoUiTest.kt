@@ -3,6 +3,7 @@ package com.fieldmaxx.app.photos
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.database.sqlite.SQLiteFullException
 import android.net.Uri
 import androidx.activity.ComponentActivity
 import androidx.compose.runtime.collectAsState
@@ -140,8 +141,12 @@ private class FakeStripDeps(context: Context) : PhotoStripDeps {
         retried += localPhotoId
     }
 
+    /** Thrown by the next removals, after they are recorded: Room's SQLITE_FULL on a full phone, say. */
+    @Volatile var removeFailure: Exception? = null
+
     override suspend fun remove(photoId: String) {
         removed += photoId
+        removeFailure?.let { throw it }
     }
 }
 
@@ -712,6 +717,24 @@ class PhotoUiTest {
         assertEquals(emptyList(), strip.removed.toList(), "not before it is confirmed")
         press(PhotoTags.REMOVE_CONFIRM)
         waitFor { strip.removed.toList() == listOf("up") }
+    }
+
+    /** Ledger item 9: a delete that fails (a full phone: Room's SQLITE_FULL) says so and can be tried again; the app carries on. */
+    @Test fun aFailedDeleteSaysSoAndNeverCrashes() {
+        strip.removeFailure = SQLiteFullException("database or disk is full (code 13 SQLITE_FULL)")
+        showStrip(photoViews(listOf(mine("up", REGISTERED, fileName = NAME_18)), emptyList(), SERVER))
+        tapPhoto("up")
+        press(PhotoTags.REMOVE)
+        press(PhotoTags.REMOVE_CONFIRM)
+        waitForText("Couldn't delete the photo. Free some space on the phone and try again.")
+        assertEquals(listOf("up"), strip.removed.toList())
+
+        strip.removeFailure = null
+        tapPhoto("up")
+        press(PhotoTags.REMOVE)
+        press(PhotoTags.REMOVE_CONFIRM)
+        waitFor { strip.removed.toList() == listOf("up", "up") }
+        waitFor { !hasTextNode("Couldn't delete the photo. Free some space on the phone and try again.") }
     }
 
     // ---- focused tests for the rulings ----

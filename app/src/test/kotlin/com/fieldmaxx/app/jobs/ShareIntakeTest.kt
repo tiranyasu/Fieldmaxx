@@ -41,6 +41,7 @@ class SharedFilesProvider : ContentProvider() {
     }
 
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
+        failures[uri.lastPathSegment]?.let { throw it }
         val (_, bytes) = files[uri.lastPathSegment] ?: throw FileNotFoundException(uri.toString())
         val file = File.createTempFile("shared", null, context!!.cacheDir).apply { writeBytes(bytes) }
         return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
@@ -55,6 +56,9 @@ class SharedFilesProvider : ContentProvider() {
         const val AUTHORITY = "com.fieldmaxx.test.shared"
         val files = ConcurrentHashMap<String, Pair<String, ByteArray>>()
 
+        /** Files whose sharing app fails as it hands them over: the provider throws this from openFile. */
+        val failures = ConcurrentHashMap<String, RuntimeException>()
+
         /** A content URI like the OneDrive app's: an id, no file name. */
         fun share(id: String, name: String, bytes: ByteArray): Uri {
             files[id] = name to bytes
@@ -62,6 +66,14 @@ class SharedFilesProvider : ContentProvider() {
         }
     }
 }
+
+/** A ZIP whose entry names aren't UTF-8 (made with another app's charset): Java's ZIP reader can't decode them. */
+internal fun zipWithLatin1Names(): ByteArray = ByteArrayOutputStream().also { out ->
+    ZipOutputStream(out, Charsets.ISO_8859_1).use { zip ->
+        zip.putNextEntry(ZipEntry("fotó 1.jpg"))
+        zip.write(1)
+    }
+}.toByteArray()
 
 /** The smallest Word file the reader would open: a ZIP holding word/document.xml. */
 internal fun docxBytes(): ByteArray = ByteArrayOutputStream().also { out ->
@@ -135,6 +147,24 @@ class ShareIntakeTest {
         val own = File(context.filesDir, "A05J9XE.pdf").apply { writeBytes(PDF_BYTES) }
         assertFailsWith<FileNotFoundException> { readJobFile(context.contentResolver, Uri.fromFile(own)) }
         assertEquals("Couldn't open this file. Share or pick it again.", refusalOf(context.contentResolver, Uri.fromFile(own)))
+    }
+
+    /** Ledger item 1: a ZIP with names Java's reader can't decode is refused in the server's words, not a crash. */
+    @Test fun zipWithUndecodableNamesIsRefusedNotACrash() {
+        val zip = SharedFilesProvider.share("71", "photos.zip", zipWithLatin1Names())
+        assertEquals("Only PDF and Word (.docx) files", refusalOf(context.contentResolver, zip))
+        assertEquals("Only PDF and Word (.docx) files", assertFailsWith<IllegalArgumentException> { readJobFile(context.contentResolver, zip) }.message)
+    }
+
+    /** Ledger item 1: the sharing app's provider failing while the file is read is "Couldn't open this file", not a crash. */
+    @Test fun providerThatFailsIsCantOpen() {
+        val broken = SharedFilesProvider.share("72", "A05J9XE", PDF_BYTES) // no extension: its first bytes are read
+        SharedFilesProvider.failures["72"] = IllegalStateException("the sharing app's provider died")
+        try {
+            assertEquals("Couldn't open this file. Share or pick it again.", refusalOf(context.contentResolver, broken))
+        } finally {
+            SharedFilesProvider.failures.remove("72")
+        }
     }
 
     @Test fun txtShareIsRefused() {

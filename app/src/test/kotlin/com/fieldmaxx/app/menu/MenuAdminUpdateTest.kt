@@ -770,6 +770,19 @@ class MenuAdminUpdateTest {
         assertTrue(registry.launches.isEmpty(), "no permission asked")
     }
 
+    /** Ledger item 14: MediaStore refusing the file (no unique name left, storage full) says so; the export never crashes. */
+    @Test fun exportSaveMediaStoreRefusesSaysSo() {
+        val downloads = Robolectric.setupContentProvider(Gallery::class.java, MediaStore.AUTHORITY)
+        downloads.insertFailure = IllegalStateException("Failed to build unique file: /storage/emulated/0/Download/A05J9XE_pole_data.csv")
+        api.served = { "Point\nPOLE 1\n".toByteArray() }
+        compose.setContent { Host { ExportDialog("j1", "A05J9XE", listOf(ExportKind.POLE_CSV), api, onDismiss = {}, sdk = 35) } }
+        waitForTag(ExportTags.SAVE)
+        tap(ExportTags.SAVE)
+        waitFor { exists(ExportTags.STATUS) && textOf(ExportTags.STATUS) == "Couldn't save it to Downloads. Share it instead." }
+        assertTrue(downloads.published.isEmpty())
+        assertTrue(exists(ExportTags.SHARE), "Share still works")
+    }
+
     @Test fun finishBlockedMessage() {
         assertEquals("7 points left, 3 photos not in OneDrive yet", finishBlockedMessage(FinishResult(false, 7, 3)))
         assertEquals("1 point left", finishBlockedMessage(FinishResult(false, 1, 0)))

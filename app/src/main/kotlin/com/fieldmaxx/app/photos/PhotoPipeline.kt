@@ -16,6 +16,7 @@ import androidx.work.workDataOf
 import com.fieldmaxx.app.FieldmaxxApp
 import com.fieldmaxx.app.data.AppDatabase
 import com.fieldmaxx.app.data.LocalPhotoEntity
+import com.fieldmaxx.app.data.toEntity
 import com.fieldmaxx.app.data.toJob
 import com.fieldmaxx.app.data.toOp
 import com.fieldmaxx.app.data.toPhoto
@@ -29,7 +30,10 @@ import com.fieldmaxx.core.FmxJson
 import com.fieldmaxx.core.model.Op
 import com.fieldmaxx.core.model.PhotoInfo
 import com.fieldmaxx.core.model.PhotoStatus
+import com.fieldmaxx.core.retry.BUSY_RECHECKS
+import com.fieldmaxx.core.retry.BUSY_TOO_LONG
 import com.fieldmaxx.core.retry.MAX_RETRY_DELAY_MS
+import com.fieldmaxx.core.retry.busyRecheckMs
 import com.fieldmaxx.core.retry.nextDelayMs
 import com.fieldmaxx.sharepoint.DestinationFactory
 import java.io.File
@@ -81,6 +85,9 @@ internal const val STAMPED_JPG = "stamped.jpg"
 internal const val KEY_PHOTO = "photoId"
 internal const val KEY_ATTEMPT = "attempt"
 
+/** The OneDrive step's BUSY answers in a row so far (ledger item 6), carried from one of its work requests to the next. */
+internal const val KEY_BUSY_CHECKS = "busyChecks"
+
 /** R67: how soon the server is asked again, while it can't be reached, whether a deleted point is deleted for good. */
 private const val DELETE_CHECK_FIRST_MS = 5_000L
 
@@ -108,6 +115,9 @@ internal enum class Wait {
 
     /** Its point is deleted (optimistically, or on the server). */
     DELETED,
+
+    /** Its job is deleted (R96, spec §6.2): the photo stays on this phone, undelivered, until an admin restores the job. */
+    JOB_DELETED,
 }
 
 /** How one run of a step ended. */
@@ -126,6 +136,13 @@ internal sealed interface Outcome {
 
     /** Not a failure, but the step goes again only after [delayMs]. */
     data class Later(val delayMs: Long) : Outcome
+
+    /**
+     * R82: SharePoint holds the photo's file for another upload session, the [checks]th answer so in a row. Looked at again
+     * after [busyRecheckMs] (2 min doubling to 30 min), uncounted for [BUSY_RECHECKS] in a row; each one after that is a
+     * failed attempt ([BUSY_TOO_LONG]), never retried sooner, so a lock that never goes ends stuck and reported (ledger 6).
+     */
+    data class Busy(val checks: Int) : Outcome
 }
 
 /**
@@ -139,7 +156,8 @@ internal sealed interface Outcome {
  *   next try with APPEND_OR_REPLACE after [nextDelayMs] (KEEP from a running worker would drop it, R55): 15 s doubling,
  *   stuck after 6 attempts and then every 30 min, reported to the server once stuck (R56 opIds).
  * - Waiting for a link, a folder choice or a deleted point's fate is not a failure (R58, R67): the photo waits, and
- *   in-process watchers line it up again when its job, point or the outbox change.
+ *   in-process watchers line it up again when its job, point or the outbox change. A deleted job holds all its photos
+ *   the same way, never discarding one, until an admin restores it (R96, spec §6.2).
  * - A photo the server shows removed before it reached OneDrive (an admin's delete) is never delivered (R86): each step,
  *   and the watcher for a photo that waits, discard it as [discardIfRemoved] says.
  * - A photo deleted on this phone keeps a tombstone (fix round 1): each step finishes its delete instead of running
@@ -226,7 +244,7 @@ class PhotoPipeline(
     /**
      * One run of a delivery step (stamp, register, OneDrive). A vanished row ends it quietly (R58). A photo deleted on this
      * phone has its delete finished (fix round 1), and one the server shows removed is discarded (R86). A row at another
-     * state lines up the step it is at instead. A deleted point holds the photo
+     * state lines up the step it is at instead. A deleted job holds the photo (R96), and so does a deleted point
      * (R67). Then [body]'s [Outcome] is recorded; a stopped worker records nothing (WorkManager runs it again).
      */
     internal suspend fun runStep(step: Step, id: String, body: suspend (LocalPhotoEntity) -> Outcome) {
@@ -234,6 +252,10 @@ class PhotoPipeline(
         if (finishIfDeleted(row) || discardIfRemoved(row)) return
         if (row.state != step.state) {
             enqueueCurrent(row, ExistingWorkPolicy.KEEP)
+            return
+        }
+        if (jobDeleted(row)) {
+            waitFor(row, Wait.JOB_DELETED)
             return
         }
         if (pointDeleted(row)) {
@@ -253,27 +275,32 @@ class PhotoPipeline(
             is Outcome.Later -> enqueue(step, id, ExistingWorkPolicy.APPEND_OR_REPLACE, outcome.delayMs)
             is Outcome.Failed -> failed(step, row, outcome.error, stuckNow = false)
             is Outcome.Stuck -> failed(step, row, outcome.error, stuckNow = true)
+            is Outcome.Busy -> if (outcome.checks <= BUSY_RECHECKS) {
+                enqueue(step, id, ExistingWorkPolicy.APPEND_OR_REPLACE, busyRecheckMs(outcome.checks), busyChecks = outcome.checks)
+            } else {
+                failed(step, row, BUSY_TOO_LONG, stuckNow = false, atLeastMs = busyRecheckMs(outcome.checks), busyChecks = outcome.checks)
+            }
         }
     }
 
     /**
-     * A failed attempt: counted, the next one lined up after its backoff (30 min once stuck). Once stuck, each failure is
-     * reported to the server, if the server knows the photo, in the same transaction (R56).
+     * A failed attempt: counted, the next one lined up after its backoff (30 min once stuck), never sooner than [atLeastMs].
+     * Once stuck, each failure is reported to the server, if the server knows the photo, in the same transaction (R56).
      * R83: the server refuses PhotoFailed for a photo it never registered, so one stuck before registering shows its reason
-     * and "Retry now" on this phone only.
+     * and "Retry now" on this phone only. [busyChecks]: the run of BUSY answers this failure continues (ledger item 6).
      */
-    private suspend fun failed(step: Step, row: LocalPhotoEntity, error: String, stuckNow: Boolean) {
+    private suspend fun failed(step: Step, row: LocalPhotoEntity, error: String, stuckNow: Boolean, atLeastMs: Long = 0, busyChecks: Int = 0) {
         currentCoroutineContext().ensureActive() // a stopped worker's error isn't the photo's
         val wait = db.withTransaction {
             val current = photos.get(row.id)?.takeIf { it.state == row.state } ?: return@withTransaction null
             val attempts = if (stuckNow) max(current.attempts + 1, STUCK_AFTER_ATTEMPTS) else current.attempts + 1
             val stuck = attempts >= STUCK_AFTER_ATTEMPTS
-            val wait = if (stuck) MAX_RETRY_DELAY_MS else nextDelayMs(attempts)
+            val wait = max(if (stuck) MAX_RETRY_DELAY_MS else nextDelayMs(attempts), atLeastMs)
             photos.recordFailure(row.id, row.state, attempts, now() + wait, error, stuck)
             if (stuck && row.state == REGISTERED) sync.enqueue(Op.PhotoFailed("photo.failed:${row.id}:$attempts", row.id, error, attempts))
             wait
         } ?: return
-        enqueue(step, row.id, ExistingWorkPolicy.APPEND_OR_REPLACE, wait)
+        enqueue(step, row.id, ExistingWorkPolicy.APPEND_OR_REPLACE, wait, busyChecks = busyChecks)
     }
 
     /** The photo waits for [reason] to go; if it went meanwhile, it goes on at once. */
@@ -298,9 +325,27 @@ class PhotoPipeline(
         Wait.FOLDER -> db.points().get(row.pointId)?.toPoint()?.let { it.folderPath != null || it.folderCandidates.isNullOrEmpty() } ?: true
         Wait.ROWS -> db.jobs().get(row.jobId) != null && db.points().get(row.pointId) != null
         Wait.DELETED -> !pointDeleted(row)
+        Wait.JOB_DELETED -> !jobDeleted(row.jobId)
     }
 
     internal suspend fun pointDeleted(row: LocalPhotoEntity): Boolean = db.points().get(row.pointId)?.toPoint()?.deletedAt != null
+
+    /** R96: the photo's job is deleted, on this phone's copy of it (the server's state, or the server's own refusal). */
+    internal suspend fun jobDeleted(row: LocalPhotoEntity): Boolean = jobDeleted(row.jobId)
+
+    private suspend fun jobDeleted(jobId: String): Boolean = db.jobs().get(jobId)?.toJob()?.deletedAt != null
+
+    /**
+     * R96: the server refused the photo's registration because its job is deleted, before this phone heard of it. The phone's
+     * copy of the job shows it deleted at once, its seq kept, so the server's next state of the job (its delete, or a
+     * restore) still replaces it. False when this phone has no copy of the job to mark.
+     */
+    internal suspend fun noteJobDeleted(jobId: String): Boolean = db.withTransaction {
+        val row = db.jobs().get(jobId) ?: return@withTransaction false
+        val job = row.toJob()
+        if (job.deletedAt == null) db.jobs().upsert(job.copy(deletedAt = now()).toEntity(row.seq, row.updatedAt))
+        true
+    }
 
     // ---- what the server and the points say (watched) ----
 
@@ -321,8 +366,9 @@ class PhotoPipeline(
      * Settles this phone's deletes first ([settleDeletes]), then brings into each unfinished photo what the server and its
      * point say: R86 (removed on the server before OneDrive, it is discarded, also while it waits for a link, a folder or a
      * stream), R67 (a deleted point holds its photos; once the
-     * server shows it deleted, those not in OneDrive are discarded), R57 (the server delivered the photo itself, or renamed
-     * it), the server's backup, and the photos waiting for a link, a folder or their rows.
+     * server shows it deleted, those not in OneDrive are discarded, but never those of a deleted job, R96), R57 (the server
+     * delivered the photo itself, or renamed it), the server's backup, and the photos waiting for a link, a folder, their
+     * rows or their job's restore.
      */
     internal suspend fun reconcile() = reconciling.withLock {
         settleDeletes()
@@ -332,7 +378,7 @@ class PhotoPipeline(
             if (discardIfRemoved(row, info)) continue // first: the photo is gone for everyone, whatever its point's fate
             if (row.state != CONFIRMED && pointDeleted(row)) {
                 val busy = inOutbox ?: pointsInOutbox().also { inOutbox = it }
-                if (row.pointId !in busy) checkDelete(row.jobId)
+                if (row.pointId !in busy && !jobDeleted(row)) checkDelete(row.jobId)
                 continue
             }
             if (info == null) continue
@@ -391,9 +437,9 @@ class PhotoPipeline(
         }
     }
 
-    /** The job's photos not in OneDrive whose point is deleted on this phone. */
+    /** The job's photos not in OneDrive whose point is deleted on this phone; none while the job is deleted (R96). */
     private suspend fun settling(jobId: String): List<LocalPhotoEntity> =
-        photos.unfinished().filter { it.jobId == jobId && it.state != CONFIRMED && pointDeleted(it) }
+        if (jobDeleted(jobId)) emptyList() else photos.unfinished().filter { it.jobId == jobId && it.state != CONFIRMED && pointDeleted(it) }
 
     /**
      * R67: the photo goes with its point; or alone, deleted before OneDrive (R64, Task 29's PhotoRemover). Its work stops, then
@@ -488,14 +534,16 @@ class PhotoPipeline(
 
     // ---- WorkManager ----
 
-    internal fun enqueue(step: Step, id: String, policy: ExistingWorkPolicy, delayMs: Long = 0, attempt: Int = 0) {
+    internal fun enqueue(step: Step, id: String, policy: ExistingWorkPolicy, delayMs: Long = 0, attempt: Int = 0, busyChecks: Int = 0) {
         val request = when (step) {
             Step.STAMP -> OneTimeWorkRequestBuilder<StampWorker>()
             Step.REGISTER -> OneTimeWorkRequestBuilder<RegisterWorker>()
             Step.ONEDRIVE -> OneTimeWorkRequestBuilder<OneDriveWorker>()
             Step.BACKUP -> OneTimeWorkRequestBuilder<BackupWorker>()
         }
-        request.setInputData(workDataOf(KEY_PHOTO to id, KEY_ATTEMPT to attempt)).addTag(PHOTO_WORK_TAG).addTag(photoTag(id))
+        request.setInputData(workDataOf(KEY_PHOTO to id, KEY_ATTEMPT to attempt, KEY_BUSY_CHECKS to busyChecks))
+            .addTag(PHOTO_WORK_TAG)
+            .addTag(photoTag(id))
         if (step != Step.STAMP) request.setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
         if (delayMs > 0) request.setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
         workManager.enqueueUniqueWork(step.workName(id), policy, request.build())

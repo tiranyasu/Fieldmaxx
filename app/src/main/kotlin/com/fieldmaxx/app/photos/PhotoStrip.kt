@@ -1,5 +1,6 @@
 package com.fieldmaxx.app.photos
 
+import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -41,11 +42,15 @@ import com.fieldmaxx.app.AppGraph
 import com.fieldmaxx.app.ui.FmxColors
 import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.model.User
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.launch
 
 private val TILE = 96.dp
 private val TILE_SHAPE = RoundedCornerShape(8.dp)
+
+/** Ledger item 9: a delete that failed, a full phone being the likely reason (Room's SQLITE_FULL). */
+internal const val DELETE_FAILED = "Couldn't delete the photo. Free some space on the phone and try again."
 
 object PhotoTags {
     fun tile(id: String) = "photo.tile:$id"
@@ -57,6 +62,7 @@ object PhotoTags {
     const val RETRY = "photo.retry"
     const val REMOVE = "photo.remove"
     const val REMOVE_CONFIRM = "photo.remove.confirm"
+    const val REMOVE_FAILED = "photo.remove.failed"
 }
 
 /** What the strip reads and does; [GraphPhotoStripDeps] in the app, a fake in tests. */
@@ -99,6 +105,7 @@ class GraphPhotoStripDeps(private val graph: AppGraph) : PhotoStripDeps {
 fun PhotoStrip(point: Point, photos: List<PhotoView>, deps: PhotoStripDeps) {
     if (photos.isEmpty()) return
     var selected by remember(point.id) { mutableStateOf<String?>(null) }
+    var deleteFailed by remember(point.id) { mutableStateOf(false) }
     val user by produceState<User?>(null, deps) { value = deps.user() }
     val scope = rememberCoroutineScope()
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -107,17 +114,31 @@ fun PhotoStrip(point: Point, photos: List<PhotoView>, deps: PhotoStripDeps) {
                 key(p.id) { Tile(p, p.id == selected, deps.imageLoader) { selected = if (selected == p.id) null else p.id } }
             }
         }
+        if (deleteFailed) Text(DELETE_FAILED, color = FmxColors.Warning, modifier = Modifier.testTag(PhotoTags.REMOVE_FAILED))
         photos.firstOrNull { it.id == selected }?.let { p ->
             key(p.id) {
                 Details(p, user, onRetry = { deps.retryNow(p.id) }) {
                     selected = null
-                    // Started at once, and it finishes even if the strip goes meanwhile ([PhotoRemover]).
-                    scope.launch(start = CoroutineStart.UNDISPATCHED) { deps.remove(p.id) }
+                    deleteFailed = false
+                    // Started at once, and it finishes even if the strip goes meanwhile ([PhotoRemover]). A delete that fails
+                    // (a full phone: Room's SQLITE_FULL) says so instead of ending the app (ledger item 9).
+                    scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                        try {
+                            deps.remove(p.id)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            Log.w(LOG_TAG, "Deleting photo ${p.id} failed", e)
+                            deleteFailed = true
+                        }
+                    }
                 }
             }
         }
     }
 }
+
+private const val LOG_TAG = "PhotoStrip"
 
 @Composable
 private fun Tile(p: PhotoView, selected: Boolean, imageLoader: ImageLoader, onClick: () -> Unit) {

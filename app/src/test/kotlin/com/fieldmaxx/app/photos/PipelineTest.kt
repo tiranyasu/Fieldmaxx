@@ -28,6 +28,7 @@ import com.fieldmaxx.app.AppGraph
 import com.fieldmaxx.app.FieldmaxxApp
 import com.fieldmaxx.app.data.AppDatabase
 import com.fieldmaxx.app.data.LocalPhotoEntity
+import com.fieldmaxx.app.data.toJob
 import com.fieldmaxx.app.data.toOp
 import com.fieldmaxx.app.data.toPhoto
 import com.fieldmaxx.app.data.toPoint
@@ -52,7 +53,10 @@ import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.model.RegisteredPhoto
 import com.fieldmaxx.core.naming.defaultFolderName
 import com.fieldmaxx.core.naming.photoFileName
+import com.fieldmaxx.core.retry.BUSY_RECHECKS
 import com.fieldmaxx.core.retry.BUSY_RECHECK_MS
+import com.fieldmaxx.core.retry.MAX_RETRY_DELAY_MS
+import com.fieldmaxx.core.retry.busyRecheckMs
 import com.fieldmaxx.sharepoint.ChunkSession
 import com.fieldmaxx.sharepoint.DestinationErrorCode
 import com.fieldmaxx.sharepoint.DestinationException
@@ -1149,6 +1153,179 @@ class PipelineTest {
         assertEquals(1, dest.resumes.size, "the new name's file is the photo: not uploaded again")
     }
 
+    /**
+     * Ledger item 6: a file that stays locked is looked at again after 2 min doubling to 30 min, uncounted 6 times; after
+     * that each BUSY is a failed attempt ("OneDrive keeps this file locked"), never sooner than 30 min, until the photo is
+     * stuck and reported. Once the lock goes, the photo is delivered.
+     */
+    @Test fun busyBacksOffThenCountsAndGoesStuck() {
+        val id = take()
+        runStep(Step.REGISTER, id)
+        fake.ensureFolder(FOLDER)
+        fake.busyWhileUploading = true
+        serverStartedUpload(id, chunks = 1) // the server's session holds the file, and doesn't finish
+        val seen = HashSet<UUID>()
+        fun nextTry(what: String): WorkInfo {
+            fun next() = work(Step.ONEDRIVE, id).filter { it.state == WorkInfo.State.ENQUEUED && it.initialDelayMillis > 0 && it.id !in seen }
+            runUntil(what, backoffOver = false) { next().isNotEmpty() }
+            return next().single().also { seen += it.id }
+        }
+        for (n in 1..BUSY_RECHECKS) {
+            val retry = nextTry("recheck $n")
+            assertEquals(busyRecheckMs(n), retry.initialDelayMillis, "recheck $n")
+            assertEquals(0, row(id)!!.attempts, "recheck $n is not an attempt")
+            driver.setInitialDelayMet(retry.id)
+        }
+        assertEquals(listOf(2L, 4, 8, 16, 30, 30).map { it * 60_000 }, (1..BUSY_RECHECKS).map(::busyRecheckMs))
+        var last: WorkInfo? = null
+        for (attempt in 1..6) {
+            val retry = nextTry("attempt $attempt")
+            val r = row(id)!!
+            assertEquals(attempt, r.attempts)
+            assertEquals("OneDrive keeps this file locked", r.lastError)
+            assertEquals(attempt == 6, r.stuck)
+            assertEquals(MAX_RETRY_DELAY_MS, retry.initialDelayMillis, "never sooner than the lock's own 30 min")
+            if (attempt < 6) driver.setInitialDelayMet(retry.id) else last = retry
+        }
+        assertEquals(
+            listOf(Op.PhotoFailed("photo.failed:$id:6", id, "OneDrive keeps this file locked", 6)),
+            ops().filterIsInstance<Op.PhotoFailed>(),
+            "reported: Delivery health shows it",
+        )
+
+        fake.expireSessions() // the lock goes at last
+        driver.setInitialDelayMet(last!!.id)
+        runUntil("delivered") { done(id) }
+        assertEquals(setOf(destPath(id)), fake.files.keys)
+        assertContentEquals(stamped(id), fake.files[destPath(id)])
+    }
+
+    /** m3, R94: the phone's own session expires mid-upload (overnight): its resume restarts in its own empty file, one full-size file. */
+    @Test fun expiredSessionRestartsIntoOneFullSizeFile() {
+        fake.restartLostSessions = true // as SharePoint's link does it
+        fake.dropChunkAfter = 1
+        val id = take()
+        runUntil("the dropped upload", backoffOver = false) { row(id)?.let { it.attempts == 1 && it.oneDriveOffset == CHUNK.toLong() } == true }
+        val dead = ChunkSession(row(id)!!.oneDriveUploadId!!, CHUNK.toLong())
+        fake.expireSessions() // SharePoint has dropped the session; its file still reads 0 bytes
+
+        runUntil("delivered") { done(id) }
+        assertEquals(listOf(null, dead), dest.resumes.toList(), "the stored session resumed, and restarted by the destination")
+        assertEquals(listOf(destPath(id)), fake.files.keys.toList(), "exactly one file")
+        assertContentEquals(stamped(id), fake.files.getValue(destPath(id)), "full size")
+        assertDeliveredOnce(id)
+        assertEquals(0, server.renames.get(), "no new counter")
+    }
+
+    /** m4: the expired session's name holds another file now: the phone takes a new counter (R82) and never writes over it. */
+    @Test fun expiredSessionMeetingAnotherFileTakesANewCounter() {
+        fake.restartLostSessions = true
+        fake.dropChunkAfter = 1
+        val id = take()
+        runUntil("the dropped upload", backoffOver = false) { row(id)?.let { it.attempts == 1 && it.oneDriveUploadId != null } == true }
+        val first = row(id)!!.fileName!!
+        fake.expireSessions()
+        val theirs = byteArrayOf(9, 9, 9) // a whole file of someone else's, under the name meanwhile
+        fake.files["$FOLDER/$first"] = theirs
+
+        runUntil("delivered") { done(id) }
+        val renamed = row(id)!!.fileName!!
+        assertNotEquals(first, renamed, "a new counter")
+        assertEquals(1, server.renames.get())
+        assertContentEquals(theirs, fake.files["$FOLDER/$first"], "never written over")
+        assertContentEquals(stamped(id), fake.files["$FOLDER/$renamed"])
+        assertEquals(listOf("photo.confirmed:$id"), confirmedOps(id).map { it.opId })
+    }
+
+    /**
+     * R96 (I4, spec §6.2): photos of a deleted job stay on the phone undelivered, registered and unregistered alike: held,
+     * never discarded, left out of the "waiting" pill, and on their way again once an admin restores the job.
+     */
+    @Test fun deletedJobHoldsItsPhotosUntilRestored() {
+        val registered = take()
+        runStep(Step.REGISTER, registered)
+        val stamped = take()
+        await("stamped") { row(stamped)?.state == STAMPED } // the stamp needs no network; its registration waits for signal
+        runBlocking { OpApplier(db).applyChange(jobChange(11, job("j1").copy(fieldNotesUrl = LINK, deletedAt = NOW))) }
+
+        runUntil("both looked at") {
+            work(Step.ONEDRIVE, registered).any { it.state == WorkInfo.State.SUCCEEDED } && work(Step.REGISTER, stamped).any { it.state == WorkInfo.State.SUCCEEDED }
+        }
+        awaitIdle()
+        Thread.sleep(300)
+        assertTrue(fake.calls.none { it.startsWith("uploadChunked") }, "nothing goes to the deleted job's Field Notes")
+        assertNull(server.registrations[stamped], "nor is the other one registered")
+        assertNull(server.copies[registered], "its backup waits too, as a deleted point's does")
+        for (id in listOf(registered, stamped)) {
+            val r = assertNotNull(row(id), "never discarded")
+            assertEquals(0, r.attempts, "not a failure")
+            assertFalse(r.stuck)
+            assertTrue(folder(id).isDirectory)
+            assertTrue(work(Step.ONEDRIVE, id).none { it.state == WorkInfo.State.ENQUEUED && it.initialDelayMillis > 0 }, "no retries meanwhile")
+        }
+        assertEquals(0, runBlocking { db.localPhotos().observeWaitingCount().first() }, "left out of the map's pill")
+
+        runBlocking { OpApplier(db).applyChange(jobChange(12, job("j1").copy(fieldNotesUrl = LINK))) } // an admin restores it
+        runUntil("both delivered") { done(registered) && done(stamped) }
+        assertDeliveredOnce(registered)
+        assertDeliveredOnce(stamped)
+    }
+
+    /** R96: the server answers a registration 410 "Job was deleted" before this phone heard of the delete: held the same way, never stuck. */
+    @Test fun registrationRefusedForADeletedJobHoldsThePhoto() {
+        server.jobDeleted = true
+        val id = take()
+        runUntil("its registration answered") { server.registerCalls.get() == 1 && work(Step.REGISTER, id).any { it.state == WorkInfo.State.SUCCEEDED } }
+        awaitIdle()
+        Thread.sleep(300)
+        val held = assertNotNull(row(id))
+        assertEquals(STAMPED, held.state)
+        assertEquals(0, held.attempts, "not a failed attempt")
+        assertFalse(held.stuck)
+        assertNull(held.lastError)
+        assertEquals(1, server.registerCalls.get(), "not asked again while the job is deleted")
+        assertNotNull(runBlocking { db.jobs().get("j1")!!.toJob().deletedAt }, "the phone shows the job deleted, as the server said")
+        assertEquals(0, runBlocking { db.localPhotos().observeWaitingCount().first() })
+
+        server.jobDeleted = false
+        runBlocking { OpApplier(db).applyChange(jobChange(12, job("j1").copy(fieldNotesUrl = LINK))) } // restored: the server's state arrives
+        runUntil("delivered") { done(id) }
+        assertDeliveredOnce(id)
+    }
+
+    /** R97 (ledger T29 M1): the registration answers "removed" (an admin deleted it first): discarded as R86 has it, never uploaded. */
+    @Test fun registrationAnsweredRemovedDiscardsThePhoto() {
+        val id = take()
+        server.removedOnServer += id
+        runUntil("discarded") { row(id) == null }
+        awaitIdle()
+        signal()
+        Thread.sleep(300)
+        assertFalse(folder(id).exists(), "meta.json and folder went too")
+        assertTrue(fake.calls.none { it.startsWith("uploadChunked") }, "never uploaded")
+        assertNull(server.copies[id], "nor backed up")
+        assertTrue(workManager.getWorkInfosByTag(photoTag(id)).get().all { it.state.isFinished })
+        assertEquals(emptyList(), ops())
+    }
+
+    /** R97: the backup answers 410 "Photo was removed" first: the photo is discarded, and its OneDrive step never runs. */
+    @Test fun backupAnswered410DiscardsThePhotoAndItsOneDriveStep() {
+        val id = take()
+        runStep(Step.REGISTER, id)
+        server.backupGone += id
+        // Signal for the backup alone: the OneDrive step is still waiting for its turn.
+        await("the backup lined up") { work(Step.BACKUP, id).any { it.state == WorkInfo.State.ENQUEUED } }
+        work(Step.BACKUP, id).filter { it.state == WorkInfo.State.ENQUEUED }.forEach { driver.setAllConstraintsMet(it.id) }
+        await("discarded") { row(id) == null }
+        awaitIdle()
+        assertFalse(folder(id).exists())
+        assertTrue(work(Step.ONEDRIVE, id).all { it.state.isFinished }, "its OneDrive step is stopped")
+        signal()
+        Thread.sleep(300)
+        assertTrue(fake.calls.none { it.startsWith("uploadChunked") }, "never uploaded")
+        assertNull(row(id))
+    }
+
     /** R59: OneDrive goes first: while a OneDrive upload waits for one of its 3 streams, the backup holds its next chunk. */
     @Test fun backupHoldsBackWhileOneDriveWaitsForAStream() = runBlocking {
         val busy = CompletableDeferred<Unit>()
@@ -1404,6 +1581,15 @@ private class PhotoServer : Api by notCalled() {
     @Volatile var afterRegister: (() -> Unit)? = null
     @Volatile var afterBackupChunk: (() -> Unit)? = null
     @Volatile var backupDelayMs = 0L
+
+    /** R97: registering these answers "removed" (an admin deleted the photo before this phone heard of it). */
+    val removedOnServer: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /** R97: these photos' backups answer 410 "Photo was removed". */
+    val backupGone: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /** R96: every registration answers 410 "Job was deleted", as the server does for a deleted job's photo. */
+    @Volatile var jobDeleted = false
     private val backupsAtOnce = AtomicInteger()
     val maxBackupsAtOnce = AtomicInteger()
 
@@ -1414,9 +1600,11 @@ private class PhotoServer : Api by notCalled() {
 
     override suspend fun registerPhoto(r: PhotoRegistration): RegisteredPhoto {
         registerCalls.incrementAndGet()
+        if (jobDeleted) throw ApiException(410, "Job was deleted")
         val reply = synchronized(lock) {
             registrations.putIfAbsent(r.id, r)
-            RegisteredPhoto(names.getOrPut(r.id) { name(r) }, PhotoStatus.registered, copies[r.id]?.size?.toLong() ?: 0)
+            val status = if (r.id in removedOnServer) PhotoStatus.removed else PhotoStatus.registered
+            RegisteredPhoto(names.getOrPut(r.id) { name(r) }, status, copies[r.id]?.size?.toLong() ?: 0)
         }
         afterRegister?.invoke()
         return reply
@@ -1442,6 +1630,7 @@ private class PhotoServer : Api by notCalled() {
 
     override suspend fun backupChunk(id: String, offset: Long, bytes: ByteArray): Pair<Long, Boolean> {
         if (id in backupBlocked) throw IOException("Can't reach the server")
+        if (id in backupGone) throw ApiException(410, "Photo was removed")
         maxBackupsAtOnce.accumulateAndGet(backupsAtOnce.incrementAndGet(), ::maxOf)
         try {
             delay(backupDelayMs) // the chunk on its way
@@ -1525,9 +1714,13 @@ class Gallery : ContentProvider() {
     private val files = ConcurrentHashMap<Uri, File>()
     val published = CopyOnWriteArrayList<File>()
 
+    /** Thrown by insert, as MediaStore does when it has no unique name left or no space. */
+    @Volatile var insertFailure: RuntimeException? = null
+
     override fun onCreate() = true
 
     override fun insert(uri: Uri, values: ContentValues?): Uri {
+        insertFailure?.let { throw it }
         inserts += uri to ContentValues(values)
         val item = ContentUris.withAppendedId(uri, inserts.size.toLong())
         files[item] = File(context!!.cacheDir, "gallery-${inserts.size}.jpg")

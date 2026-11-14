@@ -85,7 +85,8 @@ internal fun canSaveToDownloads(sdk: Int) = sdk >= Build.VERSION_CODES.Q
 
 /**
  * Copies [file] into the phone's Downloads (MediaStore, Android 10+ only: see [canSaveToDownloads]); MediaStore picks
- * another name if that one is taken. False when it couldn't; nothing half-written is left there.
+ * another name if that one is taken. False when it couldn't, MediaStore's own refusals included (no unique name left
+ * after many saves of one file, storage full: ledger item 14); nothing half-written is left there.
  */
 @SuppressLint("NewApi", "InlinedApi") // MediaStore.Downloads and IS_PENDING: called on Android 10+ only (canSaveToDownloads)
 fun saveToDownloads(resolver: ContentResolver, file: File, mime: String): Boolean {
@@ -94,17 +95,19 @@ fun saveToDownloads(resolver: ContentResolver, file: File, mime: String): Boolea
         put(MediaStore.MediaColumns.MIME_TYPE, mime)
         put(MediaStore.MediaColumns.IS_PENDING, 1)
     }
-    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return false
+    var uri: Uri? = null
     return try {
-        val out = resolver.openOutputStream(uri) ?: throw IOException("Downloads gave no file to write")
+        val item = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return false
+        uri = item
+        val out = resolver.openOutputStream(item) ?: throw IOException("Downloads gave no file to write")
         out.use { stream -> file.inputStream().use { it.copyTo(stream) } }
-        resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+        resolver.update(item, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
         true
     } catch (e: IOException) {
-        resolver.delete(uri, null, null)
+        uri?.let { runCatching { resolver.delete(it, null, null) } }
         false
-    } catch (e: SecurityException) {
-        resolver.delete(uri, null, null)
+    } catch (e: RuntimeException) { // SecurityException, and MediaStore's IllegalStateException and friends
+        uri?.let { runCatching { resolver.delete(it, null, null) } }
         false
     }
 }
