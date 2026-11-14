@@ -73,7 +73,7 @@ import org.robolectric.annotation.GraphicsMode
 private const val SERVER = "https://fmx.example.com"
 private val ADMIN = User("u7", "owner", "Owner Admin", Role.admin, disabled = false)
 
-/** What the sheet reads and writes, driven by the test. [db], when given, holds the phone's photos (R46). */
+/** What the sheet reads and writes, driven by the test. [db], when given, holds the phone's photos (R67). */
 class FakePointDeps(context: Context, private val db: AppDatabase? = null) : PointDeps {
     val pointsFlow = MutableStateFlow<List<Point>>(emptyList())
     val photosFlow = MutableStateFlow<List<PhotoView>>(emptyList())
@@ -81,9 +81,6 @@ class FakePointDeps(context: Context, private val db: AppDatabase? = null) : Poi
     override val fixes = MutableStateFlow<Fix?>(null)
     @Volatile var me: User? = ALICE
     val ops = CopyOnWriteArrayList<Op>()
-
-    /** What the sheet did, in order: "enqueue:<op kind>" and "discard:<pointId>". */
-    val log = CopyOnWriteArrayList<String>()
 
     /** The images Coil was asked for. */
     val requested = CopyOnWriteArrayList<Any?>()
@@ -111,12 +108,6 @@ class FakePointDeps(context: Context, private val db: AppDatabase? = null) : Poi
 
     override suspend fun enqueue(op: Op) {
         ops += op
-        log += "enqueue:${op::class.simpleName}"
-    }
-
-    override suspend fun discardPhonePhotos(pointId: String) {
-        log += "discard:$pointId"
-        db?.let { discardPointPhotos(it, pointId) }
     }
 }
 
@@ -368,9 +359,8 @@ class PointSheetTest {
         waitForText("2 photos on this phone will be discarded")
         press(PointTags.DELETE_CONFIRM)
 
-        waitFor { "discard:p18" in deps.log }
-        assertEquals(listOf("enqueue:PointDelete", "discard:p18"), deps.log.toList(), "the delete is queued, then the phone's photos go (R46)")
-        assertEquals("p18", (deps.ops.single() as Op.PointDelete).pointId)
+        waitFor { deps.ops.isNotEmpty() }
+        assertEquals("p18", (deps.ops.single() as Op.PointDelete).pointId, "confirming queues the delete, and only that (R67)")
         waitFor { closes.get() == 1 }
     }
 
@@ -436,7 +426,7 @@ class PointSheetTest {
 
     // ---- focused tests for the rulings ----
 
-    @Test fun confirmedDeleteDiscardsPhonePhotoRowsAndFiles() { // R46
+    @Test fun confirmedDeleteLeavesPhonePhotosUntilTheServerAcceptsIt() { // R67
         val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java).build()
         try {
             val dir = File(context.filesDir, "photos").apply { mkdirs() }
@@ -444,23 +434,23 @@ class PointSheetTest {
             val saved = localPhoto("a", pointId = "p18").copy(originalPath = file("a.jpg").path)
             val stamped = localPhoto("b", pointId = "p18").copy(state = "stamped", originalPath = file("b.jpg").path, stampedPath = file("b-stamped.jpg").path)
             val inOneDrive = localPhoto("c", pointId = "p18").copy(state = "confirmed", originalPath = file("c.jpg").path, stampedPath = file("c-stamped.jpg").path)
-            val otherPoint = localPhoto("d", pointId = "p19").copy(state = "registered", originalPath = file("d.jpg").path)
-            runBlocking { listOf(saved, stamped, inOneDrive, otherPoint).forEach { db.localPhotos().upsert(it) } }
+            val photos = listOf(saved, stamped, inOneDrive)
+            runBlocking { photos.forEach { db.localPhotos().upsert(it) } }
             val roomDeps = FakePointDeps(context, db)
 
             show(sheetDeps = roomDeps)
             tap(PointTags.DELETE)
-            waitForText("2 photos on this phone will be discarded")
+            waitForText("2 photos on this phone will be discarded") // counted from the phone's own photos
             press(PointTags.DELETE_CONFIRM)
 
-            waitFor { runBlocking { db.localPhotos().get("a") == null && db.localPhotos().get("b") == null } }
-            assertEquals(listOf("enqueue:PointDelete", "discard:p18"), roomDeps.log.toList())
-            assertFalse(File(dir, "a.jpg").exists() || File(dir, "b.jpg").exists() || File(dir, "b-stamped.jpg").exists(), "their files are gone")
-            runBlocking {
-                assertEquals(inOneDrive, db.localPhotos().get("c"), "a photo already in OneDrive is never touched")
-                assertEquals(otherPoint, db.localPhotos().get("d"))
-            }
-            assertTrue(File(dir, "c.jpg").exists() && File(dir, "c-stamped.jpg").exists() && File(dir, "d.jpg").exists())
+            waitFor { roomDeps.ops.isNotEmpty() && closes.get() == 1 }
+            assertEquals("p18", (roomDeps.ops.single() as Op.PointDelete).pointId, "the delete is queued")
+            compose.waitForIdle()
+            // The server may still refuse it (another phone's photo of the point may have reached OneDrive), and the point
+            // would come back: nothing of it is discarded yet.
+            runBlocking { assertEquals(photos, photos.map { db.localPhotos().get(it.id) }, "every row stays") }
+            val files = listOf("a.jpg", "b.jpg", "b-stamped.jpg", "c.jpg", "c-stamped.jpg")
+            assertEquals(files, files.filter { File(dir, it).exists() }, "and every file")
         } finally {
             db.close()
         }

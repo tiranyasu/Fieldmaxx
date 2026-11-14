@@ -18,16 +18,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
-import androidx.room.withTransaction
-import com.fieldmaxx.app.data.AppDatabase
 import com.fieldmaxx.app.photos.PhotoUiStatus
 import com.fieldmaxx.app.photos.PhotoView
 import com.fieldmaxx.app.ui.FmxColors
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
-import java.io.File
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 /** Spec §6.5a, as the server decides it (ops/Ops.kt): anyone while none of the point's photos reached OneDrive, then admins only. */
 fun canDeletePoint(user: User, photos: List<PhotoView>): Boolean =
@@ -41,25 +36,12 @@ internal fun discardWarning(onPhone: Int): String? = when {
 }
 
 /**
- * R46: deleting a point discards its photos still on this phone, their rows and then their files. Photos OneDrive has
- * confirmed are left alone. Rows go first, in one transaction with the read, so the photo pipeline finds a vanished row
- * (and treats it as finished) rather than a row whose file is gone.
- */
-suspend fun discardPointPhotos(db: AppDatabase, pointId: String) {
-    val gone = db.withTransaction {
-        db.localPhotos().onPhoneForPoint(pointId).also { rows -> if (rows.isNotEmpty()) db.localPhotos().delete(rows.map { it.id }) }
-    }
-    withContext(Dispatchers.IO) {
-        for (p in gone) {
-            File(p.originalPath).delete()
-            p.stampedPath?.let { File(it).delete() }
-        }
-    }
-}
-
-/**
  * "Delete point" with its warning (spec §6.5a): the point goes for the whole crew (soft: an admin can restore it), and
- * [onPhone] photos still on this phone are discarded with it. The caller shows it only where [canDeletePoint].
+ * the [onPhone] photos still on this phone are discarded with it. The caller shows it only where [canDeletePoint].
+ *
+ * Confirming only queues the delete (R67). The photos stay on the phone until the server accepts it: the server may
+ * still refuse, since a photo of the point from another phone can have reached OneDrive, and then the point comes back
+ * with them. The photo pipeline holds them meanwhile and discards them once the delete is settled (Task 28).
  */
 @Composable
 internal fun DeletePoint(label: String, onPhone: Int, onConfirm: () -> Unit) {

@@ -122,7 +122,7 @@ interface PointDeps {
     /** The point's photos as the sheet lists them: [photoViewsFor]. */
     fun photos(pointId: String): Flow<List<PhotoView>>
 
-    /** How many of the point's photos are still only on this phone. */
+    /** How many of the point's photos are still only on this phone: the delete warning's count. */
     fun photosOnPhone(pointId: String): Flow<Int>
 
     val fixes: StateFlow<Fix?>
@@ -137,9 +137,6 @@ interface PointDeps {
 
     /** Shows [op] on the phone at once and queues it for the server; it waits there while there is no signal. */
     suspend fun enqueue(op: Op)
-
-    /** R46: removes the point's photos still on this phone, rows and files ([discardPointPhotos]). */
-    suspend fun discardPhonePhotos(pointId: String)
 }
 
 /** [PointDeps] from the app's graph. */
@@ -152,7 +149,6 @@ class GraphPointDeps(private val graph: AppGraph) : PointDeps {
     override fun server(): String = graph.server.get()
     override suspend fun user(): User? = graph.sync.savedUser()
     override suspend fun enqueue(op: Op) = graph.sync.enqueue(op)
-    override suspend fun discardPhonePhotos(pointId: String) = discardPointPhotos(graph.db, pointId)
 }
 
 /**
@@ -166,10 +162,8 @@ internal class PointEditor(private val pointId: String) {
     private val lock = Any()
     private var pole: PoleData? = null // guarded by lock: not written yet
     private var comment: String? = null // guarded by lock
-    private val ops = ArrayDeque<Pending>() // guarded by lock
+    private val ops = ArrayDeque<Op>() // guarded by lock
     private val wake = Channel<Unit>(Channel.CONFLATED)
-
-    private class Pending(val op: Op, val then: (suspend () -> Unit)?)
 
     val poleWaiting: Boolean get() = synchronized(lock) { pole != null }
     val commentWaiting: Boolean get() = synchronized(lock) { comment != null }
@@ -178,8 +172,8 @@ internal class PointEditor(private val pointId: String) {
 
     fun editComment(c: String) = ask { comment = c }
 
-    /** Writes [op] once the edits before it are written, then runs [then]. */
-    fun send(op: Op, then: (suspend () -> Unit)? = null) = ask { ops.addLast(Pending(op, then)) }
+    /** Writes [op] once the edits before it are written. */
+    fun send(op: Op) = ask { ops.addLast(op) }
 
     private inline fun ask(change: () -> Unit) {
         synchronized(lock) { change() }
@@ -216,10 +210,7 @@ internal class PointEditor(private val pointId: String) {
             if (update == null && next == null) return
             withContext(NonCancellable) {
                 update?.let { enqueue(it) }
-                next?.let {
-                    enqueue(it.op)
-                    it.then?.invoke()
-                }
+                next?.let { enqueue(it) }
             }
         }
     }
@@ -398,8 +389,8 @@ private fun OpenSheet(
             val me = user
             if (me != null && canDeletePoint(me, photos)) {
                 DeletePoint(point.label, onPhone) {
-                    // R46: queued first, then this phone's photos of it go.
-                    editor.send(Op.PointDelete(newOpId(), point.id)) { deps.discardPhonePhotos(point.id) }
+                    // R67: only the delete is queued; its photos stay on the phone until the server accepts it.
+                    editor.send(Op.PointDelete(newOpId(), point.id))
                     hideThen(onClose)
                 }
             }
