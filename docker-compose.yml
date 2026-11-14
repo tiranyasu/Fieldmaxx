@@ -1,5 +1,6 @@
 # The Fieldmaxx server: the app behind Caddy, which gets and renews the HTTPS certificate for DOMAIN by itself.
-# deploy/setup.sh writes .env (DOMAIN, DATA_DIR) and starts this with `docker compose up -d --build`.
+# deploy/setup.sh writes .env (DOMAIN, DATA_DIR), fetches the newest Caddy and Java images (`compose pull caddy`,
+# `compose build --pull app`) and starts this with `docker compose up -d`.
 # Only Caddy is reachable from the internet (ports 80 and 443); the app's port 8080 stays on the internal network.
 name: fieldmaxx
 
@@ -29,6 +30,7 @@ services:
     ports:
       - "80:80"
       - "443:443"
+      - "443:443/udp" # HTTP/3, which Caddy offers browsers by default: without it they try it and fall back
     environment:
       DOMAIN: "${DOMAIN:?is not set, run deploy/setup.sh}"
     volumes:

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Builds the signed release APK and publishes it on the server: the download page offers it, and the phones' update
-# check finds it (when Fieldmaxx starts, and once a day).
+# Builds the signed release APK and publishes it on the server: the download page offers it at once, and the phones'
+# update check finds it within a day.
 #   tools/release.sh <versionCode> <versionName> <server ssh>
 #   for example: tools/release.sh 2 1.1 root@fieldmaxx.example.com
-# versionCode is a whole number, higher than the last release's (phones only update to a higher one); versionName is
-# what people see. It needs the release key (tools/make-release-key.sh, once) and ssh access to the server that
+# versionCode is a whole number, higher than every earlier release's (phones only update to a higher one, and the server
+# refuses any other); versionName is what people see, new each time. It needs the release key
+# (tools/make-release-key.sh, once) and ssh access to the server that
 # deploy/setup.sh set up. The app it builds starts with that server's address on its sign-in screen.
 set -euo pipefail
 
@@ -47,5 +48,5 @@ echo "Publishing Fieldmaxx $name on $server..."
 ssh -- "$server" "docker exec -i $CONTAINER sh -c 'f=\$(mktemp) && cat > \"\$f\" && java -jar /app/fieldmaxx.jar publish-apk \"\$f\" $code $name; s=\$?; rm -f \"\$f\"; exit \$s'" < "$APK" ||
   die "the server did not publish it (the reason is above)"
 
-echo "Done. The download page ($origin/) offers $name now, and the phones find it the next time Fieldmaxx starts."
+echo "Done. The download page ($origin/) offers $name now, and the phones find it within a day."
 echo "The next release needs a version code higher than $code."

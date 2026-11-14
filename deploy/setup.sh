@@ -3,8 +3,9 @@
 #   sudo bash deploy/setup.sh
 # It installs Docker, asks for the server's web address and the first admin, starts Fieldmaxx behind Caddy (which gets
 # the HTTPS certificate by itself) and schedules the nightly database backup. Running it again is safe, for example
-# after updating the code: it keeps the data, the address (press Enter) and the admin. The admin's password is never
-# shown, written to a file or logged.
+# after updating the code: it keeps the data, the address (press Enter) and the admin, and it fetches the newest Caddy
+# and Java images, so it is also how the server gets their security fixes. The admin's password is never shown,
+# written to a file or logged.
 if [ -z "${BASH_VERSION:-}" ]; then # started with sh: stop before any bash-only line
   echo "Run it with bash: sudo bash deploy/setup.sh" >&2
   exit 1
@@ -126,10 +127,24 @@ read_password() {
   done
 }
 
-# The username of the first admin in the database, or nothing.
+# The username of the first active admin in the database, or nothing. A disabled admin can't sign in (R92).
 existing_admin() {
-  sqlite3 -readonly -cmd ".timeout 5000" "$1" "SELECT username FROM users WHERE role = 'admin' ORDER BY created_at LIMIT 1;" ||
+  sqlite3 -readonly -cmd ".timeout 5000" "$1" "SELECT username FROM users WHERE role = 'admin' AND disabled = 0 ORDER BY created_at LIMIT 1;" ||
     die "could not read $1 to look for the admin"
+}
+
+# The disabled admins' usernames in the database, as "a, b", or nothing.
+disabled_admins() {
+  sqlite3 -readonly -cmd ".timeout 5000" "$1" "SELECT group_concat(username, ', ') FROM users WHERE role = 'admin' AND disabled = 1;" ||
+    die "could not read $1 to look for the admin"
+}
+
+# username_taken DATABASE USERNAME: whether someone in the database already has USERNAME (usernames ignore case).
+username_taken() {
+  local found
+  found=$(sqlite3 -readonly -cmd ".timeout 5000" "$1" "SELECT 1 FROM users WHERE username = '${2//\'/\'\'}' LIMIT 1;") ||
+    die "could not read $1 to look for that username"
+  [ -n "$found" ]
 }
 
 # apt_install PACKAGE...: installs without questions (the package lists are refreshed once per run).
@@ -260,7 +275,7 @@ main() {
   say "This installs Docker, starts Fieldmaxx with automatic HTTPS and schedules a nightly database backup."
   say "Running it again later is safe: the data, the address and the admin stay as they are."
 
-  local data_dir ip admin="" username="" display_name=""
+  local data_dir ip admin="" disabled="" username="" display_name=""
   data_dir=$(env_value DATA_DIR)
   data_dir=${data_dir:-$DEFAULT_DATA_DIR}
   [[ $data_dir =~ $SAFE_PATH ]] || die "DATA_DIR in .env must be a full path without spaces or special characters (it is $data_dir)"
@@ -270,17 +285,28 @@ main() {
   if [ -s "$data_dir/fieldmaxx.db" ]; then
     command -v sqlite3 >/dev/null || apt_install sqlite3
     admin=$(existing_admin "$data_dir/fieldmaxx.db")
+    [ -n "$admin" ] || disabled=$(disabled_admins "$data_dir/fieldmaxx.db")
   fi
   if [ -n "$admin" ]; then
     say "An admin already exists ($admin), so setup does not create another. Add the crew in the app: Menu > Admin > Users."
   else
     say ""
-    say "Now the first admin account (you). You sign in to the app with it and add the crew's accounts there."
+    if [ -n "$disabled" ]; then
+      say "The admin account in the database is disabled ($disabled), so nobody can sign in as an admin."
+      say "Setup makes a new admin account now. Its username must be one nobody has yet, so not $disabled."
+    else
+      say "Now the first admin account (you). You sign in to the app with it and add the crew's accounts there."
+    fi
     while :; do
       ask "Admin username"
       username=$ANSWER
-      [ -n "$username" ] && break
-      say "Please type a username."
+      if [ -z "$username" ]; then
+        say "Please type a username."
+      elif [ -s "$data_dir/fieldmaxx.db" ] && username_taken "$data_dir/fieldmaxx.db" "$username"; then
+        say "Someone already has the username $username. Type another."
+      else
+        break
+      fi
     done
     while :; do
       ask "Your name as the crew sees it (for example Jane Smith)"
@@ -303,7 +329,10 @@ main() {
   check_dns "$DOMAIN" "$ip"
 
   step "Building and starting Fieldmaxx (the first time takes 5 to 10 minutes)"
-  compose up -d --build || die "building or starting Fieldmaxx did not work (the reason is above)"
+  # The newest Caddy (the only part the internet reaches) and Java images every time, so their security fixes arrive.
+  compose pull caddy || die "getting the newest Caddy did not work (the reason is above)"
+  compose build --pull app || die "building Fieldmaxx did not work (the reason is above)"
+  compose up -d || die "starting Fieldmaxx did not work (the reason is above)"
   wait_for_server
 
   if [ -z "$admin" ]; then

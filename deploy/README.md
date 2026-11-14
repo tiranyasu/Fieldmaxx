@@ -74,8 +74,9 @@ You do this once. You can also run it again later to update the server; see "Eve
 **Running setup again is safe.** It keeps the data, keeps the address (press Enter), and doesn't create a second
 admin. It says so when the admin already exists.
 
-Besides SSH (which you sign in with), only ports 80 and 443 (the web) are open to the internet, both for Caddy, the
-part that handles HTTPS. Fieldmaxx's own port and its database stay inside the server.
+Besides SSH (which you sign in with), only ports 80 and 443 (the web; 443 also over UDP, for the newer HTTP/3) are open
+to the internet, all for Caddy, the part that handles HTTPS. Fieldmaxx's own port and its database stay inside the
+server.
 
 ### Using an attached volume (optional)
 
@@ -94,6 +95,12 @@ from the computer that builds the app. That computer needs the Fieldmaxx folder,
 Linux, `tools/android-sdk.sh` installs the SDK; elsewhere, Android Studio does), and it must be able to `ssh` to the
 server. On Windows, run the commands below in WSL or Git Bash.
 
+On a Mac or Windows the build must also be told where the SDK is, or it stops with "SDK location not found". The easy
+way: open the Fieldmaxx folder once in Android Studio, which writes that into a file named `local.properties` in the
+folder. Or write that file yourself, with one line naming the SDK folder, for example
+`sdk.dir=/Users/<you>/Library/Android/sdk` on a Mac (Android Studio shows the folder under Settings > Languages &
+Frameworks > Android SDK), or set the `ANDROID_HOME` variable to that folder.
+
 **The first time only**, in the Fieldmaxx folder on that computer, create the release key:
 
     tools/make-release-key.sh fieldmaxx-release.keystore
@@ -108,15 +115,16 @@ accident.
 
 For example: `tools/release.sh 2 1.1 root@<your-domain>`.
 
-- The **version code** is a whole number. It must be higher than the last one you published (1, 2, 3 and so on),
-  because the phones only update to a higher number. Note down each one you use. If you repeat one, the server
-  refuses it and nothing changes.
-- The **version name** is what people see, for example `1.1`.
+- The **version code** is a whole number. Each one must be higher than every one you published before (1, 2, 3 and
+  so on), because the phones only update to a higher number. Note down each one you use. If you give one that isn't
+  higher, the server refuses it, names the highest one published so far, and nothing changes.
+- The **version name** is what people see, for example `1.1`. Each one must be new too: the server refuses a name it
+  has published before.
 
 The script checks that it can reach the server and builds the signed app (a few minutes). Then it uploads and
-publishes it. The download page offers it right away, and the phones show "Update available — tap to install" the
-next time Fieldmaxx starts (or within a day). Updating keeps everything on the phone. The app it builds already knows
-your server's address, so the crew only types their username and password.
+publishes it. The download page offers it right away, and the phones show "Update available — tap to install" within
+a day. Updating keeps everything on the phone. The app it builds already knows your server's address, so the crew only
+types their username and password.
 
 To install on a new phone, open `https://<your-domain>/` in the phone's browser, tap **Download Fieldmaxx for
 Android**, and follow the three steps on the page.
@@ -154,6 +162,8 @@ Everything is in one folder on the server, `/var/lib/fieldmaxx` (the "data folde
 | `photos/` | Photo backups: the server's copies of the crew's photos, kept at least 3 days |
 | `thumbs/` | Small thumbnails of all photos, kept for good |
 | `jobs/` | The imported job files (PDF and Word) |
+| `refs/` | The reference images: every page of each job file, and the query items' own pictures |
+| `imports/` | Job files someone is still checking in the app; they move to `jobs/` when saved, or go after a day |
 | `apk/` | The app versions you published |
 
 ### The nightly backup
@@ -229,6 +239,33 @@ folder.
 If the web address changed (for example a new `.sslip.io` address), the crew has to sign out and sign in again with
 the new address. Publish the next version with the new address (section 3).
 
+### If you kept only the `backups` folder
+
+The weekly minimum copy (the `backups` folder) is enough to bring the server back, but not everything. On the new
+server, before running setup, make the data folder and put the newest backup in it as the database. In a terminal on
+your computer, run:
+
+    scp -r ./fieldmaxx-backups-<date> root@<new-server-ip>:/var/lib/fieldmaxx-backups
+
+Then sign in to the new server and run:
+
+    mkdir -p /var/lib/fieldmaxx/backups
+    cp /var/lib/fieldmaxx-backups/* /var/lib/fieldmaxx/backups/
+    cp /var/lib/fieldmaxx/backups/<newest-backup-file> /var/lib/fieldmaxx/fieldmaxx.db
+
+Then go on with step 4 above. The users, jobs, points, pole data and the record of every photo are back, and so is
+everything already in OneDrive (it was never on the server). What is lost, because it was only in the other folders:
+
+- **The photo backups** (`photos/`). A photo that wasn't in OneDrive yet arrives only if the phone that took it still
+  has it: phones keep their photos until OneDrive has them. The server can no longer deliver it for a lost phone.
+- **The thumbnails** (`thumbs/`). The point screens and "Use existing photos" show grey squares instead of the older
+  photos' pictures. The photos themselves are in OneDrive and can still be reused.
+- **The reference images** (`refs/`) and **the job files** (`jobs/`). Each point's "Client query · reference" panel
+  is empty, and Job info can't open the job's source files.
+- **The published app** (`apk/`). The download page still offers the last version, but its file is gone, so the
+  download fails. Publish a version again (section 3), with a version code higher than the last one, before anyone
+  installs Fieldmaxx on a new phone.
+
 ## 6. Adding an ArcGIS key later
 
 The map imagery comes from Esri's ArcGIS servers and works without a key. Esri expects business users to have an
@@ -249,7 +286,8 @@ Run these on the server, in `/opt/fieldmaxx` (`cd /opt/fieldmaxx` first):
 | See whether Fieldmaxx is running | `docker compose ps` |
 | See the latest server log | `docker compose logs --tail 100 app` |
 | Restart Fieldmaxx | `docker compose restart` |
-| Update the server to a new version of the code | `git pull && bash deploy/setup.sh`, then press Enter at each question |
+| Update the server to a new version of the code | `git pull && bash deploy/setup.sh`, then press Enter at each question. Setup also fetches the newest Caddy and Java, with their security fixes |
+| Get the newest Caddy and Java (security fixes) without new code | `bash deploy/setup.sh`, then press Enter at each question; once a month is a good habit |
 | Install Ubuntu's security updates | `apt-get update && apt-get upgrade`. Reboot if it asks; Fieldmaxx starts again by itself |
 
 If something goes wrong:
