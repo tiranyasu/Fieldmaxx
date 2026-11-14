@@ -76,7 +76,12 @@ interface Api {
     suspend fun positions(): List<CrewPosition>
 
     suspend fun registerPhoto(r: PhotoRegistration): RegisteredPhoto
-    suspend fun renamePhoto(id: String): RegisteredPhoto
+    /**
+     * A new counter for the photo, which is leaving the name [from] (R82). Compare-and-set: when the photo has already been
+     * renamed from [from] (the server's own delivery met the same file first), the server answers with the current name
+     * and takes no counter, so both converge on one name.
+     */
+    suspend fun renamePhoto(id: String, from: String): RegisteredPhoto
 
     /**
      * Appends [bytes] at [offset] to the server's backup copy. Returns the server's confirmed offset and whether the

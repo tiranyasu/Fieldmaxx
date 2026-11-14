@@ -52,7 +52,11 @@ fun Route.photoRoutes(ctx: Ctx) {
             }
             route("/{id}") {
                 get { call.respond(getPhoto(ctx, call.parameters["id"]!!)) }
-                post("/rename") { call.respond(renamePhoto(ctx, call.user(), call.parameters["id"]!!)) }
+                post("/rename") {
+                    val from = call.request.queryParameters["from"]?.takeIf { it.isNotBlank() }
+                        ?: throw HttpError(HttpStatusCode.BadRequest, "Missing from: the name the photo leaves")
+                    call.respond(renamePhoto(ctx, call.user(), call.parameters["id"]!!, from))
+                }
                 put("/backup") {
                     val offset = call.request.queryParameters["offset"]?.toLongOrNull()?.takeIf { it >= 0 }
                         ?: throw HttpError(HttpStatusCode.BadRequest, "Missing or bad offset")

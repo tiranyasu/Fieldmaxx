@@ -74,6 +74,9 @@ class MockSharePoint : Closeable {
      */
     @Volatile var existingFolderAnswers200 = false
 
+    /** A StartUpload on a file another open session writes to answers 423, SharePoint's file lock (R82); else it is let in. */
+    @Volatile var lockWhileUploading = false
+
     private val lock = Any()
     private var cookie: String? = null
     private var cookiesIssued = 0
@@ -251,6 +254,10 @@ class MockSharePoint : Closeable {
             if (dropChunk()) return dropped(line)
             if (p !in files) return notFound(line)
             if (r.groupValues[1] in uploads) return chunkError(line, "The upload session already exists.")
+            if (lockWhileUploading && uploads.values.any { it.path == p }) {
+                log += "$line 423"
+                return error(423, "-2147018894, Microsoft.SharePoint.SPFileLockException", "The file \"${p.removePrefix("/")}\" is locked for shared use by Guest Contributor.")
+            }
             uploads[r.groupValues[1]] = Upload(p).apply { data.write(body) }
             log += "$line 200"
             return json(buildJsonObject { put("value", body.size.toString()) }.toString())

@@ -5,6 +5,7 @@ import com.fieldmaxx.core.model.PhotoStatus
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
 import com.fieldmaxx.core.naming.PointKey
+import com.fieldmaxx.core.retry.BUSY_RECHECK_MS
 import com.fieldmaxx.core.retry.MAX_RETRY_DELAY_MS
 import com.fieldmaxx.core.retry.nextDelayMs
 import com.fieldmaxx.server.Ctx
@@ -29,6 +30,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.sql.Connection
 import java.sql.ResultSet
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -211,9 +213,15 @@ class DeliveryWorker internal constructor(
             val dest = ctx.destinations(t.url)
             val folder = folder(t, dest) ?: return Outcome.SKIPPED
             val startedNs = System.nanoTime()
-            val path = send(t, dest, folder, source)
-            confirm(t, path, (System.nanoTime() - startedNs) / 1_000_000)
-            Outcome.CONFIRMED
+            when (val sent = send(t, dest, folder, source)) {
+                Sent.Busy -> {
+                    // R82: the phone's delivery holds the photo's file. Look again in 2 min; not a failed attempt.
+                    recheckLater(t, BUSY_RECHECK_MS)
+                    Outcome.SKIPPED
+                }
+                // R82 rule 4: renamed under it, it goes round again, and the next round looks under its current name.
+                is Sent.Delivered -> if (confirm(t, sent.path, (System.nanoTime() - startedNs) / 1_000_000)) Outcome.CONFIRMED else Outcome.SKIPPED
+            }
         } catch (e: DestinationException) {
             val problem = when (e.code) {
                 DestinationErrorCode.REQUIRES_SIGN_IN -> SIGN_IN_PROBLEM
@@ -326,45 +334,98 @@ class DeliveryWorker internal constructor(
         change?.let(ctx.changes::publish)
     }
 
+    /** How [send] ended, short of an error. */
+    private sealed interface Sent {
+        /** In OneDrive, whole, at [path]. */
+        class Delivered(val path: String) : Sent
+
+        /** R82: OneDrive holds the photo's file for another upload session, the phone's delivery of it: look again later. */
+        data object Busy : Sent
+    }
+
     /**
-     * Puts the photo at `<folder>/<name>` and returns that path. A same-name file of the photo's size is the photo already
-     * delivered (by the phone, or an earlier attempt whose answer was lost); a different one that isn't our own partial
-     * upload gets the photo a new counter. A persisted chunk session for this path is resumed.
+     * Puts the photo at `<folder>/<name>`, never overwriting anything (spec §6.6.1, R82). What OneDrive holds under the
+     * photo's own name decides:
+     * - the photo's size: already delivered (by the phone, or an earlier attempt whose answer was lost);
+     * - this delivery's own persisted session: resumed;
+     * - nothing: a fresh upload;
+     * - an empty file: this photo's delivery by the phone, in progress or abandoned (SharePoint shows a chunked upload as
+     *   0 bytes until its last chunk). It is filled through a fresh session of the server's, never renamed around; BUSY
+     *   while the phone's session still holds it;
+     * - another size: someone else's file, so a new counter, compare-and-set on the name it leaves, so phone and server
+     *   converge on one name.
      */
-    private fun send(t: Target, dest: PhotoDestination, folder: String, source: Source): String {
+    private fun send(t: Target, dest: PhotoDestination, folder: String, source: Source): Sent {
         var name = t.fileName
+        var session = t.session
         var local: File? = null
         var download: File? = null
+        val file = {
+            local ?: when (source) {
+                is Source.Local -> source.file.toFile()
+                is Source.Remote -> download(t, source).also { download = it }
+            }.also { local = it }
+        }
         try {
             repeat(MAX_RENAMES + 1) {
                 val path = "$folder/$name"
-                val resume = t.session?.takeIf { it.path == path }?.let { ChunkSession(it.uploadId, it.offset) }
-                val existing = dest.fileInfo(path)
-                if (existing != null && existing.size == t.size) return path
-                if (existing != null && resume == null) {
-                    name = renamePhotoForDelivery(ctx, t.id).fileName
-                    return@repeat
+                val own = session?.takeIf { it.path == path }?.let { ChunkSession(it.uploadId, it.offset) }
+                val existing = dest.fileInfo(path)?.size
+                if (existing == t.size) return Sent.Delivered(path)
+                val sent = when {
+                    own != null -> put(t, dest, folder, path, file, own)
+                    existing == null -> put(t, dest, folder, path, file, null)
+                    existing == 0L -> adopt(t, dest, folder, path, file)
+                    else -> null
                 }
-                val file = local ?: when (source) {
-                    is Source.Local -> source.file.toFile()
-                    is Source.Remote -> download(t, source).also { download = it }
-                }.also { local = it }
-                try {
-                    upload(dest, folder, path, file, resume) { persistSession(t.id, path, it) }
-                } catch (e: DestinationException) {
-                    if (e.code != DestinationErrorCode.EXISTS || resume != null) throw e
-                    // Someone (the phone) created the name between our check and our upload.
-                    if (dest.fileInfo(path)?.size == t.size) return path
-                    name = renamePhotoForDelivery(ctx, t.id).fileName
-                    return@repeat
-                }
-                val size = dest.fileInfo(path)?.size
-                if (size != t.size) throw DeliveryFailure("OneDrive holds ${size ?: "no"} bytes of $path, expected ${t.size}")
-                return path
+                if (sent != null) return sent
+                name = renamePhotoForDelivery(ctx, t.id, from = name).fileName
+                session = null
             }
             throw DeliveryFailure("OneDrive keeps showing other files under this photo's name")
         } finally {
             download?.delete()
+        }
+    }
+
+    /**
+     * Uploads to [path], fresh or [resume]d, every progress report stored before the upload goes on, then checks it there.
+     * Returns the photo delivered, [Sent.Busy], or null when another file of another size took the name first.
+     */
+    private fun put(t: Target, dest: PhotoDestination, folder: String, path: String, file: () -> File, resume: ChunkSession?): Sent? {
+        try {
+            upload(dest, folder, path, file(), resume) { persistSession(t.id, path, it) }
+        } catch (e: DestinationException) {
+            if (e.code == DestinationErrorCode.BUSY) return Sent.Busy
+            if (e.code != DestinationErrorCode.EXISTS || resume != null) throw e
+            // Someone (the phone) created the name between our check and our upload: look again.
+            return when (dest.fileInfo(path)?.size) {
+                t.size -> Sent.Delivered(path)
+                0L -> adopt(t, dest, folder, path, file)
+                else -> null
+            }
+        }
+        val size = dest.fileInfo(path)?.size
+        if (size != t.size) throw DeliveryFailure("OneDrive holds ${size ?: "no"} bytes of $path, expected ${t.size}")
+        return Sent.Delivered(path)
+    }
+
+    /**
+     * R82: an empty file under the photo's name is the phone's delivery of it, unfinished or still going. The server fills it
+     * through a session of its own, persisted like any other: no second file, and nothing overwritten (it holds no content).
+     */
+    private fun adopt(t: Target, dest: PhotoDestination, folder: String, path: String, file: () -> File): Sent? {
+        val session = ChunkSession(UUID.randomUUID().toString(), 0)
+        persistSession(t.id, path, session)
+        return put(t, dest, folder, path, file, session)
+    }
+
+    /** R82: the photo is looked at again after [delayMs]; no failure is counted. */
+    private fun recheckLater(t: Target, delayMs: Long) {
+        ctx.db.tx {
+            prepareStatement("UPDATE photos SET next_attempt_at = ? WHERE id = ? AND confirmed_at IS NULL").use {
+                it.setLong(1, ctx.clock.millis() + delayMs); it.setString(2, t.id); it.executeUpdate()
+            }
         }
     }
 
@@ -406,7 +467,12 @@ class DeliveryWorker internal constructor(
         }
     }
 
-    private fun confirm(t: Target, path: String, uploadMs: Long) {
+    /**
+     * True once the photo is confirmed, by this delivery or by the phone meanwhile. False when it was renamed under the
+     * upload (R82 rule 4): it is not recorded under the old name.
+     */
+    private fun confirm(t: Target, path: String, uploadMs: Long): Boolean {
+        var confirmed = true
         val changes = ctx.db.tx {
             val out = mutableListOf<Change>()
             val now = ctx.clock.millis()
@@ -414,16 +480,22 @@ class DeliveryWorker internal constructor(
             val n = prepareStatement(
                 "UPDATE photos SET status = CASE WHEN status = 'removed' THEN 'removed' ELSE 'confirmed' END, dest_path = ?, upload_ms = ?, " +
                     "confirmed_at = ?, last_error = NULL, next_attempt_at = NULL, od_upload_id = NULL, od_offset = NULL, od_upload_path = NULL " +
-                    "WHERE id = ? AND confirmed_at IS NULL",
+                    "WHERE id = ? AND confirmed_at IS NULL AND file_name = ?",
             ).use {
-                it.setString(1, path); it.setLong(2, uploadMs); it.setLong(3, now); it.setString(4, t.id); it.executeUpdate()
+                it.setString(1, path); it.setLong(2, uploadMs); it.setLong(3, now); it.setString(4, t.id)
+                it.setString(5, path.substringAfterLast('/')); it.executeUpdate()
             }
-            if (n > 0) out += ctx.changes.recordInTx(this, t.jobId, "photo", t.id, photo = photoInfo(t.id))
+            if (n > 0) {
+                out += ctx.changes.recordInTx(this, t.jobId, "photo", t.id, photo = photoInfo(t.id))
+            } else {
+                confirmed = photoInfo(t.id)?.confirmedAt != null
+            }
             // Delivery works again: clear the job's banner.
-            jobProblemInTx(t.jobId, null)?.let(out::add)
+            if (confirmed) jobProblemInTx(t.jobId, null)?.let(out::add)
             out
         }
         changes.forEach(ctx.changes::publish)
+        return confirmed
     }
 
     private fun fail(t: Target, message: String, jobProblem: String?): Outcome {

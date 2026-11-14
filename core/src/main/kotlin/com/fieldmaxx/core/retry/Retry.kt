@@ -11,3 +11,9 @@ fun nextDelayMs(attempts: Int): Long {
     val doublings = (attempts - 1).coerceIn(0, 7)
     return minOf(FIRST_DELAY_MS shl doublings, MAX_RETRY_DELAY_MS)
 }
+
+/**
+ * R82: how soon the phone or the server looks again at a photo whose file SharePoint holds for another upload session (the
+ * other side's delivery of the same photo, in progress). It is not a failed attempt.
+ */
+const val BUSY_RECHECK_MS = 2L * 60 * 1000

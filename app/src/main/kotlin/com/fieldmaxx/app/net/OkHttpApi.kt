@@ -120,7 +120,8 @@ class OkHttpApi(private val client: OkHttpClient, private val baseUrl: () -> Str
     override suspend fun registerPhoto(r: PhotoRegistration): RegisteredPhoto =
         call("POST", endpoint("api", "photos", "register"), json(r))
 
-    override suspend fun renamePhoto(id: String): RegisteredPhoto = call("POST", endpoint("api", "photos", id, "rename"), EMPTY)
+    override suspend fun renamePhoto(id: String, from: String): RegisteredPhoto =
+        call("POST", endpoint("api", "photos", id, "rename", query = mapOf("from" to from)), EMPTY)
 
     override suspend fun backupChunk(id: String, offset: Long, bytes: ByteArray): Pair<Long, Boolean> {
         val url = endpoint("api", "photos", id, "backup", query = mapOf("offset" to offset.toString()))

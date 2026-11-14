@@ -149,20 +149,25 @@ fun registerPhoto(ctx: Ctx, user: User, reg: PhotoRegistration): RegisteredPhoto
     return result
 }
 
-/** The phone found a different-size file of the same name in OneDrive: give the photo a fresh counter. */
-fun renamePhoto(ctx: Ctx, user: User, photoId: String): RegisteredPhoto = rename(ctx, photoId) { row ->
+/**
+ * The phone found another file under the photo's name [from] in OneDrive: give the photo a fresh counter. Compare-and-set
+ * (R82): a photo no longer named [from] (the server's own delivery renamed it first) keeps its current name, and no
+ * counter is taken, so phone and server converge on one name.
+ */
+fun renamePhoto(ctx: Ctx, user: User, photoId: String, from: String): RegisteredPhoto = rename(ctx, photoId, from) { row ->
     if (!canTouch(user, row.userId)) throw HttpError(HttpStatusCode.Forbidden, "Not your photo")
 }
 
-/** The server's own delivery met a different file under the photo's name: a fresh counter, as [renamePhoto]. */
-internal fun renamePhotoForDelivery(ctx: Ctx, photoId: String): RegisteredPhoto = rename(ctx, photoId) {}
+/** The server's own delivery met another file under the photo's name [from]: a fresh counter, as [renamePhoto]. */
+internal fun renamePhotoForDelivery(ctx: Ctx, photoId: String, from: String): RegisteredPhoto = rename(ctx, photoId, from) {}
 
-private fun rename(ctx: Ctx, photoId: String, check: (PhotoRow) -> Unit): RegisteredPhoto {
+private fun rename(ctx: Ctx, photoId: String, from: String, check: (PhotoRow) -> Unit): RegisteredPhoto {
     var change: Change? = null
     val result = ctx.db.tx {
         val row = photoRow(photoId) ?: throw HttpError(HttpStatusCode.NotFound, "Photo not found")
         check(row)
         if (row.confirmedAt != null) throw HttpError(HttpStatusCode.Conflict, "Photo already delivered")
+        if (row.fileName != from) return@tx RegisteredPhoto(row.fileName, row.status, row.backupOffset) // renamed from it already
         val point = pointRef(row.pointId) ?: throw HttpError(HttpStatusCode.NotFound, "Point not found")
         val name = cadastrusName(point, row.lat, row.lon, nextCounter("photo"))
         exec("UPDATE photos SET file_name = ? WHERE id = ?", name, photoId)

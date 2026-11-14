@@ -39,6 +39,9 @@ private val OCTETS = "application/octet-stream".toMediaType()
 private val EMPTY_BODY = ByteArray(0).toRequestBody()
 private val SESSION_LOST_CODES = setOf(400, 409, 423)
 
+/** SharePoint's answers to a StartUpload on a file another open session holds (its lock), R82. */
+private val LOCKED_CODES = setOf(409, 423)
+
 /**
  * [PhotoDestination] behind an "anyone with the link can edit" OneDrive/SharePoint folder link, with no
  * Microsoft sign-in (spec §5.5, §5.6). Opening the link gives a guest cookie; with it the SharePoint REST API
@@ -106,7 +109,9 @@ class SharePointLinkDestination(
      * the confirmed offset after each chunk. With [resume]: carry on from its offset; if SharePoint has lost that
      * session, the file is done when it already has the full size (a FinishUpload whose answer was lost), else the
      * same (own, partial) file is restarted under a new upload id. UPLOAD_SESSION_LOST means the session was lost and
-     * not restarted in this call: retry later with the last reported [ChunkSession].
+     * not restarted in this call: retry later with the last reported [ChunkSession]. A [resume] at offset 0 under an id
+     * SharePoint never saw starts a fresh session into the existing file (R82: an empty file of the same photo, left by
+     * another uploader). BUSY: a StartUpload met the file locked by another open session (423, 409, or a lock message).
      */
     override fun uploadChunked(relPath: String, file: File, chunkBytes: Int, resume: ChunkSession?, onProgress: (ChunkSession) -> Unit) {
         require(chunkBytes > 0) { "chunkBytes must be positive" }
@@ -167,9 +172,13 @@ class SharePointLinkDestination(
             val body = chunks.read(offset, end).toRequestBody(OCTETS)
             api(body, { "${it.file(it.path(relPath))}/$call" }) { r ->
                 if (!r.isSuccessful) {
+                    val text = r.text()
+                    if (starting && (r.code in LOCKED_CODES || text.contains("lock", ignoreCase = true))) {
+                        throw DestinationException(DestinationErrorCode.BUSY, "OneDrive holds $relPath for another upload")
+                    }
                     val lost = r.code in SESSION_LOST_CODES || (r.code == 404 && !starting)
                     if (lost) throw DestinationException(DestinationErrorCode.UPLOAD_SESSION_LOST, "The upload session for $relPath was lost")
-                    throw failure(r, relPath)
+                    throw failure(r.code, text, relPath)
                 }
                 if (!finishing) {
                     val confirmed = r.json()["value"]?.jsonPrimitive?.content?.toLongOrNull()

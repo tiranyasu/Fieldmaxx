@@ -12,6 +12,7 @@ import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.server.jobs.toPhoto
 import com.fieldmaxx.server.ops.OpsRequest
 import com.fieldmaxx.server.ops.OpsResponse
+import com.fieldmaxx.server.photos.renamePhotoForDelivery
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.get
 import io.ktor.client.request.post
@@ -430,13 +431,40 @@ class PhotosTest {
         seed(app)
         val t = tokenFor("ann")
         val r = registered(t, reg("ph-1", jpeg()))
-        val res = client.post("/api/photos/ph-1/rename") { bearerAuth(t) }
+        val res = client.post("/api/photos/ph-1/rename?from=${r.fileName}") { bearerAuth(t) }
         assertEquals(HttpStatusCode.OK, res.status, res.bodyAsText())
         val renamed = FmxJson.decodeFromString(RegisteredPhoto.serializer(), res.bodyAsText())
         assertNotEquals(r.fileName, renamed.fileName)
         assertTrue(renamed.fileName.startsWith("POLE_1_39.636130_-119.691104_"))
         assertEquals(renamed.fileName, photo(app, "ph-1").fileName)
         assertEquals(renamed.fileName, photoChanges(app, "ph-1").last().fileName)
-        assertEquals(HttpStatusCode.Forbidden, client.post("/api/photos/ph-1/rename") { bearerAuth(tokenFor("bob")) }.status)
+        assertEquals(HttpStatusCode.Forbidden, client.post("/api/photos/ph-1/rename?from=${renamed.fileName}") { bearerAuth(tokenFor("bob")) }.status)
+        assertEquals(HttpStatusCode.BadRequest, client.post("/api/photos/ph-1/rename") { bearerAuth(t) }.status, "a rename names the name it leaves")
+    }
+
+    /** R82: a rename leaving a name the photo no longer has answers with its current name, and takes no counter. */
+    @Test fun renameFromAStaleNameReturnsTheCurrentOne() = TestApp().run { app ->
+        seed(app)
+        val t = tokenFor("ann")
+        val first = registered(t, reg("ph-1", jpeg())).fileName
+        fun counter() = app.ctx.db.read { createStatement().use { s -> s.executeQuery("SELECT value FROM counters WHERE name='photo'").use { it.next(); it.getLong(1) } } }
+        suspend fun rename(from: String) = client.post("/api/photos/ph-1/rename?from=$from") { bearerAuth(t) }.let { res ->
+            assertEquals(HttpStatusCode.OK, res.status, res.bodyAsText())
+            FmxJson.decodeFromString(RegisteredPhoto.serializer(), res.bodyAsText()).fileName
+        }
+        // The server's own delivery met another file under the first name and renamed it.
+        val second = renamePhotoForDelivery(app.ctx, "ph-1", from = first).fileName
+        assertNotEquals(first, second)
+        assertEquals(2L, counter())
+        // The phone met the same file a moment later: it converges on the server's name.
+        assertEquals(second, rename(from = first))
+        assertEquals(2L, counter(), "no new counter")
+        assertEquals(second, renamePhotoForDelivery(app.ctx, "ph-1", from = first).fileName)
+        assertEquals(2L, counter())
+        assertEquals(second, photo(app, "ph-1").fileName)
+        // A rename from the current name does take the next counter.
+        val third = rename(from = second)
+        assertNotEquals(second, third)
+        assertEquals(3L, counter())
     }
 }

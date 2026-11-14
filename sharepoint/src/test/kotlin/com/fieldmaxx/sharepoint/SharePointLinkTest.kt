@@ -14,6 +14,7 @@ import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import java.time.ZoneOffset
+import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import kotlin.random.Random
@@ -277,6 +278,51 @@ class SharePointLinkTest {
             mock.log.filter { "p.jpg" in it },
         )
         assertEquals(1, progress.map { it.uploadId }.distinct().size, "the same session id, no new file")
+        assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/POLE/p.jpg"])
+    }
+
+    @Test
+    fun aFreshSessionFillsAnEmptyFile() {
+        business().ensureFolder("POLE")
+        val f = tmpFile(9_000_000)
+        mock.dropOnChunk(1) // another uploader of this photo: its StartUpload never arrives, its empty file stays
+        assertEquals(DestinationErrorCode.NETWORK, failure { business().uploadChunked("POLE/p.jpg", f, CHUNK, null) {} }.code)
+        assertEquals(FileInfo(0), business().fileInfo("POLE/p.jpg"))
+
+        mock.log.clear()
+        val adopt = ChunkSession(UUID.randomUUID().toString(), 0)
+        val progress = mutableListOf<ChunkSession>()
+        business().uploadChunked("POLE/p.jpg", f, CHUNK, adopt) { progress += it }
+        assertEquals(
+            listOf(
+                "start POLE/p.jpg 3200000 200",
+                "continue POLE/p.jpg @3200000 3200000 200",
+                "finish POLE/p.jpg @6400000 2600000 200",
+            ),
+            mock.log.filter { "p.jpg" in it },
+            "a new session into the existing file: no second file",
+        )
+        assertEquals(listOf(3_200_000L, 6_400_000L, 9_000_000L), progress.map { it.offset })
+        assertEquals(setOf(adopt.uploadId), progress.map { it.uploadId }.toSet())
+        assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/POLE/p.jpg"])
+    }
+
+    @Test
+    fun aFileLockedByAnotherSessionIsBusy() {
+        mock.lockWhileUploading = true
+        business().ensureFolder("POLE")
+        val f = tmpFile(9_000_000)
+        mock.dropOnChunk(2) // the other uploader's session stays open after its first chunk
+        assertEquals(DestinationErrorCode.NETWORK, failure { business().uploadChunked("POLE/p.jpg", f, CHUNK, null) {} }.code)
+
+        mock.log.clear()
+        val e = failure { business().uploadChunked("POLE/p.jpg", f, CHUNK, ChunkSession(UUID.randomUUID().toString(), 0)) {} }
+        assertEquals(DestinationErrorCode.BUSY, e.code)
+        assertEquals(listOf("start POLE/p.jpg 3200000 423"), mock.log.filter { "p.jpg" in it }, "no restart around the lock")
+        assertEquals(FileInfo(0), business().fileInfo("POLE/p.jpg"))
+
+        mock.expireUploadSessions() // the lock times out
+        business().uploadChunked("POLE/p.jpg", f, CHUNK, ChunkSession(UUID.randomUUID().toString(), 0)) {}
         assertContentEquals(f.readBytes(), mock.files["$BUSINESS_ROOT/POLE/p.jpg"])
     }
 

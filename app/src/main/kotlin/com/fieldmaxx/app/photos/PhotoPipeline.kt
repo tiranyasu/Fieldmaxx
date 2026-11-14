@@ -175,8 +175,12 @@ class PhotoPipeline(
     internal fun folderSearch(jobId: String): Mutex = folderSearches.computeIfAbsent(jobId) { Mutex() }
     private val deleteChecks: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
-    /** A photo just saved (LocalPhotos): its stamp step, and the 6-hourly cleanup. */
+    /**
+     * A photo just saved (LocalPhotos): its stamp step, the 6-hourly cleanup, and the watcher (I1: a process that started
+     * with no photo folders never ran resumeAll, and its photos still wait for links, folder picks and deletes).
+     */
     override fun start(localPhotoId: String) {
+        watch()
         enqueue(Step.STAMP, localPhotoId, ExistingWorkPolicy.KEEP)
         scheduleCleanup()
     }
@@ -244,6 +248,8 @@ class PhotoPipeline(
     /**
      * A failed attempt: counted, the next one lined up after its backoff (30 min once stuck). Once stuck, each failure is
      * reported to the server, if the server knows the photo, in the same transaction (R56).
+     * R83: the server refuses PhotoFailed for a photo it never registered, so one stuck before registering shows its reason
+     * and "Retry now" on this phone only.
      */
     private suspend fun failed(step: Step, row: LocalPhotoEntity, error: String, stuckNow: Boolean) {
         currentCoroutineContext().ensureActive() // a stopped worker's error isn't the photo's

@@ -108,6 +108,15 @@ class ApiTest {
         assertContentEquals(byteArrayOf(1, 2, 3, 4), request.body.readByteArray())
     }
 
+    /** R82: a rename names the name it leaves, so a rename that comes second converges on the first one's name. */
+    @Test fun renameNamesTheNameItLeaves() = runTest {
+        server.enqueue(json("""{"fileName":"POLE_1_39.636130_-119.691104_8.jpg","status":"registered","backupOffset":0}"""))
+
+        assertEquals("POLE_1_39.636130_-119.691104_8.jpg", api.renamePhoto("ph1", from = "POLE_1_39.636130_-119.691104_7.jpg").fileName)
+        val request = server.takeRequest()
+        assertEquals("POST /api/photos/ph1/rename?from=POLE_1_39.636130_-119.691104_7.jpg", "${request.method} ${request.path}")
+    }
+
     @Test fun noPublishedReleaseIsNull() = runTest {
         server.enqueue(json("null"))
 

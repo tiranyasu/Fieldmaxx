@@ -34,6 +34,55 @@ class FakeDestinationTest {
     }
 
     @Test
+    fun chunkedUploadShowsAnEmptyFileUntilItsLastChunk() {
+        val d = FakeDestination().apply { ensureFolder("A") }
+        val f = tmp(100)
+        val seen = mutableListOf<Pair<Long, Long?>>()
+        d.uploadChunked("A/p.jpg", f, 30, null) { seen += it.offset to d.fileInfo("A/p.jpg")?.size }
+        assertEquals(listOf(0L, 30L, 60L, 90L, 100L), seen.map { it.first }, "R10: the session is reported before the first chunk")
+        assertEquals(listOf(0L, 0L, 0L, 0L, 100L), seen.map { it.second }, "0 bytes until the last chunk is in")
+        assertContentEquals(f.readBytes(), d.files["A/p.jpg"])
+
+        // A file that fits one chunk goes in one request, with no empty file first and no progress.
+        val small = mutableListOf<ChunkSession>()
+        d.uploadChunked("A/s.jpg", tmp(20), 30, null) { small += it }
+        assertEquals(emptyList(), small)
+    }
+
+    @Test
+    fun aFreshSessionFillsAnEmptyFile() {
+        val d = FakeDestination().apply { ensureFolder("A"); dropChunkAfter = 1 }
+        val f = tmp(100)
+        // Another uploader of this photo stopped after its first chunk: its empty file stays under the name.
+        assertEquals(DestinationErrorCode.NETWORK, assertFailsWith<DestinationException> { d.uploadChunked("A/p.jpg", f, 30, null) {} }.code)
+        assertEquals(0L, d.fileInfo("A/p.jpg")?.size)
+
+        val progress = mutableListOf<ChunkSession>()
+        d.uploadChunked("A/p.jpg", f, 30, ChunkSession("adopt-1", 0)) { progress += it }
+        assertEquals(listOf(30L, 60L, 90L, 100L), progress.map { it.offset })
+        assertEquals(setOf("adopt-1"), progress.map { it.uploadId }.toSet())
+        assertContentEquals(f.readBytes(), d.files["A/p.jpg"])
+        assertEquals(1, d.files.size)
+
+        // A session into a file that isn't there finds nothing to fill.
+        assertEquals(DestinationErrorCode.NOT_FOUND, assertFailsWith<DestinationException> { d.uploadChunked("A/none.jpg", f, 30, ChunkSession("x", 0)) {} }.code)
+    }
+
+    @Test
+    fun aSecondSessionIsBusyWhileTheFirstIsOpen() {
+        val d = FakeDestination().apply { ensureFolder("A"); busyWhileUploading = true; dropChunkAfter = 1 }
+        val f = tmp(100)
+        assertFailsWith<DestinationException> { d.uploadChunked("A/p.jpg", f, 30, null) {} } // its session stays open
+        val e = assertFailsWith<DestinationException> { d.uploadChunked("A/p.jpg", f, 30, ChunkSession("adopt-1", 0)) {} }
+        assertEquals(DestinationErrorCode.BUSY, e.code)
+        assertEquals(0L, d.fileInfo("A/p.jpg")?.size, "nothing written")
+
+        d.expireSessions() // SharePoint lets the lock go
+        d.uploadChunked("A/p.jpg", f, 30, ChunkSession("adopt-2", 0)) {}
+        assertContentEquals(f.readBytes(), d.files["A/p.jpg"])
+    }
+
+    @Test
     fun unknownResumeSessionIsLost() {
         val d = FakeDestination().apply { ensureFolder("A") }
         val e = assertFailsWith<DestinationException> { d.uploadChunked("A/p.jpg", tmp(10), 5, ChunkSession("nope", 5)) {} }
@@ -80,7 +129,7 @@ class FakeDestinationTest {
         assertEquals(80, d.files.size)
         assertEquals(1 + 80, d.calls.size)
         assertEquals(40, ids.distinct().size)
-        assertEquals(ids.size / 2, ids.distinct().size)
+        assertEquals(ids.size / 3, ids.distinct().size) // each: its empty file, then two chunks
         assert(maxInFlight.get() > 1) { "uploads never overlapped" }
     }
 }

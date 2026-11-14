@@ -8,6 +8,7 @@ import com.fieldmaxx.core.model.PhotoStatus
 import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
+import com.fieldmaxx.core.retry.BUSY_RECHECK_MS
 import com.fieldmaxx.core.retry.MAX_RETRY_DELAY_MS
 import com.fieldmaxx.core.retry.nextDelayMs
 import com.fieldmaxx.server.delivery.DeliveryWorker
@@ -26,8 +27,10 @@ import com.fieldmaxx.server.jobs.updateJob
 import com.fieldmaxx.server.ops.applyOps
 import com.fieldmaxx.server.photos.appendBackupChunk
 import com.fieldmaxx.server.photos.registerPhoto
+import com.fieldmaxx.server.photos.renamePhoto
 import com.fieldmaxx.sharepoint.ChunkSession
 import com.fieldmaxx.sharepoint.DestinationErrorCode
+import com.fieldmaxx.sharepoint.DestinationException
 import com.fieldmaxx.sharepoint.FakeDestination
 import com.fieldmaxx.sharepoint.FileInfo
 import com.fieldmaxx.sharepoint.PhotoDestination
@@ -37,7 +40,6 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.file.Files
 import java.security.MessageDigest
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import javax.imageio.ImageIO
@@ -62,12 +64,8 @@ private class Spy(val inner: FakeDestination) : PhotoDestination by inner {
     val maxActive = AtomicInteger()
     private val active = AtomicInteger()
 
-    /** Sizes to report for files the fake doesn't hold yet (SharePoint shows a chunked upload's partial file). */
-    val partialInfo: MutableMap<String, FileInfo> = ConcurrentHashMap()
-
     @Volatile var beforeUpload: ((String) -> Unit)? = null
-
-    override fun fileInfo(relPath: String): FileInfo? = inner.fileInfo(relPath) ?: partialInfo[relPath]
+    @Volatile var afterUpload: ((String) -> Unit)? = null
 
     override fun uploadChunked(relPath: String, file: File, chunkBytes: Int, resume: ChunkSession?, onProgress: (ChunkSession) -> Unit) {
         resumes += resume
@@ -78,6 +76,7 @@ private class Spy(val inner: FakeDestination) : PhotoDestination by inner {
         } finally {
             active.decrementAndGet()
         }
+        afterUpload?.invoke(relPath)
     }
 }
 
@@ -369,8 +368,8 @@ class DeliveryTest {
         assertEquals(1L, col(app, "ph-1", "attempts"))
         val uploadId = assertNotNull(col(app, "ph-1", "od_upload_id")) as String
         assertEquals(2048L, col(app, "ph-1", "od_offset"))
-        // SharePoint shows the partial file under the photo's name; it is ours, so it is resumed, not renamed.
-        spy.partialInfo[path] = FileInfo(2048)
+        // SharePoint shows its empty file under the photo's name; the session is ours, so it is resumed, not renamed.
+        assertEquals(FileInfo(0), fake.fileInfo(path))
 
         app.clock.nowMs += nextDelayMs(1)
         app.worker(chunkBytes = 1024) { w -> assertEquals(1, w.runOnce()) } // a fresh worker: the server restarted
@@ -381,6 +380,97 @@ class DeliveryTest {
         assertContentEquals(bytes, fake.files[path])
         assertEquals(1, fake.files.size)
         assertNull(col(app, "ph-1", "od_upload_id"))
+    }
+
+    // ---- R82: a 0-byte file under the photo's own name is its delivery in progress, never a reason to rename ----
+
+    /** The phone's chunked upload, stopped short: SharePoint's empty file under the photo's name, its session open. */
+    private fun phoneStartedUpload(fake: FakeDestination, path: String, bytes: ByteArray, chunks: Int) {
+        val file = File.createTempFile("phone", ".jpg").apply { deleteOnExit(); writeBytes(bytes) }
+        fake.dropChunkAfter = chunks
+        assertFailsWith<DestinationException> { fake.uploadChunked(path, file, 1024, null) {} }
+        assertEquals(FileInfo(0), fake.fileInfo(path))
+    }
+
+    @Test fun phonesEmptyFileIsAdoptedNotRenamed() = withApp(spy = true) { app, fake, spy ->
+        val bytes = jpeg(w = 400, h = 300)
+        val name = backedUp(app, "ph-1", bytes)
+        val path = "POLE/POLE_1/$name"
+        fake.ensureFolder("POLE/POLE_1")
+        phoneStartedUpload(fake, path, bytes, chunks = 0) // then the phone went out of signal
+        app.clock.nowMs += TAKEOVER
+        app.worker(chunkBytes = 1024) { w -> assertEquals(1, w.runOnce()) }
+        val p = photo(app, "ph-1")
+        assertEquals(PhotoStatus.confirmed, p.status)
+        assertEquals(name, p.fileName, "no new counter")
+        assertEquals(path, p.destPath)
+        assertContentEquals(bytes, fake.files[path])
+        assertEquals(1, fake.files.size, "one file, no stray")
+        assertEquals(listOf(0L), spy.resumes.map { it?.offset }, "a fresh session into the phone's empty file")
+        assertNull(col(app, "ph-1", "od_upload_id"))
+    }
+
+    @Test fun existsThenEmptyFileAdopts() = withApp(spy = true) { app, fake, spy ->
+        val bytes = jpeg(w = 400, h = 300)
+        val name = backedUp(app, "ph-1", bytes)
+        val path = "POLE/POLE_1/$name"
+        fake.ensureFolder("POLE/POLE_1")
+        // Between the server's check and its create, the phone's chunked upload makes its empty file.
+        spy.beforeUpload = { p -> if (spy.resumes.size == 1) fake.files.putIfAbsent(p, ByteArray(0)) }
+        app.clock.nowMs += TAKEOVER
+        app.worker(chunkBytes = 1024) { w -> assertEquals(1, w.runOnce()) }
+        val p = photo(app, "ph-1")
+        assertEquals(PhotoStatus.confirmed, p.status)
+        assertEquals(name, p.fileName)
+        assertContentEquals(bytes, fake.files[path])
+        assertEquals(1, fake.files.size)
+        assertEquals(listOf(null, 0L), spy.resumes.map { it?.offset }, "the create met the name taken, then filled the empty file")
+    }
+
+    @Test fun busyFileIsCheckedAgainIn2MinWithoutAFailure() = withApp { app, fake, _ ->
+        val bytes = jpeg(w = 400, h = 300)
+        val name = backedUp(app, "ph-1", bytes)
+        val path = "POLE/POLE_1/$name"
+        fake.ensureFolder("POLE/POLE_1")
+        fake.busyWhileUploading = true
+        phoneStartedUpload(fake, path, bytes, chunks = 1) // the phone is mid-upload: SharePoint holds the file for it
+        app.clock.nowMs += TAKEOVER
+        app.worker(chunkBytes = 1024) { w -> assertEquals(0, w.runOnce(), "not an attempt") }
+        val waiting = photo(app, "ph-1")
+        assertEquals(PhotoStatus.registered, waiting.status)
+        assertEquals(name, waiting.fileName, "no new counter")
+        assertNull(waiting.lastError)
+        assertEquals(0L, col(app, "ph-1", "attempts"))
+        assertEquals(app.clock.nowMs + BUSY_RECHECK_MS, col(app, "ph-1", "next_attempt_at"))
+
+        fake.expireSessions() // the phone's session timed out without finishing
+        app.clock.nowMs += BUSY_RECHECK_MS
+        app.worker(chunkBytes = 1024) { w -> assertEquals(1, w.runOnce()) }
+        assertEquals(PhotoStatus.confirmed, photo(app, "ph-1").status)
+        assertContentEquals(bytes, fake.files[path])
+        assertEquals(1, fake.files.size)
+    }
+
+    /** R82 rule 4: a confirmation that finds the photo renamed under the upload doesn't record the old name; the new one decides. */
+    @Test fun confirmThatFindsARenameGoesRoundAgain() = withApp(spy = true) { app, fake, spy ->
+        val bytes = jpeg(w = 400, h = 300)
+        val first = backedUp(app, "ph-1", bytes)
+        fake.ensureFolder("POLE/POLE_1")
+        var second: String? = null
+        spy.afterUpload = {
+            spy.afterUpload = null
+            // As the server's upload lands, the phone's rename (another file met under the name) and its copy come in.
+            second = renamePhoto(app.ctx, ann, "ph-1", from = first).fileName
+            fake.files["POLE/POLE_1/$second"] = bytes.copyOf()
+        }
+        app.clock.nowMs += TAKEOVER
+        app.worker(chunkBytes = 1024) { w -> assertEquals(0, w.runOnce(), "not confirmed under the old name") }
+        assertNull(photo(app, "ph-1").confirmedAt)
+        app.worker(chunkBytes = 1024) { w -> assertEquals(1, w.runOnce()) }
+        val p = photo(app, "ph-1")
+        assertEquals(PhotoStatus.confirmed, p.status)
+        assertEquals("POLE/POLE_1/$second", p.destPath)
+        assertEquals(1, spy.resumes.size, "the new name's file is the photo: not uploaded again")
     }
 
     // ---- retries ----

@@ -51,8 +51,10 @@ import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.model.RegisteredPhoto
 import com.fieldmaxx.core.naming.defaultFolderName
 import com.fieldmaxx.core.naming.photoFileName
+import com.fieldmaxx.core.retry.BUSY_RECHECK_MS
 import com.fieldmaxx.sharepoint.ChunkSession
 import com.fieldmaxx.sharepoint.DestinationErrorCode
+import com.fieldmaxx.sharepoint.DestinationException
 import com.fieldmaxx.sharepoint.FakeDestination
 import com.fieldmaxx.sharepoint.PhotoDestination
 import java.io.ByteArrayOutputStream
@@ -66,9 +68,11 @@ import java.time.ZonedDateTime
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.concurrent.thread
 import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -237,7 +241,8 @@ class PipelineTest {
             "as the stamp was recorded" to { dying.killOn = "SET state = 'stamped'" },
             "after the server registered it, before its answer came" to { server.afterRegister = ::die },
             "as the registration was recorded" to { dying.killOn = "SET state = 'registered'" },
-            "after the first chunk reached OneDrive" to { dest.onChunk = { die() } },
+            "as SharePoint's empty file was recorded" to { dying.killOn = "createdThisFile = 1" }, // its session lost: R82 fills it
+            "after the first chunk reached OneDrive" to { dest.onChunk = { if (it.offset > 0) die() } },
             "after the last chunk, before the check" to { dest.afterUpload = { die() } },
             "as the confirmation was recorded" to { dying.killOn = "SET state = 'confirmed'" },
             "after the server took a backup chunk" to { server.afterBackupChunk = ::die },
@@ -393,18 +398,21 @@ class PipelineTest {
     @Test fun serverConfirmedFirstMarksLocalConfirmed() {
         val id = take()
         runStep(Step.REGISTER, id)
-        var told = false
+        val path = destPath(id)
+        val chunks = AtomicInteger()
         dest.onChunk = {
-            if (!told) {
-                told = true
-                serverDelivered(id) // the server took over and delivered it, mid-upload
+            if (chunks.incrementAndGet() == 2) {
+                // Mid-upload, the server's takeover filled the photo's file (R82: it adopts the empty file) and confirmed it.
+                fake.files[path] = stamped(id)
+                serverDelivered(id)
                 await("marked confirmed") { row(id)?.state == CONFIRMED }
             }
         }
         runUntil("confirmed") { row(id)?.state == CONFIRMED }
         awaitIdle()
-        assertTrue(told)
-        assertTrue(fake.files.isEmpty(), "the phone's upload stopped: the server's copy is the one in OneDrive")
+        assertTrue(chunks.get() < 1 + stamped(id).size / CHUNK, "the phone's upload stopped short")
+        assertEquals(setOf(path), fake.files.keys, "one file: the server's copy")
+        assertContentEquals(stamped(id), fake.files[path])
         assertEquals(emptyList(), confirmedOps(id), "the server confirmed it itself")
         val row = assertNotNull(row(id))
         assertNull(row.oneDriveUploadId)
@@ -610,7 +618,7 @@ class PipelineTest {
         runUntil("its OneDrive step ended") { work(Step.ONEDRIVE, during).any { it.state == WorkInfo.State.SUCCEEDED } }
         awaitIdle()
         assertNull(row(during))
-        assertTrue(fake.files.isEmpty(), "never completed")
+        assertTrue(fake.files.values.all { it.isEmpty() }, "never completed: only SharePoint's empty file is left")
         assertEquals(emptyList(), confirmedOps(), "and never reported")
         assertEquals(emptyList(), ops().filterIsInstance<Op.PhotoFailed>())
     }
@@ -694,6 +702,159 @@ class PipelineTest {
         assertFalse(torn.exists(), "a meta.json cut off as it was written counts as none")
         assertTrue(folder(kept).isDirectory, "a folder with its row stays")
         assertEquals(2, fake.files.size)
+    }
+
+    /**
+     * I1: a process that starts with no photo folders resumes nothing at app start (FieldmaxxApp.onCreate), so the first
+     * photo saved starts the watcher itself: a photo waiting for its link goes once the link is added, with no resumeAll.
+     */
+    @Test fun watcherRunsInAProcessThatStartedWithNoPhotos() {
+        runBlocking { OpApplier(db).applyChange(jobChange(11, job("j1"))) } // no Field Notes link yet
+        assertFalse(photosOnPhone(context.filesDir))
+        (context as FieldmaxxApp).onCreate()
+        assertTrue(photoWork().none { it.periodicityInfo == null }, "no photo step lined up at app start")
+        // The process's pipeline: never resumed.
+        runBlocking { pipelineScope.coroutineContext.job.cancelAndJoin() }
+        pipelineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        pipeline = newPipeline()
+
+        val id = take()
+        runUntil("waiting for its link") { work(Step.ONEDRIVE, id).any { it.state == WorkInfo.State.SUCCEEDED } && row(id)!!.backupDone }
+        assertTrue(fake.calls.isEmpty())
+        runBlocking { OpApplier(db).applyChange(jobChange(12, job("j1").copy(fieldNotesUrl = LINK))) } // the office adds it
+        runUntil("delivered once the link came") { done(id) }
+        assertEquals(1, fake.files.size)
+    }
+
+    /** R82: the server's takeover started its chunked upload under the photo's name and stopped: its empty file is filled, not renamed around. */
+    @Test fun serversEmptyFileIsAdopted() {
+        val id = take()
+        runStep(Step.REGISTER, id)
+        val path = destPath(id)
+        fake.ensureFolder(FOLDER)
+        serverStartedUpload(id, chunks = 0)
+
+        runUntil("confirmed") { done(id) }
+        assertEquals(0, server.renames.get(), "no new counter")
+        assertEquals(setOf(path), fake.files.keys, "one file, no stray")
+        assertContentEquals(stamped(id), fake.files[path])
+        assertEquals(listOf(0L), dest.resumes.map { it?.offset }, "a fresh session into the empty file")
+        assertEquals(listOf(path), confirmedOps(id).map { it.destPath })
+    }
+
+    /** R82: the server's empty file appears between the phone's check and its create: the phone fills it rather than renaming. */
+    @Test fun existsThenEmptyFileAdopts() {
+        val id = take()
+        runStep(Step.REGISTER, id)
+        val path = destPath(id)
+        fake.ensureFolder(FOLDER)
+        dest.beforeUpload = { p -> if (dest.resumes.size == 1) fake.files.putIfAbsent(p, ByteArray(0)) }
+        runUntil("confirmed") { done(id) }
+        assertEquals(listOf(null, 0L), dest.resumes.map { it?.offset }, "the create met the name taken, then filled the empty file")
+        assertEquals(0, server.renames.get())
+        assertEquals(setOf(path), fake.files.keys)
+        assertContentEquals(stamped(id), fake.files[path])
+    }
+
+    /** R82: SharePoint refusing a second session (the server's still holds the file) means the server is delivering: look again in 2 min. */
+    @Test fun busyFileIsCheckedAgainIn2MinWithoutAnAttempt() {
+        val id = take()
+        runStep(Step.REGISTER, id)
+        val path = destPath(id)
+        fake.ensureFolder(FOLDER)
+        fake.busyWhileUploading = true
+        serverStartedUpload(id, chunks = 1) // mid-upload: its session open
+
+        runUntil("told to come back", backoffOver = false) { work(Step.ONEDRIVE, id).any { it.state == WorkInfo.State.ENQUEUED && it.initialDelayMillis > 0 } }
+        val retry = pendingRetry(Step.ONEDRIVE, id)
+        assertEquals(BUSY_RECHECK_MS, retry.initialDelayMillis)
+        val waiting = assertNotNull(row(id))
+        assertEquals(REGISTERED, waiting.state)
+        assertEquals(0, waiting.attempts, "not a failed attempt")
+        assertFalse(waiting.stuck)
+        assertEquals(0, server.renames.get(), "no new counter")
+
+        // The server's upload finishes meanwhile.
+        fake.expireSessions()
+        fake.files[path] = stamped(id)
+        driver.setInitialDelayMet(retry.id)
+        runUntil("delivered", backoffOver = false) { done(id) }
+        assertEquals(setOf(path), fake.files.keys)
+        assertEquals(listOf(path), confirmedOps(id).map { it.destPath })
+    }
+
+    /**
+     * R82: the link comes after a long wait, and the server's takeover and the phone start together. Whether SharePoint lets
+     * the second session in or answers it BUSY, there is one file, and no empty one left under another name.
+     */
+    @Test fun serverAndPhoneStartingTogetherLeaveOneFile() {
+        var seq = 11L
+        for (busy in listOf(true, false)) {
+            fake.busyWhileUploading = busy
+            runBlocking { OpApplier(db).applyChange(jobChange(seq++, job("j1"))) } // no link: both wait
+            val id = take()
+            runUntil("waiting for the link") { work(Step.ONEDRIVE, id).any { it.state == WorkInfo.State.SUCCEEDED } && row(id)!!.backupDone }
+            val path = destPath(id)
+            fake.ensureFolder(FOLDER)
+
+            // The link is added; the server's takeover makes its empty file first and is slow with its first chunk.
+            val release = CountDownLatch(1)
+            val serverUpload = thread {
+                fake.uploadChunked(path, File(row(id)!!.stampedPath!!), CHUNK, null) { if (it.offset == 0L) release.await() }
+            }
+            await("the server's empty file") { fake.fileInfo(path)?.size == 0L }
+            runBlocking { OpApplier(db).applyChange(jobChange(seq++, job("j1").copy(fieldNotesUrl = LINK))) }
+            if (busy) {
+                runUntil("told to come back", backoffOver = false) { work(Step.ONEDRIVE, id).any { it.state == WorkInfo.State.ENQUEUED && it.initialDelayMillis > 0 } }
+            } else {
+                runUntil("the phone's copy in", backoffOver = false) { row(id)?.state == CONFIRMED }
+            }
+            release.countDown()
+            serverUpload.join()
+            runUntil("delivered") { done(id) }
+            assertContentEquals(stamped(id), fake.files[path])
+            assertEquals(0, server.renames.get())
+        }
+        assertEquals(2, fake.files.size, "one file per photo")
+        assertTrue(fake.files.values.none { it.isEmpty() }, "no empty file left anywhere")
+    }
+
+    /** R82: the phone's rename after the server's (both met another file under the first name) converges on the server's name. */
+    @Test fun renameAfterTheServersConvergesOnItsName() {
+        val id = take()
+        runStep(Step.REGISTER, id)
+        val first = row(id)!!.fileName!!
+        fake.ensureFolder(FOLDER)
+        fake.files["$FOLDER/$first"] = byteArrayOf(1, 2, 3) // someone else's photo under the name
+        // The server's takeover met it first: the next counter, and its delivery under that name.
+        val second = server.renameForDelivery(id, from = first)
+        fake.files["$FOLDER/$second"] = stamped(id)
+
+        runUntil("confirmed") { done(id) }
+        assertEquals(second, row(id)!!.fileName, "the server's name, not a third")
+        assertEquals(2L, server.counter(), "the phone's rename took no counter")
+        assertEquals(1, server.renames.get())
+        assertEquals(listOf("$FOLDER/$second"), confirmedOps(id).map { it.destPath })
+        assertEquals(emptyList(), dest.resumes, "nothing uploaded: the server's copy is it")
+        assertEquals(2, fake.files.size)
+    }
+
+    /** R82: a confirmation that finds the photo renamed under it doesn't end it under the old name: the new name decides. */
+    @Test fun confirmThatFindsARenameGoesRoundAgain() {
+        val id = take()
+        runStep(Step.REGISTER, id)
+        val first = row(id)!!.fileName!!
+        val second = first.replace("_1.jpg", "_9.jpg")
+        dest.afterUpload = {
+            dest.afterUpload = null
+            // As the upload lands, the photo is renamed (the watcher taking the server's newer name), and the server's copy is there.
+            runBlocking { db.localPhotos().rename(id, first, second) }
+            fake.files["$FOLDER/$second"] = stamped(id)
+        }
+        runUntil("confirmed") { done(id) }
+        assertEquals(listOf("$FOLDER/$second"), confirmedOps(id).map { it.destPath }, "never recorded under the old name")
+        assertEquals(second, row(id)!!.fileName)
+        assertEquals(1, dest.resumes.size, "the new name's file is the photo: not uploaded again")
     }
 
     /** R59: OneDrive goes first: while a OneDrive upload waits for one of its 3 streams, the backup holds its next chunk. */
@@ -799,8 +960,11 @@ class PipelineTest {
     private fun work(step: Step, id: String): List<WorkInfo> = workManager.getWorkInfosForUniqueWork(step.workName(id)).get()
 
     /** The step's next attempt, lined up with its backoff delay. */
-    private fun pendingRetry(step: Step, id: String): WorkInfo =
-        work(step, id).single { it.state == WorkInfo.State.ENQUEUED && it.initialDelayMillis > 0 }
+    private fun pendingRetry(step: Step, id: String): WorkInfo {
+        // Lined up just after its failure is recorded: wait for it.
+        await("the ${step.name} step's next attempt") { work(step, id).any { it.state == WorkInfo.State.ENQUEUED && it.initialDelayMillis > 0 } }
+        return work(step, id).single { it.state == WorkInfo.State.ENQUEUED && it.initialDelayMillis > 0 }
+    }
 
     /** The phone has signal: each photo step waiting for the network may run; with [backoffOver], so may each retry waiting out its delay. */
     private fun signal(backoffOver: Boolean = true) {
@@ -880,6 +1044,13 @@ class PipelineTest {
         assertEquals(listOf("photo.confirmed:$id"), confirmedOps(id).map { it.opId }, "photo $id reported once")
     }
 
+    /** The server's takeover began its chunked upload of [id] under its name and stopped after [chunks] chunks: its empty file, its session open. */
+    private fun serverStartedUpload(id: String, chunks: Int) {
+        fake.dropChunkAfter = chunks
+        assertFailsWith<DestinationException> { fake.uploadChunked(destPath(id), File(row(id)!!.stampedPath!!), CHUNK, null) {} }
+        assertEquals(0L, fake.fileInfo(destPath(id))?.size)
+    }
+
     /** The server's own delivery got there first: its photo change arrives, as the sync engine applies it. */
     private fun serverDelivered(id: String) = runBlocking {
         val row = row(id)!!
@@ -933,12 +1104,22 @@ private class PhotoServer : Api by notCalled() {
         return reply
     }
 
-    override suspend fun renamePhoto(id: String): RegisteredPhoto {
+    override suspend fun renamePhoto(id: String, from: String): RegisteredPhoto {
         renames.incrementAndGet()
-        return synchronized(lock) {
-            val r = registrations[id] ?: throw ApiException(404, "Photo not found")
-            RegisteredPhoto(name(r).also { names[id] = it }, PhotoStatus.registered, copies[id]?.size?.toLong() ?: 0)
-        }
+        return rename(id, from)
+    }
+
+    /** The server's own delivery met another file under [from] (T17's renamePhotoForDelivery). */
+    fun renameForDelivery(id: String, from: String): String = rename(id, from).fileName
+
+    /** The last counter taken. */
+    fun counter(): Long = counter.get()
+
+    /** R82: compare-and-set, so a rename leaving a name the photo no longer has gets its current name, and no counter. */
+    private fun rename(id: String, from: String): RegisteredPhoto = synchronized(lock) {
+        val r = registrations[id] ?: throw ApiException(404, "Photo not found")
+        val name = names.getValue(id).let { current -> if (current == from) name(r).also { names[id] = it } else current }
+        RegisteredPhoto(name, PhotoStatus.registered, copies[id]?.size?.toLong() ?: 0)
     }
 
     override suspend fun backupChunk(id: String, offset: Long, bytes: ByteArray): Pair<Long, Boolean> {
@@ -999,9 +1180,11 @@ private class TestDestination(private val fake: FakeDestination) : PhotoDestinat
     val resumes = CopyOnWriteArrayList<ChunkSession?>()
     @Volatile var onChunk: ((ChunkSession) -> Unit)? = null
     @Volatile var afterUpload: (() -> Unit)? = null
+    @Volatile var beforeUpload: ((String) -> Unit)? = null
 
     override fun uploadChunked(relPath: String, file: File, chunkBytes: Int, resume: ChunkSession?, onProgress: (ChunkSession) -> Unit) {
         resumes += resume
+        beforeUpload?.invoke(relPath)
         maxInFlight.accumulateAndGet(inFlight.incrementAndGet(), ::maxOf)
         try {
             fake.uploadChunked(relPath, file, chunkBytes, resume) { s ->
