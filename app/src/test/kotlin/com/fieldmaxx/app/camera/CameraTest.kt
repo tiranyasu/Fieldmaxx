@@ -9,21 +9,26 @@ import android.database.sqlite.SQLiteFullException
 import android.net.Uri
 import android.provider.MediaStore
 import android.provider.Settings
+import androidx.activity.ComponentActivity
 import androidx.activity.compose.LocalActivityResultRegistryOwner
 import androidx.activity.result.ActivityResultRegistry
 import androidx.activity.result.ActivityResultRegistryOwner
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Button
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.assertCountEquals
-import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
@@ -31,18 +36,22 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.core.app.ActivityOptionsCompat
 import androidx.exifinterface.media.ExifInterface
+import androidx.lifecycle.Lifecycle
 import androidx.room.Room
 import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.sqlite.db.SupportSQLiteOpenHelper
 import androidx.sqlite.db.SupportSQLiteStatement
 import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.core.app.ApplicationProvider
+import com.fieldmaxx.app.FieldmaxxApp
 import com.fieldmaxx.app.data.AppDatabase
 import com.fieldmaxx.app.data.LocalPhotoEntity
 import com.fieldmaxx.app.photos.CaptureMeta
+import com.fieldmaxx.app.photos.ContentPickedMedia
 import com.fieldmaxx.app.photos.LocalPhotos
 import com.fieldmaxx.app.photos.PickedMedia
 import com.fieldmaxx.app.photos.cameraMeta
+import com.fieldmaxx.app.photos.rowFromMeta
 import com.fieldmaxx.app.photos.stampMeta
 import com.fieldmaxx.app.platform.Fix
 import com.fieldmaxx.app.platform.Heading
@@ -57,6 +66,7 @@ import java.io.InputStream
 import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
@@ -65,9 +75,12 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNotSame
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
@@ -95,6 +108,7 @@ private val SPEC_STAMP = listOf("A05J9XE · POLE 1", "39.636130, -119.691104", "
 private val ALL_STATES = listOf("saved", "stamped", "registered", "confirmed")
 private val PICKED: Uri = Uri.parse("content://media/picker/0/com.android.providers.media.photopicker/media/1000000034")
 private const val LOCATION_EXTRA = "android.provider.extra.REQUEST_LOCATION_METADATA_ACCESS"
+private const val NOT_SAVED = "Photo not saved: the camera closed. Try again."
 
 /**
  * The JPEG fixtures, made with Pillow, independently of the app's EXIF reader. `gps.jpg` is tagged as a phone camera tags
@@ -108,30 +122,33 @@ private fun fixture(name: String): ByteArray =
 /** What the camera writes for a photo here. */
 private val JPEG: ByteArray by lazy { fixture("plain.jpg") }
 
-/** The camera's capture. With [gate] set, it waits there, as while CameraX is still writing the photo; [failure] it throws. */
+/** One planned capture: it waits at [gate] (as while CameraX is still writing the photo), then fails with [failure] if set. */
+private class Shot(val gate: CompletableDeferred<Unit>? = CompletableDeferred(), val failure: Exception? = null)
+
+/** The camera's capture: the next [plan]ned shot, or else [gate] and [failure] for every one. */
 private class FakeCapture : CaptureController {
     @Volatile var gate: CompletableDeferred<Unit>? = null
     @Volatile var failure: Exception? = null
+    val plan = ConcurrentLinkedQueue<Shot>()
     val started = AtomicInteger()
 
     override suspend fun capture(to: File) {
+        val shot = plan.poll() ?: Shot(gate, failure)
         started.incrementAndGet()
-        gate?.await()
-        failure?.let { throw it }
+        shot.gate?.await()
+        shot.failure?.let { throw it }
         to.writeBytes(JPEG)
     }
 }
 
-/** Picked photos by uri. [allowed] is whether the app may read the locations stored in photos (R52). */
+/** Picked photos by uri, as the phone's storage hands them over (their location hidden or not). */
 private class FakeMedia : PickedMedia {
-    @Volatile var allowed = true
     val files = ConcurrentHashMap<Uri, () -> InputStream>()
 
     fun add(uri: Uri, bytes: ByteArray) {
         files[uri] = { ByteArrayInputStream(bytes) }
     }
 
-    override fun locationAllowed(): Boolean = allowed
     override fun open(uri: Uri): InputStream = files[uri]?.invoke() ?: throw FileNotFoundException("No photo at $uri")
 }
 
@@ -139,7 +156,9 @@ private class FakeCameraDeps(override val photos: LocalPhotos, private val clock
     val targetFlow = MutableStateFlow<CameraTarget?>(CameraTarget("A05J9XE", "POLE 1"))
     override val fixes = MutableStateFlow<Fix?>(FIX)
     override val heading = MutableStateFlow<Heading?>(HEADING)
+    @Volatile var tech: String? = "u1"
     override fun target(jobId: String, pointId: String): Flow<CameraTarget?> = targetFlow
+    override suspend fun techId(): String? = tech
     override fun now(): Long = clock()
     override fun zone(): ZoneId = ZONE
 }
@@ -166,8 +185,8 @@ private class RecordingRegistry : ActivityResultRegistry() {
     }
 }
 
-/** An in-memory database whose inserts into LocalPhotoEntity fail, as on a full disk. */
-private class FullDiskDb(context: Context) {
+/** An in-memory database that runs [beforeWrite] as each LocalPhotoEntity row is written; it may throw, as a full disk does. */
+private class HookedDb(context: Context, private val beforeWrite: () -> Unit) {
     val db: AppDatabase = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
         .openHelperFactory { config -> Helper(FrameworkSQLiteOpenHelperFactory().create(config)) }
         .build()
@@ -183,22 +202,22 @@ private class FullDiskDb(context: Context) {
 
     private inner class Statement(private val s: SupportSQLiteStatement, private val sql: String) : SupportSQLiteStatement by s {
         override fun execute() {
-            full()
+            hook()
             s.execute()
         }
 
         override fun executeInsert(): Long {
-            full()
+            hook()
             return s.executeInsert()
         }
 
         override fun executeUpdateDelete(): Int {
-            full()
+            hook()
             return s.executeUpdateDelete()
         }
 
-        private fun full() {
-            if ("LocalPhotoEntity" in sql) throw SQLiteFullException("database or disk is full")
+        private fun hook() {
+            if ("LocalPhotoEntity" in sql) beforeWrite()
         }
     }
 }
@@ -206,7 +225,7 @@ private class FullDiskDb(context: Context) {
 @RunWith(RobolectricTestRunner::class)
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class CameraTest {
-    @get:Rule val compose = createComposeRule()
+    @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
     @get:Rule val temp = TemporaryFolder()
 
     private val context: Context = ApplicationProvider.getApplicationContext()
@@ -236,8 +255,8 @@ class CameraTest {
     /** Shown while [shown], so a test can rebuild the screen as a rotation does; what outlives the screen stays. */
     private val shown = mutableStateOf(true)
 
-    private fun show() = compose.setContent {
-        Host { if (shown.value) CameraScreen("j1", "p1", deps, capture, onBack = { backs.incrementAndGet() }) }
+    private fun show(with: FakeCameraDeps = deps) = compose.setContent {
+        Host { if (shown.value) CameraScreen("j1", "p1", with, capture, onBack = { backs.incrementAndGet() }) }
     }
 
     /** "Pick from gallery" on its own, as the point sheet offers it. */
@@ -308,7 +327,10 @@ class CameraTest {
         waitFor { started.size == 1 } // once saved: the row comes first, then the pipeline's start
         val row = rows().single()
         assertEquals(
-            CaptureMeta("A05J9XE", "POLE 1", "camera", FIX.lat, FIX.lon, FIX.accuracyM, FIX.altitudeM, 47.0, NOW, gpsStale = false, headingTrueNorth = true),
+            CaptureMeta(
+                "A05J9XE", "POLE 1", "camera", FIX.lat, FIX.lon, FIX.accuracyM, FIX.altitudeM, 47.0, NOW, gpsStale = false,
+                headingTrueNorth = true, techId = "u1",
+            ),
             meta(row),
             "what the phone read as the shutter was pressed",
         )
@@ -496,19 +518,37 @@ class CameraTest {
         assertFalse(meta(rows().single()).headingTrueNorth)
     }
 
-    @Test fun galleryWithoutMediaLocationUsesFix() = runBlocking<Unit> { // R52
-        media.allowed = false
-        media.add(PICKED, fixture("gps.jpg"))
+    @Test fun galleryWithoutMediaLocationUsesFix() = runBlocking<Unit> { // R52, R52a
+        // Without ACCESS_MEDIA_LOCATION (and unless the picker asked the tech), Android hands over the photo with its
+        // location zeroed.
+        val hidden = redacted(fixture("gps.jpg"))
+        val opened = CopyOnWriteArrayList<Uri>()
+        val asAndroidGivesIt = ContentPickedMedia(sdk = 35, hasPermission = { false }, openStream = { uri ->
+            opened += uri
+            ByteArrayInputStream(hidden)
+        })
+        val local = LocalPhotos(db, filesDir, { started += it }, { clock }, asAndroidGivesIt, { ZONE })
         clock = NOW + DAY
         val here = Fix(39.7, -119.8, 30.0, 1200.0, clock - 1_000)
 
-        val meta = meta(assertNotNull(db.localPhotos().get(photos.saveFromGallery("j1", "p1", PICKED, "A05J9XE", "POLE 1", here))))
+        val meta = meta(assertNotNull(db.localPhotos().get(local.saveFromGallery("j1", "p1", PICKED, "A05J9XE", "POLE 1", here))))
 
-        // Without ACCESS_MEDIA_LOCATION, Android hides a picked photo's location: the current fix stands in.
-        assertEquals(listOf(here.lat, here.lon, here.accuracyM, here.altitudeM), listOf(meta.lat, meta.lon, meta.accuracyM, meta.altitudeM))
-        assertNull(meta.headingDeg, "the photo's direction is location data too")
+        assertEquals(listOf(PICKED), opened.toList(), "no original asked for without the permission")
+        assertEquals(listOf(here.lat, here.lon, here.accuracyM, here.altitudeM), listOf(meta.lat, meta.lon, meta.accuracyM, meta.altitudeM), "the fix stands in")
+        assertNull(meta.headingDeg, "the photo's direction was hidden with it")
         assertEquals(NOW, meta.takenAt, "its own time is not location data: kept")
         assertEquals("11/05/26 13:35:47 (from gallery)", stampLines(meta.stampMeta(ZONE)).last())
+    }
+
+    @Test fun locationThePickerSharesIsUsed() = runBlocking<Unit> { // R52a: a newer picker asks the tech itself
+        val shared = ContentPickedMedia(sdk = 35, hasPermission = { false }, openStream = { ByteArrayInputStream(fixture("gps.jpg")) })
+        val local = LocalPhotos(db, filesDir, { started += it }, { clock }, shared, { ZONE })
+        val here = Fix(39.7, -119.8, 30.0, 1200.0, NOW - 1_000)
+
+        val meta = meta(assertNotNull(db.localPhotos().get(local.saveFromGallery("j1", "p1", PICKED, "A05J9XE", "POLE 1", here))))
+
+        assertEquals(SPEC_STAMP.dropLast(1) + "11/05/26 13:35:47 (from gallery)", stampLines(meta.stampMeta(ZONE)), "its own spot, permission or not")
+        assertTrue(meta.headingTrueNorth)
     }
 
     @Test fun hiddenLocationInTheFileUsesFix() = runBlocking<Unit> { // R52: a newer picker hides it unless the user agrees
@@ -547,7 +587,7 @@ class CameraTest {
         waitFor { registry.launches.size == 2 }
         val pick = registry.launches[1]
         assertEquals(PickVisualMedia.ImageOnly, (pick.input as PickVisualMediaRequest).mediaType, "photos only")
-        assertFalse(pick.intent(context).hasExtra(LOCATION_EXTRA), "no photo locations asked of the picker without the permission")
+        assertTrue(pick.intent(context).getBooleanExtra(LOCATION_EXTRA, false), "the picker is always asked for the photos' locations (R52a)")
         compose.runOnUiThread { registry.answer(listOf(PICKED)) }
         waitFor { rows().size == 1 }
         val row = rows().single()
@@ -560,7 +600,7 @@ class CameraTest {
         assertTrue(registry.launches[2].input is PickVisualMediaRequest)
         compose.onAllNodesWithTag(GalleryTags.REASON).assertCountEquals(0)
 
-        // Allowed later in the settings: the picker is asked to keep the photos' locations.
+        // Allowed later in the settings: still no question, and still the picker is asked for the locations.
         grant(Manifest.permission.ACCESS_MEDIA_LOCATION)
         compose.onNodeWithText("Pick from gallery").performClick()
         waitFor { registry.launches.size == 4 }
@@ -580,10 +620,8 @@ class CameraTest {
         val picked = ContentPickedMedia(sdk = 35, hasPermission = { granted }, openStream = open)
         fun read(uri: Uri) = picked.open(uri).use { it.readBytes().decodeToString() }
 
-        assertFalse(picked.locationAllowed())
         assertEquals(PICKED.toString(), read(PICKED), "without the permission: the photo as Android gives it")
         granted = true
-        assertTrue(picked.locationAllowed())
         assertEquals(original.toString(), read(PICKED), "with it: the original, location included")
         originalRefused = true
         assertEquals(PICKED.toString(), read(PICKED), "a uri that can't give its original still gives the photo")
@@ -591,9 +629,8 @@ class CameraTest {
         assertEquals(document.toString(), read(document), "not a media uri: nothing to ask")
         assertEquals(listOf(PICKED, original, original, PICKED, document), opened.toList())
 
-        val api28 = ContentPickedMedia(sdk = 28, hasPermission = { false }, openStream = open)
-        assertTrue(api28.locationAllowed(), "Android 9 hides no locations")
-        assertEquals(PICKED.toString(), api28.open(PICKED).use { it.readBytes().decodeToString() })
+        val api28 = ContentPickedMedia(sdk = 28, hasPermission = { true }, openStream = open)
+        assertEquals(PICKED.toString(), api28.open(PICKED).use { it.readBytes().decodeToString() }, "Android 9 hides nothing: no original to ask for")
     }
 
     @Test fun cameraRefusedOffersSettingsAndGallery() { // R53
@@ -636,6 +673,13 @@ class CameraTest {
         // The camera says it's done but wrote nothing, or an empty file.
         assertFailsWith<IOException> { photos.saveCaptured("j1", "p1", meta) { } }
         assertFailsWith<IOException> { photos.saveCaptured("j1", "p1", meta) { it.createNewFile() } }
+        // The photo is written, but its meta.json can't be (R80).
+        assertFailsWith<IOException> {
+            photos.saveCaptured("j1", "p1", meta) { file ->
+                file.writeBytes(JPEG)
+                File(file.parentFile, "meta.json").mkdir() // something in its way
+            }
+        }
         // A picked photo that can't be read, or whose reading breaks off.
         assertFailsWith<FileNotFoundException> { photos.saveFromGallery("j1", "p1", Uri.parse("content://media/picker/0/x/media/9"), "A05J9XE", "POLE 1", FIX) }
         media.files[PICKED] = {
@@ -653,7 +697,7 @@ class CameraTest {
     }
 
     @Test fun failedRecordLeavesNoFile() = runBlocking<Unit> { // R54: the row and the file go together
-        val full = FullDiskDb(context)
+        val full = HookedDb(context) { throw SQLiteFullException("database or disk is full") }
         try {
             val local = LocalPhotos(full.db, filesDir, { started += it }, { clock }, media, { ZONE })
             assertFailsWith<SQLiteFullException> { local.saveCaptured("j1", "p1", cameraMeta("A05J9XE", "POLE 1", FIX, HEADING, NOW)) { it.writeBytes(JPEG) } }
@@ -691,20 +735,179 @@ class CameraTest {
         press(CameraTags.CLOSE) // the tech is leaving while it's written
         capture.gate!!.complete(Unit)
 
-        waitFor { textOf(CameraTags.PROBLEM) == "Photo not saved: the camera closed. Try again." }
-        assertEquals(0, backs.get(), "it stays to say so")
+        waitFor { exists(CameraTags.UNSAVED) } // it stays to say so
+        assertTrue(shows(NOT_SAVED))
+        assertEquals(0, backs.get())
         assertFalse(exists(CameraTags.COUNT))
         assertEquals(emptyList(), rows())
         assertEquals(emptyList(), leftOnDisk())
 
-        // The next photo works; then Back goes at once.
+        // Staying keeps it on screen until it is read.
+        press(CameraTags.UNSAVED_STAY)
+        waitFor { !exists(CameraTags.UNSAVED) }
+        assertEquals(NOT_SAVED, textOf(CameraTags.PROBLEM))
+        press(CameraTags.PROBLEM_OK)
+        waitFor { !exists(CameraTags.PROBLEM) }
+
+        // The next photo works; with nothing unread, Back goes at once.
         capture.gate = null
         capture.failure = null
         press(CameraTags.SHUTTER)
         waitFor { textOf(CameraTags.COUNT) == "1 photo taken" }
-        assertFalse(exists(CameraTags.PROBLEM))
         press(CameraTags.CLOSE)
         waitFor { backs.get() == 1 }
+    }
+
+    @Test fun failureStaysVisibleThroughALaterSuccess() { // R79
+        grant(Manifest.permission.CAMERA)
+        val failing = Shot(failure = IOException("the camera closed"))
+        val fine = Shot()
+        capture.plan += listOf(failing, fine)
+        show()
+        waitFor { enabled(CameraTags.SHUTTER) }
+        press(CameraTags.SHUTTER)
+        press(CameraTags.SHUTTER)
+        waitFor { capture.started.get() == 2 }
+
+        failing.gate!!.complete(Unit)
+        waitFor { textOf(CameraTags.PROBLEM) == NOT_SAVED }
+        fine.gate!!.complete(Unit)
+        waitFor { textOf(CameraTags.COUNT) == "1 photo taken" }
+        assertEquals(NOT_SAVED, textOf(CameraTags.PROBLEM), "a later photo doesn't hide the failure")
+
+        // Leaving with it unread shows it first.
+        press(CameraTags.CLOSE)
+        waitFor { exists(CameraTags.UNSAVED) }
+        assertEquals(0, backs.get())
+        press(CameraTags.UNSAVED_LEAVE)
+        waitFor { backs.get() == 1 }
+    }
+
+    @Test fun newPressClearsTheFailure() { // R79: pressing again is reading it
+        grant(Manifest.permission.CAMERA)
+        capture.failure = IOException("the camera closed")
+        show()
+        waitFor { enabled(CameraTags.SHUTTER) }
+        press(CameraTags.SHUTTER)
+        waitFor { textOf(CameraTags.PROBLEM) == NOT_SAVED }
+
+        capture.failure = null
+        capture.gate = CompletableDeferred()
+        press(CameraTags.SHUTTER)
+        waitFor { !exists(CameraTags.PROBLEM) } // as it's pressed, before the photo is written
+        assertEquals(emptyList(), rows())
+        capture.gate!!.complete(Unit)
+        waitFor { textOf(CameraTags.COUNT) == "1 photo taken" }
+        assertFalse(exists(CameraTags.PROBLEM))
+    }
+
+    @Test fun starterFailureStillCountsAsSaved() { // R79: a saved photo is never called unsaved
+        val failingStart = LocalPhotos(db, filesDir, { throw IOException("the pipeline couldn't be scheduled") }, { clock }, media, { ZONE })
+        grant(Manifest.permission.CAMERA)
+        show(FakeCameraDeps(failingStart) { clock })
+        waitFor { enabled(CameraTags.SHUTTER) }
+        press(CameraTags.SHUTTER)
+
+        waitFor { textOf(CameraTags.COUNT) == "1 photo taken" }
+        assertFalse(exists(CameraTags.PROBLEM), "no 'Try again': a retake would upload twice")
+        assertEquals(1, rows().size)
+        // The gallery's count too: the pick returns its photo.
+        media.add(PICKED, fixture("plain.jpg"))
+        val id = runBlocking { failingStart.saveFromGallery("j1", "p1", PICKED, "A05J9XE", "POLE 1", FIX) }
+        assertNotNull(runBlocking { db.localPhotos().get(id) })
+    }
+
+    @Test fun captureAndPickCarryTheSignedInTech() { // R78
+        grant(Manifest.permission.CAMERA, Manifest.permission.ACCESS_MEDIA_LOCATION)
+        media.add(PICKED, fixture("plain.jpg"))
+        compose.setContent {
+            Host {
+                Box(Modifier.fillMaxSize()) {
+                    CameraScreen("j1", "p1", deps, capture, onBack = {})
+                    val gallery = rememberGalleryPick(deps)
+                    Button(onClick = { gallery.pick("j1", "p2") }, modifier = Modifier.align(Alignment.Center)) { Text("Pick from gallery") }
+                }
+            }
+        }
+        waitFor { enabled(CameraTags.SHUTTER) }
+        press(CameraTags.SHUTTER)
+        waitFor { started.size == 1 }
+        compose.onNodeWithText("Pick from gallery").performClick()
+        waitFor { registry.launches.size == 1 }
+        compose.runOnUiThread { registry.answer(listOf(PICKED)) }
+        waitFor { started.size == 2 }
+
+        assertEquals(mapOf("p1" to "u1", "p2" to "u1"), rows().associate { it.pointId to meta(it).techId }, "the camera's photo and the picked one")
+    }
+
+    @Test fun revokedCameraAsksAgainOnReturn() { // "Only this time" ends while the app is away
+        grant(Manifest.permission.CAMERA)
+        show()
+        waitFor { enabled(CameraTags.SHUTTER) }
+        assertEquals(0, registry.launches.size)
+
+        shadowOf(context as Application).denyPermissions(Manifest.permission.CAMERA)
+        compose.activityRule.scenario.moveToState(Lifecycle.State.STARTED) // the phone is locked on this screen
+        compose.activityRule.scenario.moveToState(Lifecycle.State.RESUMED) // and unlocked
+        waitFor { registry.launches.size == 1 }
+        assertEquals(Manifest.permission.CAMERA, registry.launches.single().input, "asked again, not a black screen")
+        assertFalse(exists(CameraTags.SHUTTER))
+
+        compose.runOnUiThread { registry.answer(false) }
+        waitFor { exists(CameraTags.REFUSED) }
+        compose.activityRule.scenario.moveToState(Lifecycle.State.STARTED)
+        compose.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
+        compose.waitForIdle()
+        assertEquals(1, registry.launches.size, "refused: not asked again on every return")
+        assertTrue(exists(CameraTags.REFUSED))
+    }
+
+    @Test fun databaseSyncsEveryCommit() = runBlocking<Unit>(Dispatchers.IO) { // R80: a dead battery keeps what was saved
+        val opened = AppDatabase.open(context)
+        try {
+            assertTrue(opened.openHelper.writableDatabase.isWriteAheadLoggingEnabled, "WAL as on a phone, whose default is NORMAL")
+            // The level belongs to each connection: read it on the one that writes, inside a transaction.
+            val mode = opened.runInTransaction<Long> {
+                opened.openHelper.writableDatabase.query("PRAGMA synchronous").use { cursor ->
+                    cursor.moveToFirst()
+                    cursor.getLong(0)
+                }
+            }
+            assertEquals(2L, mode, "FULL: each commit is on the disk before it returns")
+        } finally {
+            opened.close()
+        }
+    }
+
+    @Test fun metaJsonOnDiskBeforeTheRow() = runBlocking<Unit> { // R80
+        val atWrite = CopyOnWriteArrayList<LocalPhotoEntity>()
+        val hooked = HookedDb(context) {
+            for (dir in File(filesDir, "photos").listFiles().orEmpty()) atWrite += rowFromMeta(File(dir, "meta.json"))
+        }
+        try {
+            val local = LocalPhotos(hooked.db, filesDir, { started += it }, { clock }, media, { ZONE })
+            val id = local.saveCaptured("j1", "p1", cameraMeta("A05J9XE", "POLE 1", FIX, HEADING, NOW).copy(techId = "u1")) { it.writeBytes(JPEG) }
+            assertEquals(listOf(assertNotNull(hooked.db.localPhotos().get(id))), atWrite.toList(), "meta.json was on the disk, whole, as the row went in")
+        } finally {
+            hooked.db.close()
+        }
+    }
+
+    @Test fun metaJsonRebuildsTheRow() = runBlocking<Unit> { // R80: for Task 28's sweep after a power cut
+        val camera = photos.saveCaptured("j1", "p1", cameraMeta("A05J9XE", "POLE 1", FIX, HEADING, NOW).copy(techId = "u1")) { it.writeBytes(JPEG) }
+        media.add(PICKED, fixture("gps.jpg"))
+        val picked = photos.saveFromGallery("j1", "p2", PICKED, "A05J9XE", "POLE 2", FIX, techId = "u1")
+
+        for (id in listOf(camera, picked)) {
+            assertEquals(assertNotNull(db.localPhotos().get(id)), rowFromMeta(File(filesDir, "photos/$id/meta.json")), "the row, from the file beside the photo")
+        }
+    }
+
+    @Test fun cameraUsesTheCameraHeading() { // R35a: the stamp's heading is where the back camera points
+        val graph = (context as FieldmaxxApp).graph
+        val deps = GraphCameraDeps(graph)
+        assertSame(graph.compass.cameraHeading, deps.heading)
+        assertNotSame(graph.compass.heading, deps.heading, "not the map's screen-top heading")
     }
 
     @Test fun backWaitsForThePhotoBeingSaved() {

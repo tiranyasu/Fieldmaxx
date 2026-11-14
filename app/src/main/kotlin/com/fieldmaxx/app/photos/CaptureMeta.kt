@@ -27,7 +27,7 @@ const val GPS_STALE_MS = 10_000L
  * What the phone records about a photo as it is saved (spec §6.6 step 1), and what Task 28 makes its stamp and EXIF from.
  * [takenAt] is epoch ms: the shutter press, or a gallery photo's own EXIF time when it has one. [gpsStale]: the fix was
  * older than [GPS_STALE_MS] at the shutter. [headingTrueNorth] (R51): [headingDeg] is from true north, so EXIF gets
- * GPSImgDirectionRef "T"; false means magnetic ("M").
+ * GPSImgDirectionRef "T"; false means magnetic ("M"). [techId] (R78): the signed-in tech who took or picked it.
  */
 @Serializable
 data class CaptureMeta(
@@ -42,6 +42,7 @@ data class CaptureMeta(
     val takenAt: Long,
     val gpsStale: Boolean,
     val headingTrueNorth: Boolean = false,
+    val techId: String? = null,
 )
 
 /** The stamp's input (Task 3) for this photo, its time shown in [zone]. */
@@ -80,32 +81,33 @@ fun cameraMeta(jobName: String, pointLabel: String, fix: Fix?, heading: Heading?
 
 /**
  * What a photo picked from the gallery records, from its own EXIF where it has it (spec §6.6: "Gallery picks use the
- * photo's own EXIF GPS/time if present"). Its position, altitude, accuracy and direction are taken only when
- * [locationAllowed] (R52): otherwise Android has hidden them, and [fallback], the phone's fix when the photo was picked,
- * stands in, marked "(GPS stale)" as on the camera when older than 10 s at [now]. A file whose location was hidden by
- * zeroing it counts as having none. Its time is the EXIF DateTimeOriginal (or DateTimeDigitized), at its EXIF offset or
- * else in [zone]; [now] without one. A picked photo has no compass reading of its own beyond the EXIF direction.
+ * photo's own EXIF GPS/time if present"). Its position, altitude, accuracy and direction are taken whenever the file
+ * holds a valid position, whatever the permission (R52a): Android zeroes it where the tech didn't allow it, and a zeroed,
+ * damaged or 0, 0 position counts as none. Then [fallback], the phone's fix when the photo was picked, stands in, marked
+ * "(GPS stale)" as on the camera when older than 10 s at [now]. Its time is the EXIF DateTimeOriginal (or
+ * DateTimeDigitized), at its EXIF offset or else in [zone]; [now] without one. A picked photo has no compass reading of
+ * its own beyond the EXIF direction.
  */
 internal fun galleryMeta(
     exif: ExifInterface?,
     jobName: String,
     pointLabel: String,
     fallback: Fix?,
-    locationAllowed: Boolean,
     now: Long,
     zone: ZoneId,
+    techId: String?,
 ): CaptureMeta {
     val takenAt = exif?.let { takenAt(it, zone) } ?: now
-    val own = if (locationAllowed) exif?.let(::ownPosition) else null
+    val own = exif?.let(::ownPosition)
     return if (own != null) {
         CaptureMeta(
             jobName, pointLabel, SOURCE_GALLERY, own.lat, own.lon, own.accuracyM, own.altitudeM, own.headingDeg, takenAt,
-            gpsStale = false, headingTrueNorth = own.trueNorth,
+            gpsStale = false, headingTrueNorth = own.trueNorth, techId = techId,
         )
     } else {
         CaptureMeta(
             jobName, pointLabel, SOURCE_GALLERY, fallback?.lat, fallback?.lon, fallback?.knownAccuracy(), fallback?.altitudeM,
-            headingDeg = null, takenAt = takenAt, gpsStale = fallback != null && isStale(fallback, now),
+            headingDeg = null, takenAt = takenAt, gpsStale = fallback != null && isStale(fallback, now), techId = techId,
         )
     }
 }

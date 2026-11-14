@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -31,6 +32,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -78,6 +80,9 @@ interface CameraDeps {
     /** Where the back camera points ([com.fieldmaxx.app.platform.CompassSource.cameraHeading], R35a). */
     val heading: StateFlow<Heading?>
     val photos: LocalPhotos
+
+    /** The signed-in tech's user id (R78). */
+    suspend fun techId(): String?
     fun now(): Long
     fun zone(): ZoneId
 }
@@ -93,6 +98,7 @@ class GraphCameraDeps(private val graph: AppGraph) : CameraDeps {
     override val fixes: StateFlow<Fix?> get() = graph.location.fixes
     override val heading: StateFlow<Heading?> get() = graph.compass.cameraHeading
     override val photos: LocalPhotos get() = graph.localPhotos
+    override suspend fun techId(): String? = graph.sync.savedUser()?.id
     override fun now(): Long = System.currentTimeMillis()
     override fun zone(): ZoneId = ZoneId.systemDefault()
 }
@@ -102,6 +108,10 @@ object CameraTags {
     const val COUNT = "camera.count"
     const val SAVING = "camera.saving"
     const val PROBLEM = "camera.problem"
+    const val PROBLEM_OK = "camera.problem.ok"
+    const val UNSAVED = "camera.unsaved"
+    const val UNSAVED_STAY = "camera.unsaved.stay"
+    const val UNSAVED_LEAVE = "camera.unsaved.leave"
     const val GONE = "camera.gone"
     const val CLOSE = "camera.close"
     const val OVERLAY = "camera.overlay"
@@ -122,10 +132,12 @@ private enum class CameraAccess { ASKING, ALLOWED, REFUSED }
  * The built-in camera for one point (spec §6.6): [preview] (the CameraX preview, with flash and pinch zoom) under a live
  * overlay of exactly what will be stamped, and a shutter for several photos in a row, with a count of those taken here.
  * Each press saves the fix and compass reading of that moment ([cameraMeta]). Once the camera has written a photo it is
- * saved even if the screen goes; Back waits for the photos being taken, and a photo that couldn't be taken says why.
+ * saved even if the screen goes; Back waits for the photos being taken. A photo that couldn't be taken says why, and the
+ * message stays until it is read (R79): leaving with it unread shows it first.
  *
- * The camera permission is asked on entering (R53). Refused, the screen says so, with a way to the app's settings, and
- * still offers "Pick from gallery".
+ * The camera permission is asked on entering, and again on coming back without it (R53: Android 11+ takes "Only this
+ * time" back once the app has left the screen). Refused, the screen says so, with a way to the app's settings, and still
+ * offers "Pick from gallery".
  */
 @Composable
 fun CameraScreen(
@@ -139,25 +151,38 @@ fun CameraScreen(
     // Main-confined, as on the other screens: the screen's state is written on the main thread wherever a value comes from.
     val loaded by remember(deps, jobId, pointId) { deps.target(jobId, pointId).map(::Loaded) }.collectAsState(null, Dispatchers.Main.immediate)
     val access = rememberCameraAccess()
-    val shutter = viewModel { Shutter(createSavedStateHandle(), deps.photos) }
+    val shutter = viewModel { Shutter(createSavedStateHandle(), deps.photos, deps::techId) }
     val gallery = rememberGalleryPick(deps)
     val context = LocalContext.current
 
-    // Back waits for the photos still being written, then goes; if one of them couldn't be saved, it stays to say so.
+    // Back waits for the photos still being written, then goes; a failure not yet read is shown first.
     var leaving by remember { mutableStateOf(false) }
-    BackHandler(enabled = shutter.saving > 0) { leaving = true }
+    var showingUnsaved by remember { mutableStateOf(false) }
+    val close: () -> Unit = {
+        when {
+            shutter.saving > 0 -> leaving = true
+            shutter.problem != null -> showingUnsaved = true
+            else -> onBack()
+        }
+    }
+    BackHandler(enabled = shutter.saving > 0 || shutter.problem != null, onBack = close)
     if (leaving && shutter.saving == 0) {
         LaunchedEffect(Unit) {
             leaving = false
-            if (shutter.problem == null) onBack()
+            close()
         }
     }
-    val close: () -> Unit = {
-        if (shutter.saving > 0) {
-            leaving = true
-        } else {
-            onBack()
-        }
+    val unsaved = shutter.problem
+    if (showingUnsaved && unsaved != null) {
+        Unsaved(
+            unsaved,
+            onStay = { showingUnsaved = false },
+            onLeave = {
+                showingUnsaved = false
+                shutter.dismissProblem()
+                onBack()
+            },
+        )
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -184,6 +209,7 @@ fun CameraScreen(
                 }
                 Messages(
                     problem = shutter.problem,
+                    onProblemRead = shutter::dismissProblem,
                     gone = loaded != null && loaded?.target == null,
                     modifier = Modifier.align(Alignment.TopCenter).safeDrawingPadding().padding(top = 64.dp, start = 16.dp, end = 16.dp),
                 )
@@ -229,11 +255,29 @@ private fun ShutterControls(taken: Int, saving: Boolean, onPress: (() -> Unit)?)
 }
 
 @Composable
-private fun Messages(problem: String?, gone: Boolean, modifier: Modifier) {
+private fun Messages(problem: String?, onProblemRead: () -> Unit, gone: Boolean, modifier: Modifier) {
     Column(modifier, verticalArrangement = Arrangement.spacedBy(8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         if (gone) Text("This point was deleted.", color = FmxColors.Warning, modifier = Modifier.testTag(CameraTags.GONE))
-        problem?.let { Text(it, color = FmxColors.Warning, modifier = Modifier.testTag(CameraTags.PROBLEM)) }
+        problem?.let {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(it, color = FmxColors.Warning, modifier = Modifier.weight(1f, fill = false).testTag(CameraTags.PROBLEM))
+                TextButton(onClick = onProblemRead, modifier = Modifier.testTag(CameraTags.PROBLEM_OK)) { Text("OK") }
+            }
+        }
     }
+}
+
+/** Leaving the camera with a photo not saved and the message not yet read (R79). */
+@Composable
+private fun Unsaved(problem: String, onStay: () -> Unit, onLeave: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onStay,
+        title = { Text("A photo wasn't saved") },
+        text = { Text(problem) },
+        confirmButton = { TextButton(onClick = onStay, modifier = Modifier.testTag(CameraTags.UNSAVED_STAY)) { Text("Stay and retake") } },
+        dismissButton = { TextButton(onClick = onLeave, modifier = Modifier.testTag(CameraTags.UNSAVED_LEAVE)) { Text("Leave") } },
+        modifier = Modifier.testTag(CameraTags.UNSAVED),
+    )
 }
 
 @Composable
@@ -246,28 +290,30 @@ private fun Refused(onSettings: () -> Unit, onGallery: () -> Unit, modifier: Mod
 }
 
 /**
- * R53: the camera permission, asked each time the camera opens without it (not again on a rotation). A change in the
- * system settings shows on return.
+ * R53: the camera permission, asked whenever the screen is on without it and not refused here: on entering, and on
+ * coming back after Android took it away (Android 11+ ends "Only this time" once the app has left the screen; the
+ * process may go with it). One request at a time, also across a rotation; refused, it isn't asked again on every return,
+ * and a grant in the system settings shows on return.
  */
 @Composable
 private fun rememberCameraAccess(): CameraAccess {
     val context = LocalContext.current
     var allowed by remember { mutableStateOf(hasCamera(context)) }
-    var asked by rememberSaveable { mutableStateOf(false) }
     var refused by rememberSaveable { mutableStateOf(false) }
+    var asking by rememberSaveable { mutableStateOf(false) } // a request is out; its answer can come after a rebuild
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        asking = false
         allowed = granted || hasCamera(context)
         refused = !allowed
     }
-    LaunchedEffect(Unit) {
-        if (!allowed && !asked) {
-            asked = true
-            launcher.launch(Manifest.permission.CAMERA)
-        }
-    }
     LifecycleResumeEffect(context) {
         allowed = hasCamera(context)
-        if (allowed) refused = false
+        if (allowed) {
+            refused = false
+        } else if (!refused && !asking) {
+            asking = true
+            launcher.launch(Manifest.permission.CAMERA)
+        }
         onPauseOrDispose { }
     }
     return when {

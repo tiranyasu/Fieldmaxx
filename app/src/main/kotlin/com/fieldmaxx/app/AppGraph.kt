@@ -17,7 +17,6 @@ import coil3.disk.DiskCache
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import coil3.request.CachePolicy
 import coil3.request.ImageRequest
-import com.fieldmaxx.app.camera.ContentPickedMedia
 import com.fieldmaxx.app.data.AppDatabase
 import com.fieldmaxx.app.jobs.JobList
 import com.fieldmaxx.app.map.DataStoreViewMemory
@@ -29,6 +28,7 @@ import com.fieldmaxx.app.net.ConfigStore
 import com.fieldmaxx.app.net.OkHttpApi
 import com.fieldmaxx.app.net.ServerAddress
 import com.fieldmaxx.app.net.TokenVault
+import com.fieldmaxx.app.photos.ContentPickedMedia
 import com.fieldmaxx.app.photos.LocalPhotos
 import com.fieldmaxx.app.photos.PhotoPipelineStarter
 import com.fieldmaxx.app.platform.CompassSource
