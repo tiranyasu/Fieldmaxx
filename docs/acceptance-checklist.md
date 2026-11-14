@@ -10,7 +10,10 @@ those three things to fix it.
 - **Your phone:** Android 9 or newer, with good LTE signal for most steps.
 - **A second phone** with Fieldmaxx, signed in as another crew member (steps 30 to 36).
 - **The test version of the app.** Your developer publishes it on your server's download page. For step 41 they
-  publish a second, newer test version.
+  publish a second, newer test version. The second version must be built where the first one was, on the same
+  computer, so both carry the same test signature: Android only lets a version update one with the same signature.
+  (For the developer: both debug builds must use the same `~/.android/debug.keystore`; a new cloud session makes a
+  new one.)
 - **Two files on the phone,** for example in Downloads: the job file `A05J9XE.pdf` and the query file
   `QUERY_1_-_A05K51V.docx`.
 - **Your test folder's link** (the OneDrive folder you use for testing), copied so you can paste it.
@@ -57,7 +60,8 @@ Good to know:
 ## D. The map
 
 7. ☐ **Imagery and street names.** Zoom in on the poles, then tap **Aa** twice.
-   **Expect:** satellite imagery. The first tap shows street names over it; the second hides them.
+   **Expect:** satellite imagery. Street names are on to begin with. The first tap hides them, the second shows them
+   again.
 8. ☐ **Markers and clusters.** Look at the 7 poles, zoom out until they merge, then tap the merged circle.
    **Expect:** each pole is a coloured circle marked **P**. Zoomed out, nearby points merge into one circle with a
    number. Tapping it zooms in until they separate.
@@ -206,6 +210,12 @@ Good to know:
     **Expect:** **"Update available — tap to install"**. Tapping it downloads the update and opens Android's
     installer. After **Install**, Fieldmaxx opens with your jobs and photos still there, and the menu shows the new
     version.
+
+    If Android's installer says "App not installed", or names a conflict, the two test versions were signed
+    differently: they weren't built on the same computer. That's a mix-up in the build, not a Fieldmaxx fault, so
+    write it down and tell your developer. The way out: once every photo on the phone shows ✓, uninstall Fieldmaxx,
+    install the newer test version from the download page, and sign in again. Uninstalling deletes every photo that
+    isn't in OneDrive yet, so don't uninstall while any photo is still waiting.
 
 A test version can't update the crew's version, and the crew's version can't update a test version: they are signed
 differently. Moving a phone from one to the other means uninstalling Fieldmaxx first, and uninstalling deletes every
