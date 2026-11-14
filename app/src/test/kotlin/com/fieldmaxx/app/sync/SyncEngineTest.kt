@@ -48,6 +48,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -438,11 +439,14 @@ class SyncEngineTest {
         awaitTrue("lastSeq 1") { db.meta().get("lastSeq") == "1" }
 
         // 3 is broadcast before 2: it shows at once, but lastSeq waits until a catch-up fetch has filled the gap.
+        val catchUp = CompletableDeferred<Unit>().also { api.changesGate = it }
         api.record(pointChange(2, p2.copy(comment = "b")))
         serverChange(pointChange(3, p1.copy(comment = "c")))
         engine.points("j1").await { pts -> pts.first().comment == "c" }
+        awaitTrue("the catch-up fetch") { api.sinceCalls.size == 2 }
         assertEquals("1", db.meta().get("lastSeq"))
 
+        catchUp.complete(Unit)
         awaitTrue("lastSeq 3") { db.meta().get("lastSeq") == "3" }
         assertEquals("b", engine.points("j1").first().last().comment)
         assertEquals(1L, api.sinceCalls[1], "the catch-up starts after the last change applied in order")

@@ -23,6 +23,7 @@ import java.lang.reflect.Proxy
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -86,6 +87,9 @@ class FakeApi : Api by unused() {
 
     /** Set to make that endpoint fail (an ended session, say). */
     @Volatile var changesError: Exception? = null
+
+    /** Set to hold every since-fetch until the test completes it. */
+    @Volatile var changesGate: CompletableDeferred<Unit>? = null
     @Volatile var snapshotError: Exception? = null
     @Volatile var positionsError: Exception? = null
 
@@ -98,6 +102,7 @@ class FakeApi : Api by unused() {
 
     override suspend fun changes(since: Long): Pair<List<Change>, Long> {
         sinceCalls += since
+        changesGate?.await()
         changesError?.let { throw it }
         return synchronized(log) {
             val page = log.filter { it.seq > since }.sortedBy { it.seq }.take(pageSize)

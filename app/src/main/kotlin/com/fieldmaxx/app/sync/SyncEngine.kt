@@ -86,6 +86,7 @@ private const val BATCH_SIZE = 50
 private const val BACKOFF_FIRST_MS = 2_000L
 private const val BACKOFF_MAX_MS = 60_000L
 private const val CATCH_UP_DELAY_MS = 500L
+private const val UNKNOWN = -1
 
 private enum class Fetched { CAUGHT_UP, RETRY, PAUSED }
 
@@ -144,7 +145,7 @@ class SyncEngine(
     private val catchUpPending = AtomicBoolean(false)
     private val staleJobs: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val busy = AtomicInteger()
-    @Volatile private var waiting = 0 // ops in the outbox, while a session runs
+    @Volatile private var waiting = UNKNOWN // ops in the outbox, while a session runs
     @Volatile private var flushDelayMs = BACKOFF_FIRST_MS
     private var lastSeqRead: Long? = null // guarded by applyLock
 
@@ -252,6 +253,7 @@ class SyncEngine(
     // ---- session ----
 
     private suspend fun run(user: User) = coroutineScope {
+        waiting = UNKNOWN // until the outbox is counted, the status can't say everything is sent
         // Listening first: the first frame of a connection must not be missed.
         launch(start = CoroutineStart.UNDISPATCHED) { live.messages.collect { onMessage(it, user, this@coroutineScope) } }
         launch(start = CoroutineStart.UNDISPATCHED) { live.signInRequired.collect { pauseForAuth() } }
@@ -300,7 +302,7 @@ class SyncEngine(
         synchronized(lock) {
             _status.value = when {
                 session == null || paused || !live.connected.value -> SyncStatus.OFFLINE
-                busy.get() > 0 || waiting > 0 -> SyncStatus.SYNCING
+                busy.get() > 0 || waiting != 0 -> SyncStatus.SYNCING
                 else -> SyncStatus.ONLINE
             }
         }
