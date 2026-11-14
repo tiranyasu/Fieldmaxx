@@ -16,6 +16,7 @@ import com.fieldmaxx.app.net.InMemoryTokenVault
 import com.fieldmaxx.app.ui.FieldmaxxNav
 import com.fieldmaxx.app.ui.FieldmaxxTheme
 import com.fieldmaxx.app.ui.Routes
+import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
@@ -35,6 +36,9 @@ class LoginScreenTest {
     private val vault = InMemoryTokenVault()
     private val graph = AppGraph(ApplicationProvider.getApplicationContext(), vault)
     private lateinit var nav: NavHostController
+
+    /** Signing in starts syncing: stop it, so nothing outlives the test. */
+    @AfterTest fun tearDown() = graph.close()
 
     private fun signIn(password: String) {
         compose.setContent {

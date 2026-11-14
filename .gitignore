@@ -5,6 +5,7 @@ local.properties
 *.keystore
 keystore.properties
 importer/src/test/resources/private/
-data/
+/data/
+/server/data/
 .superpowers/
 .kotlin/

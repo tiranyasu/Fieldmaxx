@@ -1,0 +1,477 @@
+package com.fieldmaxx.app.sync
+
+import android.content.Context
+import androidx.room.Room
+import androidx.test.core.app.ApplicationProvider
+import androidx.work.Configuration
+import androidx.work.NetworkType
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import androidx.work.testing.SynchronousExecutor
+import androidx.work.testing.WorkManagerTestInitHelper
+import com.fieldmaxx.app.AppGraph
+import com.fieldmaxx.app.FieldmaxxApp
+import com.fieldmaxx.app.data.AppDatabase
+import com.fieldmaxx.app.data.toOp
+import com.fieldmaxx.app.net.ApiException
+import com.fieldmaxx.app.net.InMemoryTokenVault
+import com.fieldmaxx.core.FmxJson
+import com.fieldmaxx.core.model.CantShootReason
+import com.fieldmaxx.core.model.CrewMember
+import com.fieldmaxx.core.model.JobFileInfo
+import com.fieldmaxx.core.model.Op
+import com.fieldmaxx.core.model.OpResult
+import com.fieldmaxx.core.model.PhotoStatus
+import com.fieldmaxx.core.model.PointStatus
+import com.fieldmaxx.core.model.PoleData
+import com.fieldmaxx.core.model.RefImageInfo
+import com.fieldmaxx.core.model.ServerMessage
+import java.io.File
+import java.io.IOException
+import java.util.Base64
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.test.AfterTest
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.job
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import okhttp3.mockwebserver.Dispatcher
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
+import okio.Buffer
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+
+@RunWith(RobolectricTestRunner::class)
+class SyncEngineTest {
+    private val context: Context = ApplicationProvider.getApplicationContext()
+    private val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java).build()
+    private val api = FakeApi()
+    private val live = FakeLiveSocket()
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val clock = AtomicLong(50_000)
+    private val engines = mutableListOf<SyncEngine>()
+
+    private val j1 = job("j1")
+    private val p1 = point("p1")
+    private val p2 = point("p2")
+
+    private fun newEngine(database: AppDatabase = db, socket: LiveSocket = live) =
+        SyncEngine(api, database, socket, scope, clock::get).also { engines += it }
+
+    @AfterTest fun tearDown() {
+        engines.forEach { it.stop() }
+        runBlocking { scope.coroutineContext.job.cancelAndJoin() } // nothing may still be writing when the database closes
+        db.close()
+    }
+
+    /** j1 opened on this phone from a snapshot taken at [seq], holding p1 and p2. */
+    private suspend fun SyncEngine.openSeededJob(seq: Long = 10) {
+        api.head = maxOf(api.head, seq)
+        api.snapshots["j1"] = snapshot(j1, listOf(p1, p2), seq)
+        openJob("j1")
+    }
+
+    /** A change the server committed and broadcast. */
+    private suspend fun serverChange(c: com.fieldmaxx.core.model.Change) {
+        api.record(c)
+        live.serverSends(ServerMessage.ChangeMsg(c))
+    }
+
+    private suspend fun <T> Flow<T>.await(predicate: (T) -> Boolean): T = withTimeout(5_000) { first(predicate) }
+
+    private suspend fun outboxIds() = db.outbox().all().map { it.toOp().opId }
+
+    // ---- the brief's tests ----
+
+    @Test fun enqueueAppliesLocallyAtOnce() = runBlocking {
+        api.opsReply = { throw IOException("no signal") }
+        val engine = newEngine()
+        engine.start(ALICE)
+        engine.openSeededJob()
+
+        engine.enqueue(Op.PointUpdate("op-1", "p1", pole = PoleData(lineHeightFt = 22.5), comment = "Leaning"))
+        engine.enqueue(Op.PointClose("op-2", "p1", listOf("ph-1")))
+
+        val shown = engine.points("j1").first().single { it.id == "p1" }
+        assertEquals("Leaning", shown.comment)
+        assertEquals(22.5, shown.pole?.lineHeightFt)
+        assertEquals(PointStatus.done, shown.status)
+        assertEquals(clock.get(), shown.updatedAt)
+        assertEquals(ALICE.id, shown.updatedBy)
+        assertEquals(listOf("op-1", "op-2"), outboxIds())
+    }
+
+    @Test fun offlineOpsSurviveRestartAndFlushInOrder() = runBlocking {
+        val file = File(context.filesDir, "restart.db")
+        fun openFileDb() = Room.databaseBuilder(context, AppDatabase::class.java, file.path).build()
+        val ops = listOf(
+            Op.PointUpdate("op-1", "p1", comment = "Guy wire"),
+            Op.PointMove("op-2", "p1", 39.636200, -119.691200),
+            Op.PointCantShoot("op-3", "p2", CantShootReason.no_access),
+        )
+        api.opsReply = { throw IOException("no signal") }
+        val first = openFileDb()
+        val before = newEngine(first)
+        before.start(ALICE)
+        before.openSeededJob()
+        ops.forEach { before.enqueue(it) }
+        awaitTrue("a send attempt") { api.sentBatches.isNotEmpty() }
+        before.stop()
+        first.close()
+
+        // The app starts again, now with signal.
+        api.opsReply = { batch -> batch.map { OpResult(it.opId, true) } }
+        val again = openFileDb()
+        try {
+            val after = newEngine(again, FakeLiveSocket())
+            after.start(ALICE)
+            again.outbox().observeCount().await { it == 0 }
+            assertEquals(ops, api.sentBatches.last(), "all three, in the order they were made")
+            val shown = after.points("j1").first()
+            assertEquals("Guy wire", shown.single { it.id == "p1" }.comment)
+            assertEquals(PointStatus.cant_shoot, shown.single { it.id == "p2" }.status)
+        } finally {
+            again.close()
+        }
+    }
+
+    @Test fun serverChangeOverwritesLocal() = runBlocking {
+        val engine = newEngine()
+        engine.start(ALICE)
+        engine.openSeededJob()
+        engine.enqueue(Op.PointUpdate("op-1", "p1", comment = "mine"))
+        db.outbox().observeCount().await { it == 0 }
+
+        // Later, another tech's edit of the same field reaches the phone.
+        serverChange(pointChange(11, p1.copy(comment = "theirs", updatedBy = "u2")))
+
+        val shown = engine.points("j1").await { pts -> pts.first().comment == "theirs" }.first()
+        assertEquals("u2", shown.updatedBy)
+    }
+
+    @Test fun reconnectFetchesChangesSinceLastSeq() = runBlocking {
+        val engine = newEngine()
+        engine.openSeededJob(seq = 0)
+        api.record(pointChange(1, p1.copy(comment = "a")), pointChange(2, p2.copy(comment = "b")))
+        engine.start(ALICE)
+        live.serverSends(ServerMessage.Hello(2))
+        engine.points("j1").await { pts -> pts.map { it.comment } == listOf("a", "b") }
+        awaitTrue("the first catch-up") { api.sinceCalls.size == 2 }
+
+        // While the signal was gone the server moved on; the new connection brings only what is new.
+        api.record(pointChange(3, p1.copy(comment = "c")))
+        live.serverReconnects(ServerMessage.Hello(3))
+
+        engine.points("j1").await { pts -> pts.first().comment == "c" }
+        awaitTrue("the second catch-up") { api.sinceCalls.size == 4 }
+        assertEquals(listOf(0L, 2L, 2L, 3L), api.sinceCalls.toList())
+        assertEquals("3", db.meta().get("lastSeq"))
+    }
+
+    @Test fun unauthorizedPausesOutboxKeepsOps() = runBlocking {
+        val engine = newEngine()
+        engine.openSeededJob()
+        api.opsReply = { throw ApiException(401, "Sign in required") }
+        val signedOut = async(start = CoroutineStart.UNDISPATCHED) { engine.authRequired.first() }
+        engine.start(ALICE)
+        engine.enqueue(Op.PointUpdate("op-1", "p1", comment = "kept"))
+
+        withTimeout(5_000) { signedOut.await() }
+        assertEquals(listOf("op-1"), outboxIds())
+        assertEquals("kept", engine.points("j1").first().first().comment, "still shown on the phone")
+        assertFalse(live.connected.value, "socket closed")
+        assertEquals(SyncStatus.OFFLINE, engine.status.value)
+        val sends = api.sentBatches.size
+        engine.enqueue(Op.PointUpdate("op-2", "p2", comment = "also kept"))
+        assertEquals(FlushResult.PAUSED, engine.flushOutbox())
+        assertEquals(sends, api.sentBatches.size, "nothing is sent while paused")
+        assertEquals(1, live.connects.value, "no reconnect")
+
+        // Signed in again: the engine resumes and the kept ops go out.
+        api.opsReply = { ops -> ops.map { OpResult(it.opId, true) } }
+        engine.start(ALICE)
+        db.outbox().observeCount().await { it == 0 }
+        assertEquals(listOf("op-1", "op-2"), api.sentBatches.last().map { it.opId })
+        assertEquals(2, live.connects.value)
+    }
+
+    @Test fun outboxWorkerFlushesInBackground() {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().setHeader("Content-Type", "application/json")
+                .setBody("""{"results":[{"opId":"op-1","ok":true},{"opId":"op-2","ok":true}]}"""),
+        )
+        server.start()
+        WorkManagerTestInitHelper.initializeTestWorkManager(context, Configuration.Builder().setExecutor(SynchronousExecutor()).build())
+        val app = context as FieldmaxxApp
+        val graph = AppGraph(app, InMemoryTokenVault("tok-w")).also { app.graph = it }
+        graph.server.set(server.url("/").toString().trimEnd('/'))
+        try {
+            // The app isn't on screen and nothing started the engine; a photo step queues its results.
+            runBlocking {
+                graph.sync.enqueue(Op.PhotoConfirmed("op-1", "ph-1", "POLE/POLE_1/POLE_1_39.636130_-119.691104_7.jpg", 900))
+                graph.sync.enqueue(Op.PhotoFailed("op-2", "ph-2", "Read timed out", 1))
+            }
+            val workManager = WorkManager.getInstance(context)
+            val info = runBlocking {
+                var found: WorkInfo? = null
+                awaitTrue("background flush lined up") {
+                    found = workManager.getWorkInfosForUniqueWork(OutboxWorker.NAME).get().singleOrNull()
+                    found != null
+                }
+                found!!
+            }
+            assertEquals(WorkInfo.State.ENQUEUED, info.state)
+            assertEquals(NetworkType.CONNECTED, info.constraints.requiredNetworkType)
+
+            WorkManagerTestInitHelper.getTestDriver(context)!!.setAllConstraintsMet(info.id)
+
+            val request = assertNotNull(server.takeRequest(10, TimeUnit.SECONDS))
+            assertEquals("POST /api/ops", "${request.method} ${request.path}")
+            assertEquals("Bearer tok-w", request.getHeader("Authorization"))
+            val sent = FmxJson.decodeFromJsonElement(
+                ListSerializer(Op.serializer()),
+                FmxJson.parseToJsonElement(request.body.readUtf8()).jsonObject.getValue("ops").jsonArray,
+            )
+            assertEquals(listOf("op-1", "op-2"), sent.map { it.opId })
+            runBlocking {
+                awaitTrue("work succeeded") { workManager.getWorkInfoById(info.id).get()?.state == WorkInfo.State.SUCCEEDED }
+                assertEquals(emptyList(), graph.db.outbox().all())
+            }
+            assertEquals(1, server.requestCount, "ops only: no positions, no socket")
+        } finally {
+            graph.close()
+            WorkManagerTestInitHelper.closeWorkDatabase()
+            server.shutdown()
+        }
+    }
+
+    // ---- controller rulings ----
+
+    @Test fun olderChangeArrivingLateIsIgnored() = runBlocking {
+        val engine = newEngine()
+        engine.start(ALICE)
+        engine.openSeededJob(seq = 10)
+
+        // The server committed 11 then 12, but published 12 first.
+        serverChange(pointChange(12, p1.copy(comment = "newer")))
+        serverChange(pointChange(11, p1.copy(comment = "older")))
+        serverChange(pointChange(13, p2.copy(comment = "marker"))) // handled after 11
+
+        val shown = engine.points("j1").await { pts -> pts.any { it.comment == "marker" } }
+        assertEquals("newer", shown.single { it.id == "p1" }.comment)
+
+        // A snapshot older than a row doesn't roll the row back either.
+        api.snapshots["j1"] = snapshot(j1, listOf(p1.copy(comment = "stale"), p2), seq = 11)
+        engine.openJob("j1")
+        val after = engine.points("j1").first()
+        assertEquals("newer", after.single { it.id == "p1" }.comment)
+        assertEquals("marker", after.single { it.id == "p2" }.comment)
+    }
+
+    @Test fun pendingOpStaysVisibleOverIncomingChange() = runBlocking {
+        api.opsReply = { throw IOException("no signal") }
+        val engine = newEngine()
+        engine.start(ALICE)
+        engine.openSeededJob()
+        engine.enqueue(Op.PointUpdate("op-1", "p1", comment = "Anchor buried"))
+
+        // Meanwhile another tech drags the same point.
+        serverChange(pointChange(11, p1.copy(lat = 39.637, lon = -119.692, updatedBy = "u2")))
+
+        val shown = engine.points("j1").await { pts -> pts.first().lat == 39.637 }.first()
+        assertEquals(-119.692, shown.lon)
+        assertEquals("Anchor buried", shown.comment, "the edit still waiting to be sent stays on screen")
+    }
+
+    @Test fun pendingAddedPointSurvivesASnapshotWithoutIt() = runBlocking {
+        api.opsReply = { throw IOException("no signal") }
+        val engine = newEngine()
+        engine.start(ALICE)
+        engine.openSeededJob()
+        engine.enqueue(Op.PointAdd("op-1", "j1", "p9", "POLE", "POLE", "1B", 39.6362, -119.6912))
+        engine.enqueue(Op.PointUpdate("op-2", "p9", comment = "New pole"))
+
+        // The job is opened again; the server doesn't have the new point yet, and p2 is gone from it.
+        api.snapshots["j1"] = snapshot(j1, listOf(p1), seq = 12)
+        engine.openJob("j1")
+
+        val points = engine.points("j1").first()
+        assertEquals(listOf("p1", "p9"), points.map { it.id }, "added point kept once; the server's missing point removed")
+        val added = points.last()
+        assertEquals("POLE 1B", added.label)
+        assertEquals("New pole", added.comment)
+        assertEquals(ALICE.id, added.addedBy)
+    }
+
+    @Test fun rejectedOpIsDroppedAndTheJobRefetched() = runBlocking {
+        val engine = newEngine()
+        engine.openSeededJob()
+        // On the server p1 was deleted meanwhile, so it refuses the edit.
+        api.opsReply = { ops -> ops.map { OpResult(it.opId, false, "point_deleted") } }
+        api.snapshots["j1"] = snapshot(j1, listOf(p1.copy(deletedAt = 900), p2), seq = 14)
+        val refused = async(start = CoroutineStart.UNDISPATCHED) { engine.rejected.first() }
+        engine.start(ALICE)
+        engine.enqueue(Op.PointUpdate("op-1", "p1", comment = "Too late"))
+
+        assertEquals(OpResult("op-1", false, "point_deleted"), withTimeout(5_000) { refused.await() })
+        assertEquals(emptyList(), outboxIds())
+        assertEquals(listOf("j1", "j1"), api.snapshotCalls.toList(), "opened, then fetched again")
+        assertEquals(listOf("p2"), engine.points("j1").first().map { it.id }, "server truth: p1 is deleted")
+    }
+
+    @Test fun sinceFetchPagesUntilAnEmptyPage() = runBlocking {
+        val engine = newEngine()
+        engine.openSeededJob(seq = 0)
+        api.pageSize = 2
+        api.record((1L..5L).map { pointChange(it, p1.copy(comment = "v$it")) })
+        engine.start(ALICE)
+        live.serverSends(ServerMessage.Hello(5))
+
+        awaitTrue("four pages") { api.sinceCalls.size == 4 }
+        assertEquals(listOf(0L, 2L, 4L, 5L), api.sinceCalls.toList())
+        assertEquals("v5", engine.points("j1").first().first().comment)
+        assertEquals("5", db.meta().get("lastSeq"))
+    }
+
+    @Test fun liveChangesAdvanceLastSeqOnlyWithoutGaps() = runBlocking {
+        val engine = newEngine()
+        engine.openSeededJob(seq = 0)
+        engine.start(ALICE)
+        live.serverSends(ServerMessage.Hello(0))
+        awaitTrue("the first catch-up") { api.sinceCalls.size == 1 }
+
+        serverChange(pointChange(1, p1.copy(comment = "a")))
+        awaitTrue("lastSeq 1") { db.meta().get("lastSeq") == "1" }
+
+        // 3 is broadcast before 2: it shows at once, but lastSeq waits until a catch-up fetch has filled the gap.
+        api.record(pointChange(2, p2.copy(comment = "b")))
+        serverChange(pointChange(3, p1.copy(comment = "c")))
+        engine.points("j1").await { pts -> pts.first().comment == "c" }
+        assertEquals("1", db.meta().get("lastSeq"))
+
+        awaitTrue("lastSeq 3") { db.meta().get("lastSeq") == "3" }
+        assertEquals("b", engine.points("j1").first().last().comment)
+        assertEquals(1L, api.sinceCalls[1], "the catch-up starts after the last change applied in order")
+    }
+
+    @Test fun pointsOfAJobNotOpenedHereArriveWithItsSnapshot() = runBlocking<Unit> {
+        val j2 = job("j2", "A05K51V")
+        val q1 = point("q1", jobId = "j2")
+        api.record(jobChange(1, j2), pointChange(2, q1.copy(comment = "early")), pointChange(3, q1.copy(comment = "latest")))
+        val engine = newEngine()
+        engine.start(ALICE)
+        live.serverSends(ServerMessage.Hello(3))
+        awaitTrue("caught up") { db.meta().get("lastSeq") == "3" }
+
+        assertEquals(j2, engine.job("j2").first(), "job rows always stay current")
+        assertEquals(emptyList(), engine.points("j2").first(), "never a partial point list")
+
+        // Opened later from a snapshot read at seq 2, before change 3: the phone catches up from there.
+        api.snapshots["j2"] = snapshot(j2, listOf(q1.copy(comment = "early")), seq = 2)
+        engine.openJob("j2")
+        engine.points("j2").await { pts -> pts.singleOrNull()?.comment == "latest" }
+    }
+
+    @Test fun flowsHideDeletedPointsRemovedPhotosAndOwnPosition() = runBlocking<Unit> {
+        val engine = newEngine()
+        api.snapshots["j1"] = snapshot(
+            j1, listOf(p1, p2.copy(deletedAt = 5)), seq = 10,
+            photos = listOf(photo("ph-1", "p1"), photo("ph-2", "p1", status = PhotoStatus.removed)),
+        )
+        engine.openJob("j1")
+        assertEquals(listOf("p1"), engine.points("j1").first().map { it.id })
+        assertEquals(listOf("ph-1"), engine.photos("p1").first().map { it.id })
+        assertEquals(listOf("ph-1"), engine.jobPhotos("j1").first().map { it.id })
+
+        api.positionsReply = listOf(position(ALICE.id, at = 1), position("u2", at = 1))
+        engine.start(ALICE)
+        live.serverSends(ServerMessage.Hello(10))
+        engine.crew.await { crew -> crew.map { it.userId } == listOf("u2") }
+        live.serverSends(ServerMessage.PositionMsg(position("u3", at = 2)))
+        live.serverSends(ServerMessage.PositionMsg(position(ALICE.id, at = 3)))
+        live.serverSends(ServerMessage.PositionMsg(position("u2", at = 4, lat = 39.7)))
+        engine.crew.await { crew -> crew.map { it.userId to it.at } == listOf("u2" to 4L, "u3" to 2L) }
+    }
+
+    @Test fun openJobKeepsExtrasAndPrefetchesReferenceImages() = runBlocking {
+        val asked = CopyOnWriteArrayList<List<String>>()
+        val engine = SyncEngine(api, db, live, scope, clock::get, server = { "https://fmx.example.com" }) { urls -> asked += urls }
+            .also { engines += it }
+        val refs = listOf(RefImageInfo("imp-1-page-1", "page", 1), RefImageInfo("imp-1-item-3", "item", null))
+        val files = listOf(JobFileInfo("f1", "A05J9XE.pdf", "POLE"))
+        val crew = listOf(CrewMember("u2", "Bob Tech"))
+        api.snapshots["j1"] = snapshot(j1, listOf(p1), seq = 3, refImages = refs, files = files, crew = crew)
+
+        engine.openJob("j1")
+
+        assertEquals(JobExtras(refs, files, crew), engine.extras("j1").first())
+        assertEquals(
+            listOf(listOf("https://fmx.example.com/api/jobs/j1/ref/imp-1-page-1", "https://fmx.example.com/api/jobs/j1/ref/imp-1-item-3")),
+            asked.toList(),
+        )
+        assertEquals("https://fmx.example.com/api/jobs/j1/ref/r1", refImageUrl("https://fmx.example.com/", "j1", "r1"))
+    }
+
+    @Test fun prefetchKeepsReferenceImagesOnDiskWithTheSessionToken() {
+        val png = Base64.getDecoder().decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+        val snapshotJson = FmxJson.encodeToString(
+            com.fieldmaxx.core.model.JobSnapshot.serializer(),
+            snapshot(j1, listOf(p1), seq = 3, refImages = listOf(RefImageInfo("r1", "page", 1))),
+        )
+        val server = MockWebServer()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                "/api/jobs/j1/snapshot" -> MockResponse().setHeader("Content-Type", "application/json").setBody(snapshotJson)
+                "/api/jobs/j1/ref/r1" -> MockResponse().setHeader("Content-Type", "image/png").setBody(Buffer().write(png))
+                else -> MockResponse().setResponseCode(404)
+            }
+        }
+        server.start()
+        val graph = AppGraph(context, InMemoryTokenVault("tok-r"))
+        graph.server.set(server.url("/").toString().trimEnd('/'))
+        val url = refImageUrl(graph.server.get(), "j1", "r1")
+        try {
+            runBlocking {
+                graph.sync.openJob("j1")
+                awaitTrue("image in the disk cache") { graph.imageLoader.diskCache!!.openSnapshot(url)?.use { true } == true }
+            }
+            val requests = (1..server.requestCount).map { server.takeRequest() }
+            val image = requests.single { it.path == "/api/jobs/j1/ref/r1" }
+            assertEquals("Bearer tok-r", image.getHeader("Authorization"))
+        } finally {
+            graph.close()
+            server.shutdown()
+        }
+    }
+
+    @Test fun socketClosedForSignInPausesTheEngine() = runBlocking {
+        val engine = newEngine()
+        val signedOut = async(start = CoroutineStart.UNDISPATCHED) { engine.authRequired.first() }
+        engine.start(ALICE)
+        live.serverSignsOut()
+
+        withTimeout(5_000) { signedOut.await() }
+        assertFalse(live.connected.value)
+        assertEquals(FlushResult.PAUSED, engine.flushOutbox())
+        assertEquals(ALICE, engine.savedUser(), "kept for the next start without signal")
+    }
+}

@@ -9,6 +9,7 @@ plugins {
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.ksp)
+    alias(libs.plugins.androidx.room)
 }
 
 // Release signing reads the git-ignored keystore.properties (storeFile, storePassword, keyAlias, keyPassword) when it
@@ -71,6 +72,11 @@ android {
     }
 }
 
+room {
+    // Exported schemas are the baseline for future migrations; commit them with every version bump.
+    schemaDirectory("$projectDir/schemas")
+}
+
 androidComponents {
     // Unit tests run against the debug build only: it alone declares the activity that Compose tests launch.
     beforeVariants(selector().withBuildType("release")) {
@@ -95,6 +101,12 @@ dependencies {
     implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.datastore.preferences)
     implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
+    implementation(libs.androidx.work.runtime)
+    implementation(libs.coil)
+    implementation(libs.coil.network.okhttp)
     debugImplementation(libs.androidx.compose.ui.test.manifest) // the empty activity createComposeRule() launches
 
     testImplementation(platform(libs.androidx.compose.bom))
@@ -105,4 +117,5 @@ dependencies {
     testImplementation(kotlin("test-junit"))
     testImplementation(libs.okhttp.mockwebserver)
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.androidx.work.testing)
 }
