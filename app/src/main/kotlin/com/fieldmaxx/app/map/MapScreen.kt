@@ -171,7 +171,7 @@ class GraphMapDeps(private val graph: AppGraph) : MapDeps {
  *
  * The camera never moves by itself (R38): on open it goes to the view saved for this user and job, or, with none saved,
  * fits all points once; after that only the user's own actions move it. Each view the map holds is saved. Relative
- * moves (zoom +/−) start from where the map is now, also mid-glide or mid-zoom (B1).
+ * moves (zoom +/−) start from where the map is now, also mid-glide or mid-zoom.
  *
  * Opening refreshes the job in the background; without signal the stored job stays, and a job that is gone goes back
  * with [onJobGone] ("This job was deleted", R42). Refused changes show as a snackbar while the map is open.

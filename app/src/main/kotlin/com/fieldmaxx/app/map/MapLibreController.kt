@@ -335,7 +335,7 @@ class MapLibreController(context: Context) : MapController {
     }
 
     override fun moveTo(v: CameraView) {
-        tracker.asked(v) // at once, even while the map isn't ready: a second zoom step builds on this one (B1)
+        tracker.asked(v) // at once, even while the map isn't ready: a second zoom step builds on this one
         whenPlaced { m -> go(m, CameraUpdateFactory.newLatLngZoom(LatLng(v.lat, v.lon), v.zoom), v) }
     }
 

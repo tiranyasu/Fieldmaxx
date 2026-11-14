@@ -59,7 +59,7 @@ interface MapController {
 }
 
 /**
- * Keeps a map's [MapController.camera] from the map's own events, so it says where the map is (B1, R61). The MapLibre
+ * Keeps a map's [MapController.camera] from the map's own events, so it says where the map is (R38, R61). The MapLibre
  * adapter feeds it from MapLibre's listeners; the tests' fake feeds it the same events, so the screen is tested
  * against the adapter's real reporting.
  * - A move asked for ([asked]: moveTo, fitAll, a cluster tap) shows as its destination at once and stays until it
@@ -104,10 +104,13 @@ class CameraTracker {
     @Synchronized
     fun settled(at: CameraView) = moved(at)
 
-    /** The move to [destination] finished or was given up, with the map at [at]; a newer move asked for stands. */
+    /**
+     * The move asked with this very [destination] finished or was given up, with the map at [at]; a newer move asked
+     * for stands, even one to the same place.
+     */
     @Synchronized
     fun ended(destination: CameraView, at: CameraView) {
-        if (heading != destination) return
+        if (heading !== destination) return
         heading = null
         view.value = at
     }

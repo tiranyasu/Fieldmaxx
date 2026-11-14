@@ -199,7 +199,7 @@ class MapModelTest {
         assertEquals("https://tiles.example.com/{z}/{x}/{y}?style=sat&token=k1", tileUrl("https://tiles.example.com/{z}/{x}/{y}?style=sat", "k1"))
     }
 
-    // ---- CameraTracker: what MapController.camera reports (B1, R61) ----
+    // ---- CameraTracker: what MapController.camera reports (R38, R61) ----
 
     private val rest = CameraView(39.6400, -119.6900, 15.0)
 
@@ -223,6 +223,15 @@ class MapModelTest {
         assertEquals(two, t.camera.value, "the second step builds on the first")
         t.ended(two, two)
         assertEquals(two, t.camera.value)
+
+        // The same place asked twice (center on me, tapped again): the first one's end doesn't end the second.
+        val again = two.copy()
+        t.asked(again)
+        t.applied()
+        t.ended(two, rest.copy(zoom = 16.5))
+        assertEquals(again, t.camera.value)
+        t.moved(rest.copy(zoom = 16.6))
+        assertEquals(again, t.camera.value, "still heading for it")
     }
 
     @Test fun cameraFollowsTheUsersGlide() {
