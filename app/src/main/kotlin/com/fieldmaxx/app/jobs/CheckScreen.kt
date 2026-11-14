@@ -114,7 +114,7 @@ fun CheckScreen(model: NewJobModel, api: Api, onBack: () -> Unit) {
             if (model.isNew) {
                 item(key = "name") {
                     OutlinedTextField(
-                        model.name, model::rename, label = { Text("Job name") }, singleLine = true,
+                        model.name, model::rename, label = { Text("Job name") }, singleLine = true, enabled = model.editable,
                         modifier = Modifier.fillMaxWidth().testTag(CheckTags.NAME),
                     )
                 }
@@ -123,7 +123,7 @@ fun CheckScreen(model: NewJobModel, api: Api, onBack: () -> Unit) {
                 item(key = "failed") {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         FailedFiles(model.failed)
-                        TextButton(onClick = model::retryFailed, enabled = model.reading == null) { Text("Try again") }
+                        TextButton(onClick = model::retryFailed, enabled = model.reading == null && model.editable) { Text("Try again") }
                     }
                 }
             }
@@ -131,11 +131,15 @@ fun CheckScreen(model: NewJobModel, api: Api, onBack: () -> Unit) {
                 val id = preview.importId
                 val points = pointsOf(s, id)
                 item(key = "file:$id") {
-                    FileHeader(preview, layer = s.layers[id] ?: preview.layerSuggestion, points = points, onLayer = { l -> model.update { setLayer(it, id, l) } })
+                    FileHeader(
+                        preview, layer = s.layers[id] ?: preview.layerSuggestion, points = points, editable = model.editable,
+                        onLayer = { l -> model.update { setLayer(it, id, l) } },
+                    )
                 }
                 itemsIndexed(points, key = { i, _ -> "point:$id:$i" }) { i, point ->
                     PointCard(
                         point,
+                        editable = model.editable,
                         onEdit = { editing = Editing(id, i) },
                         onRemove = { model.update { removePoint(it, id, i) } },
                         modifier = Modifier.testTag(CheckTags.point(id, i)),
@@ -154,6 +158,7 @@ fun CheckScreen(model: NewJobModel, api: Api, onBack: () -> Unit) {
                         UnreadCard(
                             line,
                             ignored = isIgnored(s, id, line),
+                            editable = model.editable,
                             onFix = { fixing = Fixing(id, line) },
                             onIgnore = { ignore -> model.update { ignoreUnread(it, id, line, ignore) } },
                             modifier = Modifier.testTag(CheckTags.unread(id, i)),
@@ -162,7 +167,7 @@ fun CheckScreen(model: NewJobModel, api: Api, onBack: () -> Unit) {
                 }
             }
             if (model.isNew) {
-                item(key = "link") { FieldNotesLinkField(model.link, { model.link = it }, api, Modifier.padding(top = 8.dp)) }
+                item(key = "link") { FieldNotesLinkField(model.link, model::editLink, api, Modifier.padding(top = 8.dp), editable = model.editable) }
             }
         }
     }
@@ -220,11 +225,11 @@ fun CheckScreen(model: NewJobModel, api: Api, onBack: () -> Unit) {
 }
 
 @Composable
-private fun FileHeader(preview: ImportPreview, layer: String, points: List<DraftPoint>, onLayer: (String) -> Unit) {
+private fun FileHeader(preview: ImportPreview, layer: String, points: List<DraftPoint>, editable: Boolean, onLayer: (String) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
         Text(preview.fileName, style = MaterialTheme.typography.titleMedium)
         OutlinedTextField(
-            layer, onLayer, label = { Text("Layer") }, singleLine = true,
+            layer, onLayer, label = { Text("Layer") }, singleLine = true, enabled = editable,
             modifier = Modifier.fillMaxWidth().testTag(CheckTags.layer(preview.importId)),
         )
         val lines = summary(points)
@@ -242,13 +247,13 @@ private fun FileHeader(preview: ImportPreview, layer: String, points: List<Draft
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun PointCard(point: DraftPoint, onEdit: () -> Unit, onRemove: () -> Unit, modifier: Modifier = Modifier) {
+private fun PointCard(point: DraftPoint, editable: Boolean, onEdit: () -> Unit, onRemove: () -> Unit, modifier: Modifier = Modifier) {
     OutlinedCard(modifier.fillMaxWidth()) {
         Column(Modifier.padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(point.label, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
-                TextButton(onClick = onEdit) { Text("Edit") }
-                TextButton(onClick = onRemove) { Text("Remove") }
+                TextButton(onClick = onEdit, enabled = editable) { Text("Edit") }
+                TextButton(onClick = onRemove, enabled = editable) { Text("Remove") }
             }
             val lat = point.lat
             val lon = point.lon
@@ -277,7 +282,14 @@ private fun FlagBadge(text: String) {
 }
 
 @Composable
-private fun UnreadCard(line: UnreadLine, ignored: Boolean, onFix: () -> Unit, onIgnore: (Boolean) -> Unit, modifier: Modifier = Modifier) {
+private fun UnreadCard(
+    line: UnreadLine,
+    ignored: Boolean,
+    editable: Boolean,
+    onFix: () -> Unit,
+    onIgnore: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     OutlinedCard(modifier.fillMaxWidth()) {
         Column(Modifier.padding(start = 12.dp, end = 4.dp, top = 12.dp, bottom = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Column(Modifier.alpha(if (ignored) 0.6f else 1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -291,11 +303,11 @@ private fun UnreadCard(line: UnreadLine, ignored: Boolean, onFix: () -> Unit, on
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (ignored) {
                     Text("Ignored", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
-                    TextButton(onClick = { onIgnore(false) }) { Text("Undo") }
+                    TextButton(onClick = { onIgnore(false) }, enabled = editable) { Text("Undo") }
                 } else {
                     Text("Not on the map yet", color = FmxColors.Warning, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
-                    TextButton(onClick = onFix) { Text("Fix") }
-                    TextButton(onClick = { onIgnore(true) }) { Text("Ignore") }
+                    TextButton(onClick = onFix, enabled = editable) { Text("Fix") }
+                    TextButton(onClick = { onIgnore(true) }, enabled = editable) { Text("Ignore") }
                 }
             }
         }
@@ -312,6 +324,7 @@ private fun SaveBar(model: NewJobModel, s: CheckState, onSave: () -> Unit) {
             if (unread > 0) Text(if (unread == 1) "Fix or ignore 1 line that couldn't be read." else "Fix or ignore $unread lines that couldn't be read.", color = FmxColors.Warning)
             if (model.isNew && model.name.isBlank()) Text("Enter the job name.", color = FmxColors.Warning)
             model.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            if (model.unsure) Text(SAVE_UNSURE, color = FmxColors.Warning)
             Button(onClick = onSave, enabled = model.saveEnabled, modifier = Modifier.fillMaxWidth().testTag(CheckTags.SAVE)) {
                 if (model.saving) {
                     CircularProgressIndicator(Modifier.size(20.dp), color = LocalContentColor.current, strokeWidth = 2.dp)

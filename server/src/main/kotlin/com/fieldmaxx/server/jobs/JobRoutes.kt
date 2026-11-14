@@ -7,6 +7,7 @@ import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
 import com.fieldmaxx.server.Ctx
 import com.fieldmaxx.server.HttpError
+import com.fieldmaxx.server.idempotencyKey
 import com.fieldmaxx.server.auth.user
 import io.ktor.http.ContentDisposition
 import io.ktor.http.ContentType
@@ -49,7 +50,7 @@ fun Route.jobRoutes(ctx: Ctx) {
                 call.respond(listJobs(ctx, call.user(), "finished" in include, "deleted" in include))
             }
             post {
-                val (job, skipped) = createJob(ctx, call.user(), call.receive<CreateJobInput>())
+                val (job, skipped) = createJob(ctx, call.user(), call.receive<CreateJobInput>(), call.idempotencyKey())
                 call.respond(HttpStatusCode.Created, CreateJobResponse(job, skipped))
             }
             route("/{id}") {
@@ -70,7 +71,8 @@ fun Route.jobRoutes(ctx: Ctx) {
                     call.respond(HttpStatusCode.NoContent)
                 }
                 post("/imports") {
-                    val (points, skipped) = addImportToJob(ctx, call.user(), call.parameters["id"]!!, call.receive<JobImportInput>())
+                    val (points, skipped) =
+                        addImportToJob(ctx, call.user(), call.parameters["id"]!!, call.receive<JobImportInput>(), call.idempotencyKey())
                     call.respond(HttpStatusCode.Created, AddImportResponse(points, skipped))
                 }
                 get("/ref/{refId}") {

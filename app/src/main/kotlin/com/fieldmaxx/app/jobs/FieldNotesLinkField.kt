@@ -27,6 +27,7 @@ import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.ApiException
 import com.fieldmaxx.app.ui.FmxColors
 import java.io.IOException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 internal const val NO_SIGNAL = "Can't reach the server. Check your signal."
@@ -43,10 +44,10 @@ private class CheckedLink(val url: String, val ok: Boolean, val message: String)
 /**
  * The job's OneDrive "Field Notes" share link, with "Check": the server opens the link and answers with the folder's
  * name, or a readable reason it can't be used (sign-in only, expired, no access). The answer shows only while the field
- * still holds the link that was checked.
+ * still holds the link that was checked. [editable] false keeps the link as it is (it can still be checked).
  */
 @Composable
-fun FieldNotesLinkField(value: String, onValueChange: (String) -> Unit, api: Api, modifier: Modifier = Modifier) {
+fun FieldNotesLinkField(value: String, onValueChange: (String) -> Unit, api: Api, modifier: Modifier = Modifier, editable: Boolean = true) {
     var checked by remember { mutableStateOf<CheckedLink?>(null) }
     var checking by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
@@ -55,7 +56,7 @@ fun FieldNotesLinkField(value: String, onValueChange: (String) -> Unit, api: Api
         val url = value.trim()
         if (url.isEmpty() || checking) return
         checking = true
-        scope.launch {
+        scope.launch(Dispatchers.Main.immediate) { // the answer is shown on the main thread wherever the call finishes
             checked = try {
                 val r = api.checkLink(url)
                 when {
@@ -79,6 +80,7 @@ fun FieldNotesLinkField(value: String, onValueChange: (String) -> Unit, api: Api
             label = { Text("Field Notes link") },
             placeholder = { Text("https://….sharepoint.com/…") },
             singleLine = true,
+            enabled = editable,
             keyboardOptions = KeyboardOptions(autoCorrectEnabled = false, keyboardType = KeyboardType.Uri, imeAction = ImeAction.Done),
             modifier = Modifier.fillMaxWidth().testTag(LinkTags.FIELD),
         )

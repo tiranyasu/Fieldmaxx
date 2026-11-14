@@ -2,6 +2,7 @@ package com.fieldmaxx.server.jobs
 
 import com.fieldmaxx.core.geo.LatLon
 import com.fieldmaxx.core.geo.distanceMeters
+import com.fieldmaxx.core.model.Change
 import com.fieldmaxx.core.model.CrewMember
 import com.fieldmaxx.core.model.DraftPoint
 import com.fieldmaxx.core.model.ImportFlag
@@ -17,6 +18,8 @@ import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
 import com.fieldmaxx.server.Ctx
 import com.fieldmaxx.server.HttpError
+import com.fieldmaxx.server.storeAnswer
+import com.fieldmaxx.server.storedAnswer
 import com.fieldmaxx.server.delivery.backupMaintenance
 import io.ktor.http.HttpStatusCode
 import java.nio.file.Files
@@ -55,15 +58,20 @@ private fun checkHaveCoordinates(imports: List<JobImportInput>) {
     }
 }
 
-/** Creates the job with the points of every import; identical repeats are skipped and returned by label. */
-fun createJob(ctx: Ctx, user: User, input: CreateJobInput): Pair<Job, List<String>> {
+/**
+ * Creates the job with the points of every import; identical repeats are skipped and returned by label. A [requestId]
+ * sent again by the same user (a retry whose reply was lost) gets the first answer and creates nothing (R44).
+ */
+fun createJob(ctx: Ctx, user: User, input: CreateJobInput, requestId: String? = null): Pair<Job, List<String>> {
     val name = input.name.trim()
     require(name.isNotEmpty()) { "Job name is required" }
     checkHaveCoordinates(input.imports)
-    val jobId = newId()
     val now = ctx.clock.millis()
     val url = input.fieldNotesUrl?.trim()?.ifEmpty { null }
-    val (job, skipped, changes) = ctx.db.tx {
+    val opId = requestId?.let { "jobs.create:$it" }
+    val (answer, changes) = ctx.db.tx {
+        storedAnswer(opId, user, CreateJobResponse.serializer())?.let { return@tx it to emptyList<Change>() }
+        val jobId = newId()
         prepareStatement(
             "INSERT INTO jobs(id, name, notes, field_notes_url, status, created_by, created_at) VALUES (?,?,?,?,'active',?,?)",
         ).use {
@@ -80,17 +88,24 @@ fun createJob(ctx: Ctx, user: User, input: CreateJobInput): Pair<Job, List<Strin
         val job = requireJob(jobId)
         val changes = listOf(ctx.changes.recordInTx(this, jobId, "job", jobId, job = job)) +
             added.map { ctx.changes.recordInTx(this, jobId, "point", it.id, point = it) }
-        Triple(job, skipped, changes)
+        val answer = CreateJobResponse(job, skipped)
+        storeAnswer(opId, user, now, CreateJobResponse.serializer(), answer)
+        answer to changes
     }
     changes.forEach(ctx.changes::publish)
-    return job to skipped
+    return answer.job to answer.skippedDuplicates
 }
 
-/** Adds another import's points to an existing job (skipping same-label points within 1 m). */
-fun addImportToJob(ctx: Ctx, user: User, jobId: String, imp: JobImportInput): Pair<List<Point>, List<String>> {
+/**
+ * Adds another import's points to an existing job (skipping same-label points within 1 m). A [requestId] sent again by
+ * the same user gets the first answer and adds nothing: no points, no second file, no notes appended twice (R44).
+ */
+fun addImportToJob(ctx: Ctx, user: User, jobId: String, imp: JobImportInput, requestId: String? = null): Pair<List<Point>, List<String>> {
     checkHaveCoordinates(listOf(imp))
     val now = ctx.clock.millis()
-    val (result, changes) = ctx.db.tx {
+    val opId = requestId?.let { "jobs.import:$jobId:$it" }
+    val (answer, changes) = ctx.db.tx {
+        storedAnswer(opId, user, AddImportResponse.serializer())?.let { return@tx it to emptyList<Change>() }
         val job = requireJob(jobId)
         if (job.deletedAt != null) throw HttpError(HttpStatusCode.NotFound, "Job not found")
         val before = job.notes
@@ -100,10 +115,12 @@ fun addImportToJob(ctx: Ctx, user: User, jobId: String, imp: JobImportInput): Pa
             if (after.notes != before) add(ctx.changes.recordInTx(this@tx, jobId, "job", jobId, job = after))
             r.first.forEach { add(ctx.changes.recordInTx(this@tx, jobId, "point", it.id, point = it)) }
         }
-        r to changes
+        val answer = AddImportResponse(r.first, r.second)
+        storeAnswer(opId, user, now, AddImportResponse.serializer(), answer)
+        answer to changes
     }
     changes.forEach(ctx.changes::publish)
-    return result
+    return answer.points to answer.skippedDuplicates
 }
 
 /** Runs inside a write transaction. [existing] is updated with every point inserted. */

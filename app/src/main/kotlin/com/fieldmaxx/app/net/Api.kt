@@ -53,10 +53,18 @@ interface Api {
 
     /** Uploads a PDF or Word file for reading; the preview feeds the check screen. */
     suspend fun importFile(name: String, bytes: ByteArray): ImportPreview
-    suspend fun createJob(i: CreateJobInput): Job
 
-    /** Adds a checked import to an existing job; returns the points created (identical ones are skipped). */
-    suspend fun addImport(jobId: String, i: JobImportInput): List<Point>
+    /**
+     * [requestId] goes as the `Idempotency-Key` header: sent again (a retry after a lost reply), the server answers with
+     * the job it created the first time and creates no other (R44).
+     */
+    suspend fun createJob(i: CreateJobInput, requestId: String): Job
+
+    /**
+     * Adds a checked import to an existing job; returns the points created (identical ones are skipped). A [requestId]
+     * sent again adds nothing more (R44).
+     */
+    suspend fun addImport(jobId: String, i: JobImportInput, requestId: String): List<Point>
 
     /** Changes only the fields given; an empty [fieldNotesUrl] removes the link. */
     suspend fun patchJob(jobId: String, name: String? = null, fieldNotesUrl: String? = null, notes: String? = null): Job

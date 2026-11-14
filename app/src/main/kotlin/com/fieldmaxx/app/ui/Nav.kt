@@ -181,7 +181,7 @@ private suspend fun resumeSync(graph: AppGraph, toLogin: suspend () -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun MapPlaceholder(graph: AppGraph, jobId: String, onBack: () -> Unit) {
-    val job by remember(jobId) { graph.sync.job(jobId) }.collectAsState(null)
+    val job by remember(jobId) { graph.sync.job(jobId) }.collectAsState(null, Dispatchers.Main.immediate)
     Scaffold(
         topBar = {
             TopAppBar(

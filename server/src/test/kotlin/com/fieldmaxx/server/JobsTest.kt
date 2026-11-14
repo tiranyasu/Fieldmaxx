@@ -29,6 +29,7 @@ import io.ktor.client.request.delete
 import io.ktor.client.request.forms.MultiPartFormDataContent
 import io.ktor.client.request.forms.formData
 import io.ktor.client.request.get
+import io.ktor.client.request.header
 import io.ktor.client.request.patch
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
@@ -77,6 +78,20 @@ class JobsTest {
         assertEquals(HttpStatusCode.Created, res.status, res.bodyAsText())
         return FmxJson.decodeFromString(CreateJobResponse.serializer(), res.bodyAsText())
     }
+
+    /** POST /api/jobs as the app sends it, with an `Idempotency-Key` when [key] is given. */
+    private suspend fun ApplicationTestBuilder.createWithKey(token: String, p: ImportPreview, key: String?, name: String = "Elko run"): HttpResponse =
+        client.post("/api/jobs") {
+            bearerAuth(token); contentType(ContentType.Application.Json)
+            if (key != null) header("Idempotency-Key", key)
+            setBody(FmxJson.encodeToString(CreateJobInput.serializer(), CreateJobInput(name, null, listOf(input(p)))))
+        }
+
+    private suspend fun ApplicationTestBuilder.addWithKey(token: String, jobId: String, imp: JobImportInput, key: String): HttpResponse =
+        client.post("/api/jobs/$jobId/imports") {
+            bearerAuth(token); contentType(ContentType.Application.Json); header("Idempotency-Key", key)
+            setBody(FmxJson.encodeToString(JobImportInput.serializer(), imp))
+        }
 
     private suspend fun ApplicationTestBuilder.snapshot(token: String, jobId: String): JobSnapshot {
         val res = client.get("/api/jobs/$jobId/snapshot") { bearerAuth(token) }
@@ -275,6 +290,71 @@ class JobsTest {
         val tr = FmxJson.decodeFromString(CreateJobResponse.serializer(), twice.bodyAsText())
         assertEquals(7, tr.skippedDuplicates.size)
         assertEquals(7, snapshot(t, tr.job.id).points.size)
+    }
+
+    @Test fun replayedCreateReturnsTheSameJob() = TestApp().run { app ->
+        val t = tokenFor("ann")
+        val p = preview(t)
+        val first = createWithKey(t, p, "draft-1")
+        assertEquals(HttpStatusCode.Created, first.status, first.bodyAsText())
+
+        // The reply was lost and the phone tries again with the same key: the stored answer, and nothing new.
+        val again = createWithKey(t, p, "draft-1")
+        assertEquals(HttpStatusCode.Created, again.status, again.bodyAsText())
+        assertEquals(first.bodyAsText(), again.bodyAsText())
+        val job = FmxJson.decodeFromString(CreateJobResponse.serializer(), again.bodyAsText()).job
+        assertEquals(listOf(job.id), list(t).map { it.job.id }, "no second job")
+        assertEquals(7, snapshot(t, job.id).points.size)
+        assertEquals(1, app.ctx.changes.since(0).first.count { it.entity == "job" }, "a replay records no change")
+
+        // Another draft is another job.
+        assertEquals(HttpStatusCode.Created, createWithKey(t, preview(t), "draft-2").status)
+        assertEquals(2, list(t).size)
+    }
+
+    @Test fun replayedAddImportAddsNothing() = TestApp().run { app ->
+        val t = tokenFor("ann")
+        val j = create(t, preview(t)).job
+        // A file with notes: each import added appends them to the job's notes.
+        val noted = upload(t, bytes = makePdf(listOf(PdfPageSpec(freeText = listOf("NOTE FOR AERIAL PATH", AERIAL)))))
+        val q = FmxJson.decodeFromString(ImportPreview.serializer(), noted.bodyAsText())
+        assertEquals("NOTE FOR AERIAL PATH", q.notes)
+        val elsewhere = input(q).copy(points = q.points.map { it.copy(lat = it.lat!! + 0.01) })
+
+        val first = addWithKey(t, j.id, elsewhere, "add-1")
+        assertEquals(HttpStatusCode.Created, first.status, first.bodyAsText())
+        val added = snapshot(t, j.id)
+        assertEquals(14, added.points.size)
+        assertEquals(2, added.files.size)
+        val changes = app.ctx.changes.headSeq()
+
+        val again = addWithKey(t, j.id, elsewhere, "add-1")
+        assertEquals(HttpStatusCode.Created, again.status, again.bodyAsText())
+        assertEquals(first.bodyAsText(), again.bodyAsText())
+        val replayed = snapshot(t, j.id)
+        assertEquals(14, replayed.points.size, "no points added")
+        assertEquals(2, replayed.files.size, "no second job_files row")
+        assertEquals(added.job.notes, replayed.job.notes, "the notes aren't appended twice")
+        assertEquals(changes, app.ctx.changes.headSeq(), "a replay records no change")
+    }
+
+    @Test fun anotherUsersIdempotencyKeyIs409() = TestApp().run {
+        val ann = tokenFor("ann"); val bob = tokenFor("bob")
+        val job = FmxJson.decodeFromString(CreateJobResponse.serializer(), createWithKey(ann, preview(ann), "ann-1").bodyAsText()).job
+
+        val stolen = createWithKey(bob, preview(bob), "ann-1")
+        assertEquals(HttpStatusCode.Conflict, stolen.status)
+        assertTrue("op_id_conflict" in stolen.bodyAsText(), stolen.bodyAsText())
+        assertEquals(listOf(job.id), list(bob).map { it.job.id }, "bob's request wrote nothing")
+
+        val q = preview(ann)
+        val elsewhere = input(q).copy(points = q.points.map { it.copy(lat = it.lat!! + 0.01) })
+        assertEquals(HttpStatusCode.Created, addWithKey(ann, job.id, elsewhere, "ann-add").status)
+        val theirs = addWithKey(bob, job.id, elsewhere, "ann-add")
+        assertEquals(HttpStatusCode.Conflict, theirs.status)
+        assertTrue("op_id_conflict" in theirs.bodyAsText(), theirs.bodyAsText())
+        assertEquals(14, snapshot(bob, job.id).points.size)
+        assertEquals(2, snapshot(bob, job.id).files.size)
     }
 
     @Test fun sameLabelDifferentCoordsFlagged() = TestApp().run {

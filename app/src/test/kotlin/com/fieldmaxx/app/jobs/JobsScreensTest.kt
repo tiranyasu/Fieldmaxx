@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import androidx.activity.ComponentActivity
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -31,11 +32,17 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTextReplacement
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.createSavedStateHandle
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.room.Room
+import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import com.fieldmaxx.app.data.AppDatabase
 import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.ApiException
+import com.fieldmaxx.app.net.OkHttpApi
 import com.fieldmaxx.app.sync.ALICE
 import com.fieldmaxx.app.sync.FakeLiveSocket
 import com.fieldmaxx.app.sync.SyncEngine
@@ -46,11 +53,13 @@ import com.fieldmaxx.app.sync.photo
 import com.fieldmaxx.app.sync.point
 import com.fieldmaxx.app.sync.snapshot
 import com.fieldmaxx.app.ui.FieldmaxxTheme
+import com.fieldmaxx.core.FmxJson
 import com.fieldmaxx.core.model.CreateJobInput
 import com.fieldmaxx.core.model.CrewMember
 import com.fieldmaxx.core.model.ImportPreview
 import com.fieldmaxx.core.model.Job
 import com.fieldmaxx.core.model.JobFileInfo
+import com.fieldmaxx.core.model.JobImportInput
 import com.fieldmaxx.core.model.JobListItem
 import com.fieldmaxx.core.model.JobSnapshot
 import com.fieldmaxx.core.model.LinkCheck
@@ -63,6 +72,7 @@ import java.io.IOException
 import java.lang.reflect.Proxy
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -75,6 +85,12 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.runBlocking
+import okhttp3.OkHttpClient
+import okhttp3.mockwebserver.Dispatcher
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
+import okhttp3.mockwebserver.SocketPolicy
 import org.junit.Rule
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
@@ -96,6 +112,10 @@ class JobsFakeApi : Api by notUsed() {
     val imported = CopyOnWriteArrayList<String>()
     @Volatile var importReply: (String, ByteArray) -> ImportPreview = { name, _ -> error("no import expected: $name") }
     val created = CopyOnWriteArrayList<CreateJobInput>()
+    val createKeys = CopyOnWriteArrayList<String>()
+
+    /** Thrown by the next creates instead of creating. */
+    @Volatile var createError: Exception? = null
     val downloads = CopyOnWriteArrayList<String>()
 
     override suspend fun jobs(include: String?): List<JobListItem> {
@@ -119,7 +139,9 @@ class JobsFakeApi : Api by notUsed() {
         return importReply(name, bytes)
     }
 
-    override suspend fun createJob(i: CreateJobInput): Job {
+    override suspend fun createJob(i: CreateJobInput, requestId: String): Job {
+        createKeys += requestId
+        createError?.let { throw it }
         created += i
         return job("j-new", i.name).copy(fieldNotesUrl = i.fieldNotesUrl)
     }
@@ -176,6 +198,8 @@ class JobsScreensTest {
         compose.waitForIdle()
         condition()
     }
+
+    private fun inCard(tag: String, text: String) = compose.onNode(hasText(text) and hasAnyAncestor(hasTestTag(tag)))
 
     private fun openMenuItem(jobId: String, item: String) {
         compose.onNodeWithTag(JobListTags.menu(jobId)).performClick()
@@ -369,7 +393,6 @@ class JobsScreensTest {
                 NewJobScreen(api, openJob = {}, addToJobId = null, sharedFiles = listOf(file), sharedLink = link, onDone = {}, onBack = {})
             }
         }
-        fun inCard(tag: String, text: String) = compose.onNode(hasText(text) and hasAnyAncestor(hasTestTag(tag)))
         fun scrollTo(tag: String) = compose.onNodeWithTag(CheckTags.LIST).performScrollToNode(hasTestTag(tag))
 
         waitForText("Found 1 POLE point")
@@ -413,6 +436,147 @@ class JobsScreensTest {
         val input = api.created.single()
         assertEquals(link, input.fieldNotesUrl)
         assertEquals(listOf("POLE 8", "POLE 9"), input.imports.single().points.map { it.label })
+    }
+
+    /**
+     * A server where every file upload reads as [previews] in turn and the job writes on [writePath] answer with
+     * [answers] in turn; a null answer is applied but never replied to (the reply is lost), so the phone times out.
+     */
+    private fun lostReplyServer(writePath: String, previews: List<ImportPreview>, answers: List<String?>): MockWebServer {
+        val server = MockWebServer()
+        var uploads = 0
+        var writes = 0
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.path) {
+                "/api/imports" -> jsonReply(FmxJson.encodeToString(ImportPreview.serializer(), previews[uploads++]))
+                writePath -> answers[writes++]?.let { jsonReply(it, 201) } ?: MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE)
+                else -> MockResponse().setResponseCode(404)
+            }
+        }
+        return server
+    }
+
+    private fun jsonReply(body: String, code: Int = 200) = MockResponse().setResponseCode(code).setHeader("Content-Type", "application/json").setBody(body)
+
+    /** The real client, giving up on a reply after a second. */
+    private fun realApi(server: MockWebServer) = OkHttpApi(OkHttpClient.Builder().readTimeout(1, TimeUnit.SECONDS).build()) { server.url("/").toString() }
+
+    private fun writes(server: MockWebServer, path: String): List<RecordedRequest> =
+        List(server.requestCount) { server.takeRequest() }.filter { it.path == path }
+
+    @Test fun retryAfterLostReplySendsSameKey() {
+        val created = """{"job":${FmxJson.encodeToString(Job.serializer(), job("j-9", "A05J9XE"))},"skippedDuplicates":[]}"""
+        lostReplyServer("/api/jobs", listOf(preview((1..7).map { draft("POLE $it") })), listOf(null, created)).use { server ->
+            val file = SharedFilesProvider.share("86", "A05J9XE.pdf", PDF_BYTES)
+            var done: String? = null
+            compose.setContent {
+                FieldmaxxTheme {
+                    NewJobScreen(
+                        realApi(server), openJob = {}, addToJobId = null, sharedFiles = listOf(file),
+                        sharedLink = "https://contoso.sharepoint.com/:f:/s/Fielding/EaBcDe?e=1", onDone = { done = it }, onBack = {},
+                    )
+                }
+            }
+            waitForText("Found 7 POLE points")
+
+            compose.onNodeWithTag(CheckTags.SAVE).performClick() // the server creates the job; its reply never comes
+            waitForText("Can't reach the server. Check your signal and try again.")
+            // What was sent stays as it was: an edit now would be lost, since the retry gets the first answer.
+            compose.onNodeWithText(SAVE_UNSURE).assertIsDisplayed()
+            compose.onNodeWithTag(CheckTags.LIST).performScrollToNode(hasTestTag(CheckTags.point("imp1", 0)))
+            inCard(CheckTags.point("imp1", 0), "Edit").assertIsNotEnabled()
+            compose.onNodeWithTag(CheckTags.SAVE).performClick()
+            waitFor { done != null }
+
+            assertEquals("j-9", done)
+            val posts = writes(server, "/api/jobs")
+            assertEquals(2, posts.size)
+            val key = posts[0].getHeader("Idempotency-Key")
+            assertTrue(!key.isNullOrBlank(), "the save carries a key")
+            assertEquals(key, posts[1].getHeader("Idempotency-Key"), "the retry sends the same key: the server answers it once")
+            assertEquals(posts[0].body.readUtf8(), posts[1].body.readUtf8(), "and the same draft")
+        }
+    }
+
+    @Test fun addRetrySendsOnlyTheRestWithTheirKeys() {
+        val previews = listOf(
+            preview((1..7).map { draft("POLE $it") }, importId = "imp-a"),
+            preview((8..9).map { draft("POLE $it") }, importId = "imp-b", fileName = "A05J9XE more.pdf"),
+        )
+        val added = """{"points":[],"skippedDuplicates":[]}"""
+        lostReplyServer("/api/jobs/j1/imports", previews, listOf(added, null, added)).use { server ->
+            val files = listOf(SharedFilesProvider.share("87", "A05J9XE.pdf", PDF_BYTES), SharedFilesProvider.share("88", "A05J9XE more.pdf", PDF_BYTES))
+            var done: String? = null
+            compose.setContent {
+                FieldmaxxTheme {
+                    NewJobScreen(realApi(server), openJob = {}, addToJobId = "j1", sharedFiles = files, sharedLink = null, onDone = { done = it }, onBack = {})
+                }
+            }
+            waitForText("Found 7 POLE points")
+            compose.onNodeWithTag(CheckTags.LIST).performScrollToNode(hasText("Found 2 POLE points"))
+
+            compose.onNodeWithTag(CheckTags.SAVE).performClick() // the first file is added; the second's reply is lost
+            waitForText("Can't reach the server. Check your signal and try again.")
+            compose.onNodeWithTag(CheckTags.SAVE).performClick()
+            waitFor { done != null }
+
+            val posts = writes(server, "/api/jobs/j1/imports")
+            assertEquals(listOf("imp-a", "imp-b", "imp-b"), posts.map { FmxJson.decodeFromString(JobImportInput.serializer(), it.body.readUtf8()).importId })
+            val keys = posts.map { it.getHeader("Idempotency-Key") }
+            assertTrue(keys.none { it.isNullOrBlank() }, "every add carries a key: $keys")
+            assertTrue(keys[0] != keys[1], "each file has its own key: $keys")
+            assertEquals(keys[1], keys[2], "the retry of the second file sends its key again")
+        }
+    }
+
+    @Test fun lostReplyLocksTheDraftARefusalDoesNot() {
+        val file = SharedFilesProvider.share("89", "A05J9XE.pdf", PDF_BYTES)
+        api.importReply = { name, _ -> preview((1..7).map { draft("POLE $it") }, fileName = name) }
+        compose.setContent {
+            FieldmaxxTheme {
+                NewJobScreen(
+                    api, openJob = {}, addToJobId = null, sharedFiles = listOf(file),
+                    sharedLink = "https://contoso.sharepoint.com/:f:/s/Fielding/EaBcDe?e=1", onDone = {}, onBack = {},
+                )
+            }
+        }
+        waitForText("Found 7 POLE points")
+        fun firstEdit() = compose.onNodeWithTag(CheckTags.LIST).performScrollToNode(hasTestTag(CheckTags.point("imp1", 0)))
+            .let { inCard(CheckTags.point("imp1", 0), "Edit") }
+        fun name() = compose.onNodeWithTag(CheckTags.LIST).performScrollToNode(hasTestTag(CheckTags.NAME)).let { compose.onNodeWithTag(CheckTags.NAME) }
+
+        // Refused: the server saved nothing, so the draft can still change.
+        api.createError = ApiException(400, "These points have no coordinates: POLE 2. Place them on the map or remove them.")
+        compose.onNodeWithTag(CheckTags.SAVE).performClick()
+        waitForText("These points have no coordinates: POLE 2. Place them on the map or remove them.")
+        firstEdit().assertIsEnabled()
+        name().assertIsEnabled()
+        compose.onAllNodesWithText(SAVE_UNSURE).assertCountEquals(0)
+
+        // A gateway gave up: the server may have saved it, so the draft waits as it was sent.
+        api.createError = ApiException(502, "Server error (HTTP 502)")
+        compose.onNodeWithTag(CheckTags.SAVE).performClick()
+        waitForText(SAVE_UNSURE)
+        firstEdit().assertIsNotEnabled()
+        name().assertIsNotEnabled()
+        compose.onNodeWithTag(CheckTags.SAVE).assertIsEnabled()
+        assertEquals(1, api.createKeys.toSet().size, "every try of the draft sends one key: ${api.createKeys}")
+    }
+
+    @Test fun draftKeyOutlivesTheScreen() {
+        fun model(a: ComponentActivity) = ViewModelProvider(
+            a, viewModelFactory { initializer { NewJobModel(createSavedStateHandle(), api, a.contentResolver, {}, null, null) } },
+        )[NewJobModel::class.java]
+
+        ActivityScenario.launch(ComponentActivity::class.java).use { scenario ->
+            var first: String? = null
+            scenario.onActivity { first = model(it).requestId }
+            scenario.recreate() // turning the phone keeps the model
+            scenario.onActivity { assertEquals(first, model(it).requestId) }
+            scenario.onActivity { it.viewModelStore.clear() } // as after Android ends the process: only saved state is left
+            scenario.recreate()
+            scenario.onActivity { assertEquals(first, model(it).requestId, "the key comes back from saved state") }
+        }
     }
 
     @Test fun jobInfoOpensSourceFile() {

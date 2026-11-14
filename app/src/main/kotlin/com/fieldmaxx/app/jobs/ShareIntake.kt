@@ -228,10 +228,13 @@ fun ShareIntakeScreen(
     onClose: () -> Unit,
 ) {
     val resolver = LocalContext.current.applicationContext.contentResolver
+    // Main-confined, as on the login screen: the screen's state is written on the main thread wherever a call finishes.
     val files by produceState<List<SharedFile>?>(null, intake) {
         val uris = (intake as? SharedIntake.Files)?.uris.orEmpty()
-        value = withContext(Dispatchers.IO) {
-            uris.map { uri -> SharedFile(uri, runCatching { fileInfo(resolver, uri).name }.getOrDefault("file"), refusalOf(resolver, uri)) }
+        withContext(Dispatchers.Main.immediate) {
+            value = withContext(Dispatchers.IO) {
+                uris.map { uri -> SharedFile(uri, runCatching { fileInfo(resolver, uri).name }.getOrDefault("file"), refusalOf(resolver, uri)) }
+            }
         }
     }
     val link = (intake as? SharedIntake.Link)?.url
@@ -242,14 +245,16 @@ fun ShareIntakeScreen(
     var problem by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(choosing) {
         if (!choosing) return@LaunchedEffect
-        active = jobs.cached()?.filter { it.job.status != FINISHED }
-        try {
-            active = jobs.fetch().filter { it.job.status != FINISHED }
-            problem = null
-        } catch (e: IOException) {
-            problem = if (active == null) OFFLINE_EMPTY else OFFLINE_CACHED
-        } catch (e: ApiException) {
-            problem = e.message
+        withContext(Dispatchers.Main.immediate) {
+            active = jobs.cached()?.filter { it.job.status != FINISHED }
+            try {
+                active = jobs.fetch().filter { it.job.status != FINISHED }
+                problem = null
+            } catch (e: IOException) {
+                problem = if (active == null) OFFLINE_EMPTY else OFFLINE_CACHED
+            } catch (e: ApiException) {
+                problem = e.message
+            }
         }
     }
 

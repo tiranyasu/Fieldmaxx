@@ -5,7 +5,9 @@ import com.fieldmaxx.app.net.AuthInterceptor
 import com.fieldmaxx.app.net.InMemoryTokenVault
 import com.fieldmaxx.app.net.OkHttpApi
 import com.fieldmaxx.core.FmxJson
+import com.fieldmaxx.core.model.CreateJobInput
 import com.fieldmaxx.core.model.ImportPreview
+import com.fieldmaxx.core.model.JobImportInput
 import com.fieldmaxx.core.model.Op
 import com.fieldmaxx.core.model.OpResult
 import com.fieldmaxx.core.model.Role
@@ -124,6 +126,21 @@ class ApiTest {
         val body = request.body.readUtf8()
         assertTrue("Content-Disposition: form-data; name=\"file\"; filename=\"A05J9XE.pdf\"" in body, body)
         assertTrue("%PDF-1.7" in body, body)
+    }
+
+    @Test fun jobWritesCarryTheirIdempotencyKey() = runTest {
+        val job = """{"id":"j1","name":"A05J9XE","notes":"","fieldNotesUrl":null,"status":"active","createdBy":"u1","createdAt":1,"finishedAt":null,"deletedAt":null,"deliveryProblem":null}"""
+        server.enqueue(json("""{"job":$job,"skippedDuplicates":[]}""", code = 201))
+        server.enqueue(json("""{"points":[],"skippedDuplicates":["POLE 1"]}""", code = 201))
+
+        assertEquals("j1", api.createJob(CreateJobInput("A05J9XE", null, emptyList()), requestId = "draft-7").id)
+        assertEquals(emptyList(), api.addImport("j1", JobImportInput("imp1", "POLE", "", emptyList()), requestId = "draft-8/imp1"))
+        val create = server.takeRequest()
+        assertEquals("POST /api/jobs", "${create.method} ${create.path}")
+        assertEquals("draft-7", create.getHeader("Idempotency-Key"))
+        val add = server.takeRequest()
+        assertEquals("POST /api/jobs/j1/imports", "${add.method} ${add.path}")
+        assertEquals("draft-8/imp1", add.getHeader("Idempotency-Key"))
     }
 
     @Test fun downloadKeepsOnlyCompleteFiles() = runTest {

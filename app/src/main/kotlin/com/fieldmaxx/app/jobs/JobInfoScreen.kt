@@ -70,8 +70,9 @@ object JobInfoTags {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun JobInfoScreen(jobId: String, api: Api, sync: SyncEngine, sharedLink: String?, onBack: () -> Unit) {
-    val job by remember(jobId) { sync.job(jobId) }.collectAsState(null)
-    val extras by remember(jobId) { sync.extras(jobId) }.collectAsState(null)
+    // Main-confined, as on the login screen: the screen's state is written on the main thread wherever a call finishes.
+    val job by remember(jobId) { sync.job(jobId) }.collectAsState(null, Dispatchers.Main.immediate)
+    val extras by remember(jobId) { sync.extras(jobId) }.collectAsState(null, Dispatchers.Main.immediate)
     var offline by remember { mutableStateOf(false) }
     var refused by remember { mutableStateOf<String?>(null) }
     var typedLink by rememberSaveable { mutableStateOf(sharedLink) } // null: the job's own link
@@ -83,12 +84,14 @@ fun JobInfoScreen(jobId: String, api: Api, sync: SyncEngine, sharedLink: String?
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(jobId) {
-        try {
-            sync.openJob(jobId)
-        } catch (e: IOException) {
-            offline = true // what the phone kept still shows
-        } catch (e: ApiException) {
-            refused = e.message // gone, say, or no longer readable
+        withContext(Dispatchers.Main.immediate) {
+            try {
+                sync.openJob(jobId)
+            } catch (e: IOException) {
+                offline = true // what the phone kept still shows
+            } catch (e: ApiException) {
+                refused = e.message // gone, say, or no longer readable
+            }
         }
     }
     val savedLink = job?.fieldNotesUrl.orEmpty()
@@ -126,7 +129,7 @@ fun JobInfoScreen(jobId: String, api: Api, sync: SyncEngine, sharedLink: String?
                         modifier = Modifier.testTag(JobInfoTags.file(f.id)).clickable(enabled = opening == null) {
                             opening = f.id
                             fileProblem = null
-                            scope.launch {
+                            scope.launch(Dispatchers.Main.immediate) { // the viewer is started from the main thread
                                 fileProblem = try {
                                     openJobFile(context, api, jobId, f)
                                     null
@@ -161,7 +164,7 @@ fun JobInfoScreen(jobId: String, api: Api, sync: SyncEngine, sharedLink: String?
                 Button(
                     onClick = {
                         savingLink = true
-                        scope.launch {
+                        scope.launch(Dispatchers.Main.immediate) {
                             linkNote = try {
                                 api.patchJob(jobId, fieldNotesUrl = link.trim())
                                 if (link.isBlank()) "Link removed" else "Link saved"

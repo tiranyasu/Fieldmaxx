@@ -98,10 +98,11 @@ class OkHttpApi(private val client: OkHttpClient, private val baseUrl: () -> Str
         return call("POST", endpoint("api", "imports"), form)
     }
 
-    override suspend fun createJob(i: CreateJobInput): Job = call<CreateJobReply>("POST", endpoint("api", "jobs"), json(i)).job
+    override suspend fun createJob(i: CreateJobInput, requestId: String): Job =
+        call<CreateJobReply>("POST", endpoint("api", "jobs"), json(i), idempotencyKey = requestId).job
 
-    override suspend fun addImport(jobId: String, i: JobImportInput): List<Point> =
-        call<AddImportReply>("POST", endpoint("api", "jobs", jobId, "imports"), json(i)).points
+    override suspend fun addImport(jobId: String, i: JobImportInput, requestId: String): List<Point> =
+        call<AddImportReply>("POST", endpoint("api", "jobs", jobId, "imports"), json(i), idempotencyKey = requestId).points
 
     override suspend fun patchJob(jobId: String, name: String?, fieldNotesUrl: String?, notes: String?): Job =
         call("PATCH", endpoint("api", "jobs", jobId), json(PatchJobBody(name, fieldNotesUrl, notes)))
@@ -182,13 +183,15 @@ class OkHttpApi(private val client: OkHttpClient, private val baseUrl: () -> Str
         }.build()
     }
 
-    private fun request(method: String, url: HttpUrl, body: RequestBody?): Request = Request.Builder().url(url).method(method, body).build()
+    /** [idempotencyKey]: the server applies a write sent again with the same key only once (R44). */
+    private fun request(method: String, url: HttpUrl, body: RequestBody?, idempotencyKey: String? = null): Request =
+        Request.Builder().url(url).method(method, body).apply { if (idempotencyKey != null) header(IDEMPOTENCY_KEY, idempotencyKey) }.build()
 
     private inline fun <reified T> json(value: T): RequestBody = FmxJson.encodeToString(serializer<T>(), value).toRequestBody(JSON)
 
     /** A 2xx answer decoded as [T]; anything else becomes an [ApiException]. */
-    private suspend inline fun <reified T> call(method: String, url: HttpUrl, body: RequestBody? = null): T =
-        exchange(request(method, url, body)) { it.requireOk().decode(serializer<T>()) }
+    private suspend inline fun <reified T> call(method: String, url: HttpUrl, body: RequestBody? = null, idempotencyKey: String? = null): T =
+        exchange(request(method, url, body, idempotencyKey)) { it.requireOk().decode(serializer<T>()) }
 
     /** For routes whose answer carries nothing the app needs (204, `{"ok":true}`, the saved settings). */
     private suspend fun callUnit(method: String, url: HttpUrl, body: RequestBody? = null) {
@@ -218,6 +221,7 @@ class OkHttpApi(private val client: OkHttpClient, private val baseUrl: () -> Str
     }
 
     private companion object {
+        const val IDEMPOTENCY_KEY = "Idempotency-Key"
         val JSON = "application/json; charset=utf-8".toMediaType()
         val OCTET_STREAM = "application/octet-stream".toMediaType()
         val EMPTY = ByteArray(0).toRequestBody()

@@ -33,7 +33,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.createSavedStateHandle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.fieldmaxx.app.net.Api
@@ -42,6 +44,7 @@ import com.fieldmaxx.app.ui.fmxBarColors
 import com.fieldmaxx.core.model.CreateJobInput
 import com.fieldmaxx.core.model.ImportPreview
 import java.io.IOException
+import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -49,6 +52,8 @@ import kotlinx.coroutines.withContext
 private const val NO_SIGNAL_IMPORT = "No signal. Reading a job file needs signal: the server reads it."
 private const val NO_SIGNAL_SAVE = "Can't reach the server. Check your signal and try again."
 private const val CANT_READ_FILE = "Couldn't open this file on the phone. Pick or share it again."
+const val SAVE_UNSURE = "The server may already have this. Try again: it is never saved twice. Changes wait until then."
+private const val REQUEST_ID = "requestId"
 
 /** A file that couldn't be read, and why. "Try again" reads it again from [uri]. */
 class FailedFile(val uri: Uri, val name: String, val reason: String)
@@ -56,14 +61,22 @@ class FailedFile(val uri: Uri, val name: String, val reason: String)
 /**
  * A new job (or more files for [addToJobId]): each picked or shared file is read by the server, the tech checks the
  * result ([state], the check screen) and saves. It lives as long as its screen, so turning the phone keeps the work.
+ *
+ * Saving is idempotent (R44): the draft has one [requestId], sent with every try until one succeeds, so a retry after a
+ * lost reply gets the job the server already made instead of a second one. While a try's outcome is unknown, the draft
+ * stays exactly as sent ([unsure]): the retry's answer is the first one, so an edit made in between would be lost.
  */
 class NewJobModel(
+    handle: SavedStateHandle,
     private val api: Api,
     private val resolver: ContentResolver,
     private val openJob: suspend (jobId: String) -> Unit,
     val addToJobId: String?,
     sharedLink: String?,
 ) : ViewModel() {
+    /** In saved state, so a screen rebuilt after Android ended the app still sends it. */
+    internal val requestId: String = handle.get<String>(REQUEST_ID) ?: UUID.randomUUID().toString().also { handle[REQUEST_ID] = it }
+
     var state by mutableStateOf<CheckState?>(null)
         private set
     var failed by mutableStateOf<List<FailedFile>>(emptyList())
@@ -75,7 +88,12 @@ class NewJobModel(
     var name by mutableStateOf("")
         private set
     var link by mutableStateOf(sharedLink.orEmpty())
+        private set
     var saving by mutableStateOf(false)
+        private set
+
+    /** A try got no answer (or a gateway's 5xx): the server may have saved it, so the draft waits as it was sent. */
+    var unsure by mutableStateOf(false)
         private set
     var error by mutableStateOf<String?>(null)
         private set
@@ -92,19 +110,27 @@ class NewJobModel(
     val saveEnabled: Boolean
         get() = state?.let(::canSave) == true && (!isNew || name.isNotBlank()) && !saving && reading == null
 
+    /** The draft can change: not while a save runs, nor while the server may already have it. */
+    val editable: Boolean get() = !saving && !unsure
+
     fun rename(text: String) {
+        if (!editable) return
         name = text
         nameEdited = true
     }
 
+    fun editLink(text: String) {
+        if (editable) link = text
+    }
+
     /** A change from the check screen, applied to the state as it is now. Whatever [change] throws leaves it as it was. */
     fun update(change: (CheckState) -> CheckState) {
-        state = state?.let(change)
+        if (editable) state = state?.let(change)
     }
 
     /** Reads each file on the server in turn; a file that fails is listed with the reason and doesn't stop the rest. */
     fun read(uris: List<Uri>) {
-        if (uris.isEmpty() || reading != null) return
+        if (uris.isEmpty() || reading != null || !editable) return
         reading = ""
         viewModelScope.launch {
             val got = ArrayList<ImportPreview>()
@@ -147,9 +173,9 @@ class NewJobModel(
     fun retryFailed() = read(failed.map { it.uri })
 
     /**
-     * Creates the job, or adds each file to [addToJobId]; a file added is dropped from the screen, so trying again
-     * after a failure sends only the rest. Then the job is opened on the phone (failures there don't matter: the map
-     * opens it again) and [savedJobId] is set.
+     * Creates the job, or adds each file to [addToJobId] under its own key derived from [requestId]; a file added is
+     * dropped from the screen, so trying again after a failure sends only the rest. Then the job is opened on the phone
+     * (failures there don't matter: the map opens it again) and [savedJobId] is set.
      */
     fun save() {
         val s = state ?: return
@@ -160,10 +186,11 @@ class NewJobModel(
             try {
                 val jobId = addToJobId?.also { id ->
                     for (imp in toJobImports(s)) {
-                        api.addImport(id, imp)
-                        update { it.without(imp.importId) }
+                        api.addImport(id, imp, "$requestId/${imp.importId}")
+                        state = state?.without(imp.importId)
                     }
-                } ?: api.createJob(CreateJobInput(name.trim(), link.trim().ifEmpty { null }, toJobImports(s))).id
+                } ?: api.createJob(CreateJobInput(name.trim(), link.trim().ifEmpty { null }, toJobImports(s)), requestId).id
+                unsure = false
                 try {
                     openJob(jobId)
                 } catch (e: IOException) {
@@ -174,8 +201,10 @@ class NewJobModel(
                 savedJobId = jobId
             } catch (e: ApiException) {
                 error = e.message
+                unsure = e.status >= 500 // a refusal (4xx) saved nothing; a gateway's 5xx may hide a server that did
             } catch (e: IOException) {
                 error = NO_SIGNAL_SAVE
+                unsure = true
             } finally {
                 saving = false
             }
@@ -199,7 +228,7 @@ fun NewJobScreen(
     onBack: () -> Unit,
 ) {
     val resolver = LocalContext.current.applicationContext.contentResolver
-    val model = viewModel { NewJobModel(api, resolver, openJob, addToJobId, sharedLink) }
+    val model = viewModel { NewJobModel(createSavedStateHandle(), api, resolver, openJob, addToJobId, sharedLink) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isEmpty() && model.state == null && model.failed.isEmpty()) onBack() else model.read(uris)
     }

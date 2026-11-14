@@ -55,6 +55,7 @@ import com.fieldmaxx.core.model.PhotoStatus
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
 import java.io.IOException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -62,6 +63,7 @@ import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.ListSerializer
 
 internal const val FINISHED = "finished"
@@ -169,25 +171,28 @@ fun JobListScreen(
     var deleting by remember { mutableStateOf<Job?>(null) }
     val refreshAsked = remember { Channel<Unit>(Channel.CONFLATED) }
 
+    // Main-confined, as on the login screen: the screen's state is written on the main thread wherever a call finishes.
     LaunchedEffect(jobs) {
-        me = currentUser()
-        if (items == null) items = jobs.cached()
-        while (true) {
-            refreshAsked.receive()
-            refreshing = true
-            try {
-                items = jobs.fetch()
-                offline = false
-                problem = null
-            } catch (e: IOException) {
-                offline = true
-            } catch (e: ApiException) {
-                offline = false
-                problem = e.message
-            } finally {
-                refreshing = false
+        withContext(Dispatchers.Main.immediate) {
+            me = currentUser()
+            if (items == null) items = jobs.cached()
+            while (true) {
+                refreshAsked.receive()
+                refreshing = true
+                try {
+                    items = jobs.fetch()
+                    offline = false
+                    problem = null
+                } catch (e: IOException) {
+                    offline = true
+                } catch (e: ApiException) {
+                    offline = false
+                    problem = e.message
+                } finally {
+                    refreshing = false
+                }
+                me = currentUser() // signing in saves the user while the first list loads
             }
-            me = currentUser() // signing in saves the user while the first list loads
         }
     }
     LifecycleStartEffect(refreshAsked) {
@@ -320,12 +325,14 @@ private fun DeleteJobDialog(job: Job, jobs: JobList, onDismiss: () -> Unit, onDe
     var busy by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     LaunchedEffect(job.id) {
-        try {
-            contents = jobs.contents(job.id)
-        } catch (e: IOException) {
-            problem = NO_SIGNAL_DELETE
-        } catch (e: ApiException) {
-            problem = e.message
+        withContext(Dispatchers.Main.immediate) {
+            try {
+                contents = jobs.contents(job.id)
+            } catch (e: IOException) {
+                problem = NO_SIGNAL_DELETE
+            } catch (e: ApiException) {
+                problem = e.message
+            }
         }
     }
     AlertDialog(
@@ -349,7 +356,7 @@ private fun DeleteJobDialog(job: Job, jobs: JobList, onDismiss: () -> Unit, onDe
         confirmButton = {
             TextButton(
                 onClick = {
-                    scope.launch {
+                    scope.launch(Dispatchers.Main.immediate) {
                         busy = true
                         try {
                             jobs.delete(job.id)
