@@ -295,6 +295,9 @@ data class AdminSettings(
 @Serializable
 data class HealthReport(val diskUsedPct: Int, val photos: List<PhotoInfo>, val phoneToConfirmedMedianS: Long?, val uploadMedianS: Long?)
 
+/** The activity feed (`/api/admin/activity`) holds at most this many events, the newest. */
+const val ACTIVITY_LIMIT = 500
+
 /** [pointId]: the point the event is about (null for photo events), so a deleted point can be restored from it (R68). */
 @Serializable
 data class ActivityItem(val at: Long, val user: String, val kind: String, val label: String?, val detail: String, val pointId: String? = null)

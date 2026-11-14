@@ -151,8 +151,10 @@ class OkHttpApi(private val client: OkHttpClient, private val baseUrl: () -> Str
 
     override suspend fun retryPhoto(id: String) = callUnit("POST", endpoint("api", "admin", "photos", id, "retry"), EMPTY)
 
-    override suspend fun activity(jobId: String?): List<ActivityItem> =
-        call("GET", endpoint("api", "admin", "activity", query = mapOf("jobId" to jobId)))
+    override suspend fun activity(jobId: String?, kinds: Set<String>?): List<ActivityItem> = call(
+        "GET",
+        endpoint("api", "admin", "activity", query = mapOf("jobId" to jobId, "kinds" to kinds?.ifEmpty { null }?.sorted()?.joinToString(","))),
+    )
 
     override suspend fun putSettings(s: AdminSettings) = callUnit("PUT", endpoint("api", "admin", "settings"), json(s))
 

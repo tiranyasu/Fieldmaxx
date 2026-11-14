@@ -32,6 +32,7 @@ import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.ApiException
 import com.fieldmaxx.app.point.newOpId
 import com.fieldmaxx.app.ui.FmxColors
+import com.fieldmaxx.core.model.ACTIVITY_LIMIT
 import com.fieldmaxx.core.model.ActivityItem
 import com.fieldmaxx.core.model.CantShootReason
 import com.fieldmaxx.core.model.Op
@@ -45,17 +46,33 @@ import kotlinx.coroutines.withContext
 private const val POINT_DELETE = "point.delete"
 private const val POINT_RESTORE = "point.restore"
 
-/** Deliveries are logged too; they belong on Delivery health, not among who did what. */
+/**
+ * Deliveries are logged too; they belong on Delivery health, not among who did what. The server leaves them out (I1);
+ * this is the backstop for a server from before that.
+ */
 private val DELIVERY_EVENTS = setOf("photo.confirmed", "photo.failed")
 
-enum class ActivityFilter(val label: String, internal val kinds: Set<String>?) {
-    ALL("All", null),
-    SHOT("Shot", setOf("point.close")),
-    CANT_SHOOT("Can't shoot", setOf("point.cantShoot")),
-    DELETED("Deleted", setOf(POINT_DELETE)),
+/**
+ * What each list shows ([kinds], null: everything) and what it asks the server for ([asks]): only its own kinds, so a
+ * busy job's newer edits can't push an older can't-shoot or delete past the server's newest [ACTIVITY_LIMIT] (I1).
+ * Deleted asks for the restores too: Restore is offered only while a point's newest of the two is a delete (R68).
+ */
+enum class ActivityFilter(val label: String, internal val kinds: Set<String>?, internal val asks: Set<String>?) {
+    ALL("All", null, null),
+    SHOT("Shot", setOf("point.close"), setOf("point.close")),
+    CANT_SHOOT("Can't shoot", setOf("point.cantShoot"), setOf("point.cantShoot")),
+    DELETED("Deleted", setOf(POINT_DELETE), setOf(POINT_DELETE, POINT_RESTORE)),
 }
 
+/** What a list says when the server's answer is full, so it is never silently partial. */
+internal fun cappedText(f: ActivityFilter): String = "Showing the newest $ACTIVITY_LIMIT." +
+    if (f == ActivityFilter.ALL) " Shot, Can't shoot and Deleted each reach further back." else ""
+
+/** The server's answer for [filter]: [capped] when it holds the most the server sends, so older ones exist. */
+private class Feed(val filter: ActivityFilter, val items: List<ActivityItem>, val capped: Boolean)
+
 object ActivityTags {
+    const val CAPPED = "activity.capped"
     fun filter(f: ActivityFilter) = "activity.filter:${f.name}"
     fun restore(pointId: String) = "activity.restore:$pointId"
     fun restoreSent(pointId: String) = "activity.restoreSent:$pointId"
@@ -108,21 +125,24 @@ internal fun stillDeleted(items: List<ActivityItem>): Map<String, ActivityItem> 
 /**
  * Admin → Activity (spec §6.9): who did what to which point and when, newest first, for one job ([jobId]) or all.
  * "Shot" is who shot which point and when, "Can't shoot" the list of points that couldn't be, with the reason. A
- * point's latest delete has Restore (R68), queued through the outbox ([enqueue]) like every other change.
+ * point's latest delete has Restore (R68), queued through the outbox ([enqueue]) like every other change. Each list
+ * asks the server for its own kinds, and says when it shows only the newest [ACTIVITY_LIMIT] (I1).
  */
 @Composable
 fun ActivityScreen(api: Api, jobId: String?, title: String, enqueue: suspend (Op) -> Unit, onBack: () -> Unit, zone: ZoneId = ZoneId.systemDefault()) {
-    var items by remember { mutableStateOf<List<ActivityItem>?>(null) }
+    var feed by remember { mutableStateOf<Feed?>(null) }
     var problem by remember { mutableStateOf<String?>(null) }
     var reload by remember { mutableIntStateOf(0) }
     var filter by rememberSaveable { mutableStateOf(ActivityFilter.ALL) }
     var sent by remember { mutableStateOf(emptySet<String>()) }
     val scope = rememberCoroutineScope()
 
-    LaunchedEffect(reload) {
+    // Until the new list's answer is in, the last one shows, narrowed to the new list's kinds.
+    LaunchedEffect(reload, filter) {
         withContext(Dispatchers.Main.immediate) {
             try {
-                items = api.activity(jobId).filter { it.kind !in DELIVERY_EVENTS }
+                val answer = api.activity(jobId, filter.asks)
+                feed = Feed(filter, answer.filter { it.kind !in DELIVERY_EVENTS }, capped = answer.size >= ACTIVITY_LIMIT)
                 problem = null
             } catch (e: IOException) {
                 problem = ADMIN_NEEDS_SIGNAL
@@ -140,10 +160,19 @@ fun ActivityScreen(api: Api, jobId: String?, title: String, enqueue: suspend (Op
                 }
             }
             problem?.let { AdminNote(it) }
-            val all = items.orEmpty()
+            val current = feed
+            val all = current?.items.orEmpty()
             val restorable = remember(all) { stillDeleted(all) }
             val shown = filter.kinds?.let { kinds -> all.filter { it.kind in kinds } } ?: all
-            if (items != null && shown.isEmpty()) {
+            if (current?.capped == true && current.filter == filter) {
+                Text(
+                    cappedText(filter),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp).testTag(ActivityTags.CAPPED),
+                )
+            }
+            if (current != null && shown.isEmpty()) {
                 Text("Nothing here yet.", color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(16.dp))
             }
             LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 24.dp)) {

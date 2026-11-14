@@ -6,11 +6,15 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.ApiException
 import com.fieldmaxx.core.FmxJson
 import com.fieldmaxx.core.model.AppRelease
 import java.io.IOException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -18,12 +22,16 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /** What the app shows once a newer version is published (spec §6.11). */
 const val UPDATE_BANNER = "Update available — tap to install"
 
 /** The server is asked at most this often, unless the tech asks ("Check for update", R69). */
 internal const val UPDATE_CHECK_EVERY_MS = 24L * 3_600_000
+
+/** While the app stays on screen the checker is consulted this often (R88); it asks the server once a day at most. */
+internal const val UPDATE_POLL_MS = 3_600_000L
 
 private val LAST_CHECK = longPreferencesKey("lastCheck")
 private val FOUND = stringPreferencesKey("release")
@@ -58,15 +66,19 @@ class UpdateChecker(
         val last = kept[LAST_CHECK]
         // A clock set back before the last check is no reason to wait: ask.
         if (!force && last != null && now() - last in 0 until UPDATE_CHECK_EVERY_MS) return@withLock known
+        val askedAt = now() // the check's time: read here, not in the store's write, which runs later on its own thread
         val newer = api.latestRelease()?.takeIf { it.versionCode > currentVersionCode }
         _available.value = newer
-        try {
-            store.edit {
-                it[LAST_CHECK] = now()
-                if (newer == null) it.remove(FOUND) else it[FOUND] = FmxJson.encodeToString(AppRelease.serializer(), newer)
+        // The server has answered: that counts as the day's check even if the app leaves the screen right now.
+        withContext(NonCancellable) {
+            try {
+                store.edit {
+                    it[LAST_CHECK] = askedAt
+                    if (newer == null) it.remove(FOUND) else it[FOUND] = FmxJson.encodeToString(AppRelease.serializer(), newer)
+                }
+            } catch (e: IOException) {
+                // Not kept: the next start asks again.
             }
-        } catch (e: IOException) {
-            // Not kept: the next start asks again.
         }
         newer
     }
@@ -78,6 +90,24 @@ class UpdateChecker(
         null
     }
 }
+
+/**
+ * R88 (spec §6.11, "on start and once a day"): each time [lifecycle] starts (the app coming on screen, on whichever
+ * screen Android opens it, the map included) the checker is consulted, and again after each [pause] (an hour) while it
+ * stays started; the checker itself asks the server at most once a day. Nothing is asked while [signedIn] says there's
+ * no session. Returns only when [lifecycle] is destroyed.
+ */
+suspend fun UpdateChecker.checkWhileStarted(lifecycle: Lifecycle, signedIn: () -> Boolean, pause: suspend () -> Unit = ::pollPause) {
+    lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+        while (true) {
+            if (signedIn()) checkQuietly()
+            pause()
+        }
+    }
+}
+
+/** The wait between two consultations while the app stays on screen. */
+internal suspend fun pollPause() = delay(UPDATE_POLL_MS)
 
 /** The start's check: without signal, or refused, it just waits for the next one. */
 suspend fun UpdateChecker.checkQuietly() {

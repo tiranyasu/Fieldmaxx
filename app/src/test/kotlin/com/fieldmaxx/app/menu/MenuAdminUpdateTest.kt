@@ -40,6 +40,9 @@ import androidx.core.content.IntentCompat
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.testing.TestLifecycleOwner
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.rememberNavController
 import androidx.room.Room
@@ -73,6 +76,10 @@ import com.fieldmaxx.app.jobs.FinishTags
 import com.fieldmaxx.app.jobs.JobListTags
 import com.fieldmaxx.app.jobs.POLE_DATA_EXPORTS
 import com.fieldmaxx.app.jobs.finishBlockedMessage
+import com.fieldmaxx.app.map.FakeMapController
+import com.fieldmaxx.app.map.FakeMapDeps
+import com.fieldmaxx.app.map.MapScreen
+import com.fieldmaxx.app.map.MapTags
 import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.ApiException
 import com.fieldmaxx.app.net.DEFAULT_CONFIG
@@ -91,6 +98,7 @@ import com.fieldmaxx.app.sync.snapshot
 import com.fieldmaxx.app.ui.FieldmaxxNav
 import com.fieldmaxx.app.ui.FieldmaxxTheme
 import com.fieldmaxx.app.ui.Routes
+import com.fieldmaxx.app.ui.UpdateChecks
 import com.fieldmaxx.app.update.InstallStep
 import com.fieldmaxx.app.update.UPDATE_BANNER
 import com.fieldmaxx.app.update.UpdateBanner
@@ -99,6 +107,7 @@ import com.fieldmaxx.app.update.UpdateInstaller
 import com.fieldmaxx.app.update.UpdateRejectedException
 import com.fieldmaxx.app.update.UpdateTags
 import com.fieldmaxx.core.FmxJson
+import com.fieldmaxx.core.model.ACTIVITY_LIMIT
 import com.fieldmaxx.core.model.ActivityItem
 import com.fieldmaxx.core.model.AdminSettings
 import com.fieldmaxx.core.model.AppConfig
@@ -133,8 +142,12 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.job
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -204,8 +217,12 @@ private class AdminFakeApi : Api by notUsed() {
     val restored = CopyOnWriteArrayList<String>()
     val snapshots = ConcurrentHashMap<String, JobSnapshot>()
 
+    /** The job's whole event log, newest first; [activity] answers from it as the server does. */
     @Volatile var activityItems: List<ActivityItem> = emptyList()
     val activityCalls = CopyOnWriteArrayList<String?>()
+
+    /** The kinds each activity call asked for (null: all). */
+    val activityKinds = CopyOnWriteArrayList<Set<String>?>()
 
     @Volatile var serverConfig: AppConfig = DEFAULT_CONFIG
     val settingsPut = CopyOnWriteArrayList<AdminSettings>()
@@ -261,9 +278,11 @@ private class AdminFakeApi : Api by notUsed() {
 
     override suspend fun snapshot(jobId: String): JobSnapshot = snapshots[jobId] ?: throw ApiException(404, "Job not found")
 
-    override suspend fun activity(jobId: String?): List<ActivityItem> {
+    /** As the server answers: only the [kinds] asked for, when given, and at most the newest [ACTIVITY_LIMIT]. */
+    override suspend fun activity(jobId: String?, kinds: Set<String>?): List<ActivityItem> {
         activityCalls += jobId
-        return activityItems
+        activityKinds.add(kinds)
+        return activityItems.filter { kinds == null || it.kind in kinds }.take(ACTIVITY_LIMIT)
     }
 
     override suspend fun config(): AppConfig = serverConfig
@@ -327,6 +346,12 @@ private class FakeMenuDeps(override val api: AdminFakeApi, private val sync: Syn
     override suspend fun signOut() {
         signOuts.incrementAndGet()
     }
+}
+
+/** The update checker's store, counting its reads: each read is the checker being consulted. */
+private class CountingStore(private val store: DataStore<Preferences>) : DataStore<Preferences> by store {
+    val reads = AtomicInteger()
+    override val data: Flow<Preferences> get() = store.data.onStart { reads.incrementAndGet() }
 }
 
 /** What a screen asked the system for, and the contract it asked with. */
@@ -690,7 +715,7 @@ class MenuAdminUpdateTest {
         waitFor { api.settingsPut.size == 1 }
         assertEquals(AdminSettings(backupDays = 5), api.settingsPut.single(), "only what changed")
         waitFor { saved.get() == 1 } // the phone's settings are fetched again: the map and the photo quality follow at once
-        waitFor { textOf(AdminSettingsTags.MESSAGE) == "Settings saved" }
+        waitFor { exists(AdminSettingsTags.MESSAGE) && textOf(AdminSettingsTags.MESSAGE) == "Settings saved" }
 
         tap(AdminSettingsTags.MAXIMUM)
         tap(AdminSettingsTags.SAVE)
@@ -720,7 +745,8 @@ class MenuAdminUpdateTest {
         assertEquals("A05J9XE_pole_data.csv", values.getAsString(MediaStore.MediaColumns.DISPLAY_NAME))
         assertEquals("text/csv", values.getAsString(MediaStore.MediaColumns.MIME_TYPE))
         assertEquals(csv.toList(), downloads.published.single().readBytes().toList())
-        waitFor { textOf(ExportTags.STATUS) == "Saved to Downloads: A05J9XE_pole_data.csv" }
+        // MediaStore has it before the dialog says so: the note may not be on screen yet.
+        waitFor { exists(ExportTags.STATUS) && textOf(ExportTags.STATUS) == "Saved to Downloads: A05J9XE_pole_data.csv" }
 
         // Or Share, through the app's FileProvider.
         tap(ExportTags.SHARE)
@@ -1067,5 +1093,160 @@ class MenuAdminUpdateTest {
         tap(SettingsTags.GALLERY)
         waitFor { runBlocking { !settings.galleryCopy.first() } }
         assertEquals(2, registry.launches.size, "switching it off asks for nothing")
+    }
+
+    // ---- fix round 1 ----
+
+    /** I1: a busy job's newest 500 events are edits; Shot, Can't shoot and Deleted each ask the server for their own. */
+    @Test fun activityListsReachPastABusyFeed() {
+        val edits = List(ACTIVITY_LIMIT) { i -> ActivityItem(NOW - i * 60_000L, "Bob Tech", "point.update", "POLE 9", "", "p9") }
+        api.activityItems = edits + listOf(
+            ActivityItem(NOV5 + 2_000, "Alice Tech", "point.delete", "POLE 5", "", "p5"),
+            ActivityItem(NOV5 + 1_000, "Bob Tech", "point.cantShoot", "POLE 7", "not_found", "p7"),
+            ActivityItem(NOV5, "Bob Tech", "point.close", "POLE 1", "", "p1"),
+        )
+        compose.setContent { Host { ActivityScreen(api, "j1", "A05J9XE", sync::enqueue, onBack = {}, zone = ZONE) } }
+
+        // Everything: the server's newest 500, all edits, and the screen says it is only those.
+        waitForTag(ActivityTags.CAPPED)
+        assertEquals("Showing the newest 500. Shot, Can't shoot and Deleted each reach further back.", textOf(ActivityTags.CAPPED))
+        assertEquals(listOf<Set<String>?>(null), api.activityKinds.toList())
+        assertFalse(exists(ActivityTags.restore("p5")), "past the newest 500")
+
+        // Deleted asks for deletes and restores only: the older delete is there, with Restore (R68).
+        tap(ActivityTags.filter(ActivityFilter.DELETED))
+        waitForTag(ActivityTags.restore("p5"))
+        assertEquals(setOf("point.delete", "point.restore"), api.activityKinds.last())
+        assertFalse(exists(ActivityTags.CAPPED), "every deleted point fits")
+        tap(ActivityTags.restore("p5"))
+        waitFor { outbox().any { it is Op.PointRestore && it.pointId == "p5" } }
+
+        // Can't shoot and Shot each ask for theirs.
+        tap(ActivityTags.filter(ActivityFilter.CANT_SHOOT))
+        waitFor { hasText("POLE 7") }
+        assertTrue(hasText("Not found"))
+        assertEquals(setOf("point.cantShoot"), api.activityKinds.last())
+        tap(ActivityTags.filter(ActivityFilter.SHOT))
+        waitFor { hasText("POLE 1") }
+        assertEquals(setOf("point.close"), api.activityKinds.last())
+    }
+
+    private fun checker(now: () -> Long): Pair<UpdateChecker, CountingStore> {
+        val kept = CountingStore(store("updates"))
+        return UpdateChecker(api, currentVersionCode = 1, now = now, store = kept) to kept
+    }
+
+    /**
+     * The app's update checks with the update banner, on the map as Android shows it when it restores the app onto it (no
+     * job list on the way), or ([withMap] false) on their own. [onScreen] is the app's lifecycle, which the test starts,
+     * stops and starts again; [pause] stands for the hour between two consultations while the app stays on screen (by
+     * default it never ends).
+     */
+    private fun showChecks(
+        checker: UpdateChecker,
+        onScreen: TestLifecycleOwner,
+        withMap: Boolean = false,
+        pause: suspend () -> Unit = { awaitCancellation() },
+    ) {
+        val installer = UpdateInstaller(compose.activity, api) { true }
+        compose.setContent {
+            CompositionLocalProvider(LocalLifecycleOwner provides onScreen) {
+                Host {
+                    UpdateChecks(checker, signedIn = { true }, pause = pause)
+                    if (withMap) {
+                        MapScreen(
+                            "j1", FakeMapDeps(), FakeMapController(), onBack = {}, onJobGone = {},
+                            banner = { UpdateBanner(checker.available, installer) },
+                        )
+                    } else {
+                        UpdateBanner(checker.available, installer)
+                    }
+                }
+            }
+        }
+    }
+
+    /** R88: a start straight onto the map checks once. */
+    @Test fun updateCheckOnAStartStraightOntoTheMap() {
+        val (checker, kept) = checker { NOW }
+        val onScreen = TestLifecycleOwner(Lifecycle.State.CREATED)
+        showChecks(checker, onScreen, withMap = true)
+        compose.waitForIdle()
+        assertEquals(0, kept.reads.get(), "nothing before the app is on screen")
+
+        onScreen.currentState = Lifecycle.State.RESUMED
+        waitFor { api.latestCalls.get() == 1 }
+        compose.waitForIdle()
+        assertEquals(1, api.latestCalls.get(), "one start, one check")
+    }
+
+    /** R88: two starts within a day check once; the second consults the kept check and asks the server nothing. */
+    @Test fun twoStartsWithinADayCheckOnce() {
+        var now = NOW
+        val (checker, kept) = checker { now }
+        val onScreen = TestLifecycleOwner(Lifecycle.State.CREATED)
+        showChecks(checker, onScreen)
+        onScreen.currentState = Lifecycle.State.RESUMED
+        waitFor { api.latestCalls.get() == 1 }
+
+        onScreen.currentState = Lifecycle.State.CREATED // the tech switches to another app for a while
+        now += 2 * HOUR
+        onScreen.currentState = Lifecycle.State.RESUMED
+        waitFor { kept.reads.get() == 2 }
+        compose.waitForIdle()
+        assertEquals(1, api.latestCalls.get(), "within the day the server isn't asked again")
+    }
+
+    /** R88: coming back to the foreground after more than a day checks again. */
+    @Test fun updateCheckAgainOnReturnAfterADay() {
+        var now = NOW
+        val (checker, _) = checker { now }
+        val onScreen = TestLifecycleOwner(Lifecycle.State.CREATED)
+        showChecks(checker, onScreen)
+        onScreen.currentState = Lifecycle.State.RESUMED
+        waitFor { api.latestCalls.get() == 1 }
+
+        onScreen.currentState = Lifecycle.State.CREATED
+        now += DAY + HOUR
+        onScreen.currentState = Lifecycle.State.RESUMED
+        waitFor { api.latestCalls.get() == 2 }
+    }
+
+    /** R88: an app that stays on screen checks again once a day has passed, without leaving it. */
+    @Test fun updateCheckOnceADayWhileOnScreen() {
+        var now = NOW
+        val (checker, kept) = checker { now }
+        val hours = Channel<Unit>(Channel.UNLIMITED) // each one an hour on screen
+        val onScreen = TestLifecycleOwner(Lifecycle.State.CREATED)
+        showChecks(checker, onScreen, pause = { hours.receive() })
+        onScreen.currentState = Lifecycle.State.RESUMED
+        waitFor { api.latestCalls.get() == 1 }
+
+        now += 3 * HOUR
+        hours.trySend(Unit)
+        waitFor { kept.reads.get() == 2 }
+        compose.waitForIdle()
+        assertEquals(1, api.latestCalls.get(), "consulted again within the day: the server isn't asked")
+
+        now += DAY
+        hours.trySend(Unit)
+        waitFor { api.latestCalls.get() == 2 }
+    }
+
+    /** R88: the update offer shows on the map too, and a tap there installs. */
+    @Test fun updateOfferShowsOnTheMap() {
+        val (checker, _) = checker { NOW }
+        val onScreen = TestLifecycleOwner(Lifecycle.State.CREATED)
+        showChecks(checker, onScreen, withMap = true)
+        compose.waitForIdle()
+        assertFalse(exists(UpdateTags.BANNER), "no offer before a newer version is known")
+
+        onScreen.currentState = Lifecycle.State.RESUMED
+        waitForTag(UpdateTags.BANNER)
+        assertTrue(hasText(UPDATE_BANNER) && hasText("Version 1.2.0"))
+        assertTrue(top(UpdateTags.BANNER) > top(MapTags.MENU), "on the map, under its top bar")
+        tap(UpdateTags.BANNER)
+        waitFor { app.peekNextStartedActivity() != null }
+        assertEquals(Intent.ACTION_VIEW, app.nextStartedActivity.action)
     }
 }

@@ -188,7 +188,8 @@ class GraphMapDeps(private val graph: AppGraph) : MapDeps {
  *
  * "+" starts the add-point flow ([AddPointFlow]); the new point opens in [pointSheet]. [initialPointId] opens that point's
  * sheet at once (from "Points I added"). Hooks (R43): [onMenu] is the ☰ (Task 30), and [pointSheet] shows the point a
- * marker tap (or a search or "Left" pick) selected, with a way to close it (Task 25).
+ * marker tap (or a search or "Left" pick) selected, with a way to close it (Task 25). [banner] shows under the top bar,
+ * after the delivery banner: the update offer (R88).
  */
 @Composable
 fun MapScreen(
@@ -200,6 +201,7 @@ fun MapScreen(
     mapView: @Composable (Modifier) -> Unit = {},
     initialPointId: String? = null,
     onMenu: () -> Unit = {},
+    banner: @Composable () -> Unit = {},
     pointSheet: @Composable (pointId: String, close: () -> Unit) -> Unit = { _, _ -> },
 ) {
     // Main-confined, as on the other screens: the screen's state is written on the main thread wherever a value comes from.
@@ -275,6 +277,7 @@ fun MapScreen(
         Column(Modifier.fillMaxWidth().align(Alignment.TopCenter)) {
             TopBar(job?.name.orEmpty(), status, waiting, onBack = onBack, onSearch = { searching = true }, onMenu = onMenu)
             job?.deliveryProblem?.let { DeliveryBanner(it) }
+            banner()
             ChipRow(progress, type, hideShot, onType = { typeFilter = it }, onHideShot = { hideShot = !hideShot })
         }
         MapButtons(

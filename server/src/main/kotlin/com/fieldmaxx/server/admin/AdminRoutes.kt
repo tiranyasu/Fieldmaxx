@@ -1,5 +1,6 @@
 package com.fieldmaxx.server.admin
 
+import com.fieldmaxx.core.model.ACTIVITY_LIMIT
 import com.fieldmaxx.core.model.ActivityItem
 import com.fieldmaxx.core.model.AdminSettings
 import com.fieldmaxx.core.model.AppConfig
@@ -33,7 +34,15 @@ const val DEFAULT_IMAGERY_URL = "https://server.arcgisonline.com/ArcGIS/rest/ser
 const val DEFAULT_LABELS_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}"
 const val DEFAULT_PHOTO_QUALITY = 85
 private const val DAY_MS = 24L * 3600 * 1000
-private const val ACTIVITY_LIMIT = 500
+
+/**
+ * Deliveries are logged as events too, one per photo delivered and one per failed attempt: they belong on Delivery
+ * health, and would fill the activity feed's cap (I1).
+ */
+private const val NOT_DELIVERIES = "e.kind NOT IN ('photo.confirmed', 'photo.failed')"
+
+/** At most this many kinds in one activity query; a list asks for one or two. */
+private const val MAX_KINDS = 20
 
 @Serializable data class Ok(val ok: Boolean = true)
 
@@ -86,18 +95,22 @@ fun healthReport(ctx: Ctx): HealthReport {
 }
 
 /**
- * Newest first; "Can't shoot" entries carry their reason (and the tech's text) in `detail`. A point's event names the
- * point (R68), so a deleted one can be restored from its entry.
+ * The newest [ACTIVITY_LIMIT] events, newest first, of every kind but deliveries, or only of [kinds] when given (a list
+ * that shows only those then reaches as far back as it can, I1). "Can't shoot" entries carry their reason (and the
+ * tech's text) in `detail`. A point's event names the point (R68), so a deleted one can be restored from its entry.
  */
-fun activity(ctx: Ctx, jobId: String?): List<ActivityItem> = ctx.db.read {
+fun activity(ctx: Ctx, jobId: String?, kinds: Set<String>? = null): List<ActivityItem> = ctx.db.read {
+    val only = kinds.orEmpty().take(MAX_KINDS)
+    val ofKinds = if (only.isEmpty()) "" else " AND e.kind IN (" + only.joinToString(", ") { "?" } + ")"
     prepareStatement(
         "SELECT e.at, e.kind, u.display_name, p.label, json_extract(e.data_json, '\$.pointId') AS point_id, " +
             "json_extract(e.data_json, '\$.reason') AS reason, json_extract(e.data_json, '\$.text') AS text FROM events e " +
             "LEFT JOIN users u ON u.id = e.user_id " +
             "LEFT JOIN points p ON p.id = json_extract(e.data_json, '\$.pointId') " +
-            "WHERE (? IS NULL OR e.job_id = ?) ORDER BY e.at DESC, e.id DESC LIMIT $ACTIVITY_LIMIT",
+            "WHERE (? IS NULL OR e.job_id = ?) AND $NOT_DELIVERIES$ofKinds ORDER BY e.at DESC, e.id DESC LIMIT $ACTIVITY_LIMIT",
     ).use { ps ->
         ps.setString(1, jobId); ps.setString(2, jobId)
+        only.forEachIndexed { i, kind -> ps.setString(3 + i, kind) }
         ps.executeQuery().use { rs ->
             buildList {
                 while (rs.next()) {
@@ -152,7 +165,12 @@ fun Route.adminRoutes(ctx: Ctx) {
                 retryPhoto(ctx, call.requireAdmin(), call.parameters["id"]!!)
                 call.respond(Ok())
             }
-            get("/activity") { call.respond(activity(ctx, call.request.queryParameters["jobId"]?.ifBlank { null })) }
+            get("/activity") {
+                val query = call.request.queryParameters
+                // ?kinds=point.delete,point.restore: only those (one list's own); none or empty: every kind but deliveries
+                val kinds = query["kinds"]?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }?.toSet()?.ifEmpty { null }
+                call.respond(activity(ctx, query["jobId"]?.ifBlank { null }, kinds))
+            }
             put("/settings") {
                 updateSettings(ctx, call.receive<AdminSettings>())
                 call.respond(appConfig(ctx))

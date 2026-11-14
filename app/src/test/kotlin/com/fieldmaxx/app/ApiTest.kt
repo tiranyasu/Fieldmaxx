@@ -117,6 +117,20 @@ class ApiTest {
         assertEquals("POST /api/photos/ph1/rename?from=POLE_1_39.636130_-119.691104_7.jpg", "${request.method} ${request.path}")
     }
 
+    /** I1: a list of the Activity screen asks for its own kinds; with none it asks for everything. */
+    @Test fun activityAsksForItsKinds() = runTest {
+        server.enqueue(json("[]"))
+        server.enqueue(json("[]"))
+
+        api.activity("j1", setOf("point.restore", "point.delete"))
+        val one = server.takeRequest().requestUrl!!
+        assertEquals("/api/admin/activity", one.encodedPath)
+        assertEquals("j1", one.queryParameter("jobId"))
+        assertEquals("point.delete,point.restore", one.queryParameter("kinds"))
+        api.activity(null)
+        assertEquals("/api/admin/activity", server.takeRequest().path)
+    }
+
     @Test fun noPublishedReleaseIsNull() = runTest {
         server.enqueue(json("null"))
 

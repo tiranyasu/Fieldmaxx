@@ -99,8 +99,12 @@ interface Api {
     suspend fun health(): HealthReport
     suspend fun retryPhoto(id: String)
 
-    /** Newest first; all jobs when [jobId] is null. */
-    suspend fun activity(jobId: String?): List<ActivityItem>
+    /**
+     * The newest events ([com.fieldmaxx.core.model.ACTIVITY_LIMIT] at most), newest first; all jobs when [jobId] is null.
+     * Only [kinds] when given ("point.delete"…), so a list showing only those reaches as far back as it can (I1);
+     * otherwise every kind but deliveries.
+     */
+    suspend fun activity(jobId: String?, kinds: Set<String>? = null): List<ActivityItem>
     suspend fun putSettings(s: AdminSettings)
 
     /** The newest published APK, or null when none is published. */

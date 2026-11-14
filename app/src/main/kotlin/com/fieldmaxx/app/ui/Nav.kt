@@ -7,10 +7,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
-import androidx.lifecycle.compose.LifecycleStartEffect
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.navigation.NavBackStackEntry
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
@@ -51,8 +52,11 @@ import com.fieldmaxx.app.photos.jobPhotoViewsFor
 import com.fieldmaxx.app.point.GraphPointDeps
 import com.fieldmaxx.app.point.PointSheet
 import com.fieldmaxx.app.update.UpdateBanner
+import com.fieldmaxx.app.update.UpdateChecker
 import com.fieldmaxx.app.update.UpdateInstaller
 import com.fieldmaxx.app.update.checkQuietly
+import com.fieldmaxx.app.update.checkWhileStarted
+import com.fieldmaxx.app.update.pollPause
 import java.io.IOException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -132,12 +136,15 @@ private val pointIdArg = navArgument("pointId") { type = NavType.StringType }
  * Saving a new job or adding files opens the job's map (R34).
  *
  * The menu (Task 30) opens from the map's ☰ for its job, and from the job list's without one. Signing out there comes
- * back to the login screen as an ended session does. Each time the job list starts, the app checks for an update
- * (at most once a day, R69), and the banner shows above the list.
+ * back to the login screen as an ended session does. The app checks for an update on every start, whichever screen it
+ * opens on, once a day while it stays open, and right after a sign-in ([UpdateChecks], R88; the checker itself asks the
+ * server at most once a day). The update banner shows on the job list and on the map.
  */
 @Composable
 fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNavController(), intake: SharedIntake? = null) {
     val start = remember { if (graph.vault.load() != null) Routes.JOBS else Routes.LOGIN }
+    val scope = rememberCoroutineScope() // lives as long as the navigation, unlike a screen's
+    UpdateChecks(graph.updates, signedIn = { graph.vault.load() != null })
     LaunchedEffect(graph) {
         // Main-confined, as on the login screen: navigation runs on the main thread wherever a call finishes.
         withContext(Dispatchers.Main.immediate) {
@@ -188,6 +195,7 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
             LoginScreen(graph.api, graph.vault, graph.server) { user ->
                 graph.sync.start(user)
                 graph.refreshConfig() // the map's imagery and the photo quality come from the server (R39)
+                scope.launch { graph.updates.checkQuietly() } // signed in now: the start's check was skipped without a session
                 navController.navigate(Routes.JOBS) { popUpTo(Routes.LOGIN) { inclusive = true } }
             }
         }
@@ -197,12 +205,6 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
                     intakeShown = true
                     navController.navigate(Routes.SHARE)
                 }
-            }
-            val scope = rememberCoroutineScope()
-            LifecycleStartEffect(graph) {
-                // On start and once a day (spec §6.11): the checker asks the server at most once a day itself.
-                val check = scope.launch { graph.updates.checkQuietly() }
-                onStopOrDispose { check.cancel() }
             }
             val context = LocalContext.current
             val installer = remember(graph, context) { UpdateInstaller(context, graph.api) }
@@ -256,11 +258,14 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
             val pointDeps = remember(graph) { GraphPointDeps(graph) }
             val gallery = rememberGalleryPick(cameraDeps)
             var menu by rememberSaveable { mutableStateOf(false) }
+            val context = LocalContext.current
+            val installer = remember(graph, context) { UpdateInstaller(context, graph.api) }
             MapScreen(
                 entry.jobId(), remember(graph) { GraphMapDeps(graph) }, controller, mapView = { controller.View(it) },
                 onBack = back,
                 initialPointId = entry.arguments?.getString("select"),
                 onMenu = { menu = true }, // R43: the ☰ opens the menu for this job
+                banner = { UpdateBanner(graph.updates.available, installer) }, // R88: the update offer on the map too
                 onJobGone = { message ->
                     jobsNotice = message
                     if (!navController.popBackStack(Routes.JOBS, inclusive = false)) {
@@ -330,6 +335,19 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
             AdminSettingsScreen(graph.api, kept = graph::currentConfig, onSaved = graph::refreshConfig, onBack = back)
         }
     }
+}
+
+/**
+ * R88: the app's update checks, tied to the lifecycle of whatever hosts them: placed above the NavHost, that is the
+ * activity's, so they run on every start whichever screen Android opens on (the map after a restore too) and once a
+ * day while the app stays open ([checkWhileStarted]).
+ */
+@Composable
+internal fun UpdateChecks(checker: UpdateChecker, signedIn: () -> Boolean, pause: suspend () -> Unit = ::pollPause) {
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val session by rememberUpdatedState(signedIn)
+    val between by rememberUpdatedState(pause)
+    LaunchedEffect(checker, lifecycle) { checker.checkWhileStarted(lifecycle, { session() }, { between() }) }
 }
 
 /**

@@ -1,6 +1,7 @@
 package com.fieldmaxx.server
 
 import com.fieldmaxx.core.FmxJson
+import com.fieldmaxx.core.model.ACTIVITY_LIMIT
 import com.fieldmaxx.core.model.ActivityItem
 import com.fieldmaxx.core.model.AppConfig
 import com.fieldmaxx.core.model.AppRelease
@@ -178,6 +179,69 @@ class AdminTest {
             prepareStatement("SELECT deleted_at FROM points WHERE id = 'pt-1'").use { ps -> ps.executeQuery().use { it.next(); it.getObject(1) } }
         }
         assertNull(restored, "the point is back")
+    }
+
+    /** Newer events of [kind] for job-1, written straight into the log as applied ops write them. */
+    private fun logEvents(app: TestApp, kind: String, count: Int, pointId: String? = null) = app.ctx.db.tx {
+        prepareStatement("INSERT INTO events(job_id, user_id, kind, data_json, at) VALUES ('job-1', 'u-x', ?, ?, ?)").use { ps ->
+            repeat(count) { i ->
+                app.clock.nowMs += 1
+                ps.setString(1, kind)
+                ps.setString(2, if (pointId != null) """{"opId":"$kind-$i","pointId":"$pointId"}""" else """{"opId":"$kind-$i","photoId":"ph-$i"}""")
+                ps.setLong(3, app.clock.nowMs)
+                ps.addBatch()
+            }
+            ps.executeBatch()
+        }
+    }
+
+    /**
+     * I1: deliveries never count against the feed's cap, and each list asks for its own kinds, so a busy job's newer
+     * edits can't push an older can't-shoot or delete out of reach.
+     */
+    @Test fun activityCapCountsOnlyWhatTheListsShow() = TestApp().run { app ->
+        seed(app)
+        val ann = tokenFor("ann")
+        val boss = tokenFor("boss", Role.admin)
+        suspend fun send(op: Op) = assertEquals(
+            HttpStatusCode.OK,
+            client.post("/api/ops") {
+                bearerAuth(ann); contentType(ContentType.Application.Json)
+                setBody(FmxJson.encodeToString(OpsRequest.serializer(), OpsRequest(listOf(op))))
+            }.status,
+        )
+        suspend fun activity(query: String) =
+            FmxJson.decodeFromString(ListSerializer(ActivityItem.serializer()), getAs(boss, "/api/admin/activity$query").bodyAsText())
+
+        app.ctx.db.tx {
+            createStatement().use {
+                it.execute(
+                    "INSERT INTO points(id, job_id, layer, type, num, label, lat, lon, description, status, created_at, updated_at) " +
+                        "VALUES ('pt-3','job-1','POLE','POLE','3','POLE 3',39.6,-119.7,'','open',0,0)",
+                )
+            }
+        }
+        app.clock.nowMs += 1000
+        send(Op.PointCantShoot("c1", "pt-1", CantShootReason.no_access))
+        app.clock.nowMs += 1000
+        send(Op.PointDelete("d1", "pt-3"))
+        // Then a busy day of deliveries in the job, every one of them newer.
+        logEvents(app, "photo.confirmed", ACTIVITY_LIMIT + 50)
+        logEvents(app, "photo.failed", 100)
+
+        val older = listOf("point.delete" to "pt-3", "point.cantShoot" to "pt-1")
+        assertEquals(older, activity("").map { it.kind to it.pointId }, "deliveries don't count against the cap")
+        assertEquals(older, activity("?jobId=job-1").map { it.kind to it.pointId })
+
+        // A busy job's edits can still fill the cap on their own; Can't shoot and Deleted ask for just their kinds.
+        logEvents(app, "point.update", ACTIVITY_LIMIT + 50, pointId = "pt-1")
+        val busy = activity("?jobId=job-1")
+        assertEquals(ACTIVITY_LIMIT, busy.size)
+        assertTrue(busy.all { it.kind == "point.update" })
+        assertEquals(listOf("point.delete" to "pt-3"), activity("?jobId=job-1&kinds=point.delete,point.restore").map { it.kind to it.pointId })
+        val cantShoot = activity("?kinds=point.cantShoot").single()
+        assertEquals(Triple("pt-1", "POLE 1", "no_access"), Triple(cantShoot.pointId, cantShoot.label, cantShoot.detail))
+        assertEquals(ACTIVITY_LIMIT, activity("?kinds=").size, "no kinds: everything but deliveries")
     }
 
     @Test fun settingsDefaultsAndBackupDaysMin3() = TestApp().run { app ->
