@@ -1,0 +1,14 @@
+# The Docker build context (docker build -f server/Dockerfile .): the sources only. Never secrets, data or build output.
+.git
+.gradle
+.kotlin
+.idea
+.superpowers
+**/build
+local.properties
+*.keystore
+keystore.properties
+.env
+data
+server/data
+importer/src/test/resources/private

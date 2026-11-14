@@ -1,0 +1,42 @@
+# The Fieldmaxx server: the app behind Caddy, which gets and renews the HTTPS certificate for DOMAIN by itself.
+# deploy/setup.sh writes .env (DOMAIN, DATA_DIR) and starts this with `docker compose up -d --build`.
+# Only Caddy is reachable from the internet (ports 80 and 443); the app's port 8080 stays on the internal network.
+name: fieldmaxx
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: fieldmaxx-app # tools/release.sh publishes the app through this name
+    restart: unless-stopped
+    environment:
+      FMX_PUBLIC_ORIGIN: "https://${DOMAIN:?is not set, run deploy/setup.sh}"
+    volumes:
+      # Everything the server keeps (see deploy/README.md). A folder on the server itself, so it survives rebuilds.
+      - ${DATA_DIR:-/var/lib/fieldmaxx}:/data
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: "${DOMAIN:?is not set, run deploy/setup.sh}"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data # the HTTPS certificates: kept, so a restart doesn't ask for new ones
+      - caddy_config:/config
+    logging: *logging
+
+volumes:
+  caddy_data:
+  caddy_config:

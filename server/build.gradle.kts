@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.kotlin.jvm)
     alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.ktor) // buildFatJar: the one runnable jar the Docker image ships
     application
 }
 
@@ -10,6 +11,13 @@ kotlin {
 
 application {
     mainClass.set("com.fieldmaxx.server.MainKt")
+}
+
+ktor {
+    fatJar {
+        // A fixed name, so server/Dockerfile copies exactly this file.
+        archiveFileName.set("fieldmaxx-server-all.jar")
+    }
 }
 
 dependencies {

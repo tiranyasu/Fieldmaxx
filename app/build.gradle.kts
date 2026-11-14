@@ -21,6 +21,14 @@ val keystoreProperties: Properties? = rootProject.file("keystore.properties").ta
 // The server address the login screen starts with: -Pfieldmaxx.serverUrl=https://… (or set it in ~/.gradle/gradle.properties).
 val serverUrl: String = providers.gradleProperty("fieldmaxx.serverUrl").getOrElse("")
 
+// tools/release.sh passes -PversionCode (a whole number that goes up with every release: the phones' update check
+// compares it) and -PversionName (what people see). Without them a build is 1 / 0.1.0.
+val appVersionCode: Int = providers.gradleProperty("versionCode").orNull?.let { text ->
+    text.trim().toIntOrNull()?.takeIf { it in 1..2_100_000_000 }
+        ?: error("-PversionCode must be a whole number from 1 to 2100000000, was '$text'")
+} ?: 1
+val appVersionName: String = providers.gradleProperty("versionName").orNull?.trim()?.ifEmpty { null } ?: "0.1.0"
+
 android {
     namespace = "com.fieldmaxx.app"
     compileSdk = 35
@@ -29,8 +37,8 @@ android {
         applicationId = "com.fieldmaxx.app"
         minSdk = 28
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
         buildConfigField("String", "SERVER_URL", "\"" + serverUrl.replace("\\", "\\\\").replace("\"", "\\\"") + "\"")
     }
 
@@ -50,6 +58,9 @@ android {
         release {
             isMinifyEnabled = false
             signingConfig = signingConfigs.findByName("release")
+            // The sideloaded APK carries only the ABIs of real phones (every Android phone the crew could own, R72):
+            // MapLibre's x86 libraries are for emulators. Debug builds keep every ABI.
+            ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
         }
     }
 

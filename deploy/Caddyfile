@@ -1,0 +1,4 @@
+# Caddy serves https://DOMAIN (from .env) and gets and renews its certificate by itself; plain http redirects to it.
+{$DOMAIN} {
+	reverse_proxy app:8080
+}

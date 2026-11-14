@@ -4,6 +4,8 @@ build/
 local.properties
 *.keystore
 keystore.properties
+# The server's settings, written by deploy/setup.sh
+.env
 importer/src/test/resources/private/
 /data/
 /server/data/
