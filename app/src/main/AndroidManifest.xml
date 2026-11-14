@@ -10,6 +10,11 @@
     <!-- Reads the location stored inside photos picked from the gallery, so they keep the spot they were taken (R52).
          It doesn't track the phone: that is the two permissions above, while the app is on screen. -->
     <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
+    <!-- The gallery copy of each stamped photo (album Fieldmaxx), on Android 9 only: from Android 10 the app adds its own
+         photos to the gallery with no permission. It is never asked for; without it, Android 9 skips the copy (R60). -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 

@@ -282,8 +282,8 @@ class OpApplier(private val db: AppDatabase, private val clock: () -> Long = Sys
     }
 }
 
-/** The point an op writes, or null for a photo op. */
-private val Op.targetPoint: String?
+/** The point an op writes, or null for a photo op. The photo pipeline reads it too: a point delete is answered once none waits (R67). */
+internal val Op.targetPoint: String?
     get() = when (this) {
         is Op.PointUpdate -> pointId
         is Op.PointMove -> pointId

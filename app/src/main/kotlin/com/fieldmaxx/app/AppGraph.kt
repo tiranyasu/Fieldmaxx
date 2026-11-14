@@ -30,7 +30,8 @@ import com.fieldmaxx.app.net.ServerAddress
 import com.fieldmaxx.app.net.TokenVault
 import com.fieldmaxx.app.photos.ContentPickedMedia
 import com.fieldmaxx.app.photos.LocalPhotos
-import com.fieldmaxx.app.photos.PhotoPipelineStarter
+import com.fieldmaxx.app.photos.PhotoPipeline
+import com.fieldmaxx.app.photos.PhotoSettings
 import com.fieldmaxx.app.platform.CompassSource
 import com.fieldmaxx.app.platform.ForegroundTracker
 import com.fieldmaxx.app.platform.FusedLocationSource
@@ -41,6 +42,7 @@ import com.fieldmaxx.app.sync.OutboxWorker
 import com.fieldmaxx.app.sync.SyncEngine
 import com.fieldmaxx.app.sync.liveSocketUrl
 import com.fieldmaxx.core.model.AppConfig
+import com.fieldmaxx.sharepoint.sharePointDestinations
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -73,6 +75,9 @@ class AppGraph(context: Context, val vault: TokenVault = AndroidKeystoreTokenVau
         .build()
 
     val api: Api = OkHttpApi(http, server::get)
+
+    /** OneDrive's client: the same connections and threads, without the session interceptor (the token is our server's alone). */
+    private val oneDriveHttp: OkHttpClient by lazy { http.newBuilder().apply { interceptors().clear() }.build() }
 
     /** Lives as long as the process: the sync engine and the outbox watch run here. */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -124,11 +129,22 @@ class AppGraph(context: Context, val vault: TokenVault = AndroidKeystoreTokenVau
     /** The map's view per user per job (spec §6.3). */
     val mapViews: ViewMemory by lazy { DataStoreViewMemory(dataStore("map_views")) }
 
-    /** Starts a saved photo on its way. A no-op until Task 28's pipeline replaces it: photos stay "saved" meanwhile (R54). */
-    val photoStarter: PhotoPipelineStarter = PhotoPipelineStarter { }
+    /** The phone's own photo settings: the gallery copy (R60), which the settings screen toggles. */
+    val photoSettings: PhotoSettings by lazy { PhotoSettings(dataStore("photo_settings")) }
+
+    /**
+     * Takes each saved photo to OneDrive and to the server backup (spec §6.6), at the server's photo quality read once the
+     * kept settings are in (R62). [FieldmaxxApp] resumes it at every start.
+     */
+    val photos: PhotoPipeline by lazy {
+        PhotoPipeline(
+            app, db, api, sharePointDestinations(oneDriveHttp), sync, System::currentTimeMillis,
+            quality = { currentConfig().photoQuality }, galleryCopy = { photoSettings.galleryCopy.first() }, scope = scope,
+        )
+    }
 
     /** Photos taken or picked on this phone: each is written to app storage and recorded before anything else happens (§6.6). */
-    val localPhotos: LocalPhotos by lazy { LocalPhotos(db, app.filesDir, photoStarter, System::currentTimeMillis, ContentPickedMedia(app)) }
+    val localPhotos: LocalPhotos by lazy { LocalPhotos(db, app.filesDir, photos, System::currentTimeMillis, ContentPickedMedia(app)) }
 
     /** One store per file and graph; it closes with the graph's scope. A damaged file starts empty again. */
     private fun dataStore(name: String): DataStore<Preferences> = PreferenceDataStoreFactory.create(

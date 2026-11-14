@@ -42,7 +42,7 @@ data class LocalPhotoEntity(
     val backupOffset: Long,
     val backupDone: Boolean,
     val attempts: Int,
-    val nextAttemptAt: Long,
+    val nextAttemptAt: Long, // the pipeline's next turn: a failed step's next try; once confirmed and backed up, when its copies go
     val lastError: String?,
     val stuck: Boolean,
     val createdAt: Long,
