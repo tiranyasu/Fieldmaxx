@@ -341,10 +341,11 @@ class SyncEngine(
      * is filled from; state from another address clears it first.
      */
     private suspend fun <T> land(write: suspend () -> T): T {
-        if (otherServer()) resetCache()
         val here = server()
+        val stamp = db.meta().get(MetaKeys.SERVER) // only land and resetCache write it, both under applyLock
+        if (stamp != null && stamp != here) resetCache()
         return db.withTransaction {
-            if (db.meta().get(MetaKeys.SERVER) != here) db.meta().put(MetaEntity(MetaKeys.SERVER, here))
+            if (stamp != here) db.meta().put(MetaEntity(MetaKeys.SERVER, here))
             write()
         }
     }
