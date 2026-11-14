@@ -50,4 +50,9 @@ dependencies {
 tasks.test {
     useJUnitPlatform()
     systemProperty("java.awt.headless", "true")
+    // LiveDeliveryTest runs only when FMX_LIVE_TEST_LINK is set. Gradle doesn't track environment variables, so a live
+    // run must never be answered from up-to-date or build-cache results.
+    if (providers.environmentVariable("FMX_LIVE_TEST_LINK").isPresent) {
+        doNotTrackState("live OneDrive test")
+    }
 }
