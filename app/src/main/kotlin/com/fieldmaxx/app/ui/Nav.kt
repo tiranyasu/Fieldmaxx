@@ -26,6 +26,8 @@ import com.fieldmaxx.app.map.GraphMapDeps
 import com.fieldmaxx.app.map.MapScreen
 import com.fieldmaxx.app.map.rememberMapLibreController
 import com.fieldmaxx.app.net.ApiException
+import com.fieldmaxx.app.point.GraphPointDeps
+import com.fieldmaxx.app.point.PointSheet
 import java.io.IOException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -151,6 +153,7 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
         }
         composable(Routes.MAP, arguments = listOf(jobIdArg)) { entry ->
             val controller = rememberMapLibreController(graph.compass.heading)
+            val pointDeps = remember(graph) { GraphPointDeps(graph) }
             MapScreen(
                 entry.jobId(), remember(graph) { GraphMapDeps(graph) }, controller, mapView = { controller.View(it) },
                 onBack = back,
@@ -160,6 +163,7 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
                         navController.navigate(Routes.JOBS) { popUpTo(Routes.MAP) { inclusive = true } }
                     }
                 },
+                pointSheet = { pointId, close -> PointSheet(entry.jobId(), pointId, pointDeps, controller, onClose = close) },
             )
         }
     }

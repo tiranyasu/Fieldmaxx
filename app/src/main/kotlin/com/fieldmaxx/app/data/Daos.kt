@@ -138,6 +138,17 @@ interface LocalPhotoDao {
     @Query("SELECT DISTINCT pointId FROM LocalPhotoEntity WHERE jobId = :jobId AND state != 'confirmed'")
     fun observeWaitingPointIds(jobId: String): Flow<List<String>>
 
+    /** The point's photos that are still only on this phone: what deleting the point discards (R46). */
+    @Query("SELECT * FROM LocalPhotoEntity WHERE pointId = :pointId AND state != 'confirmed' ORDER BY createdAt")
+    suspend fun onPhoneForPoint(pointId: String): List<LocalPhotoEntity>
+
+    @Query("SELECT COUNT(*) FROM LocalPhotoEntity WHERE pointId = :pointId AND state != 'confirmed'")
+    fun observeOnPhoneCount(pointId: String): Flow<Int>
+
     @Upsert
     suspend fun upsert(photo: LocalPhotoEntity)
+
+    /** At most a few hundred ids per call, as [PointDao.delete]. */
+    @Query("DELETE FROM LocalPhotoEntity WHERE id IN (:ids)")
+    suspend fun delete(ids: List<String>)
 }

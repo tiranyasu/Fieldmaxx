@@ -110,6 +110,7 @@ dependencies {
     implementation(libs.maplibre.android)
     implementation(libs.suncalc)
     implementation(libs.coil)
+    implementation(libs.coil.compose) // the point sheet's reference images
     implementation(libs.coil.network.okhttp)
     debugImplementation(libs.androidx.compose.ui.test.manifest) // the empty activity createComposeRule() launches
 
