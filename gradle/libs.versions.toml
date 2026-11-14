@@ -22,6 +22,11 @@ playServicesLocation = "21.3.0"
 exifinterface = "1.4.1"
 coil = "3.2.0"
 robolectric = "4.14.1"
+androidxCore = "1.16.0"
+activityCompose = "1.10.1"
+navigation = "2.8.9"
+androidxTestCore = "1.6.1"
+junit4 = "4.13.2"
 
 [libraries]
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
@@ -50,6 +55,13 @@ bouncycastle-prov = { module = "org.bouncycastle:bcprov-jdk18on", version.ref = 
 fastexcel = { module = "org.dhatim:fastexcel", version.ref = "fastexcel" }
 suncalc = { module = "org.shredzone.commons:commons-suncalc", version.ref = "suncalc" }
 androidx-compose-bom = { module = "androidx.compose:compose-bom", version.ref = "composeBom" }
+androidx-compose-ui = { module = "androidx.compose.ui:ui" }
+androidx-compose-material3 = { module = "androidx.compose.material3:material3" }
+androidx-compose-ui-test-junit4 = { module = "androidx.compose.ui:ui-test-junit4" }
+androidx-compose-ui-test-manifest = { module = "androidx.compose.ui:ui-test-manifest" }
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "androidxCore" }
+androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
+androidx-navigation-compose = { module = "androidx.navigation:navigation-compose", version.ref = "navigation" }
 androidx-room-runtime = { module = "androidx.room:room-runtime", version.ref = "room" }
 androidx-room-ktx = { module = "androidx.room:room-ktx", version.ref = "room" }
 androidx-room-compiler = { module = "androidx.room:room-compiler", version.ref = "room" }
@@ -64,6 +76,8 @@ maplibre-android = { module = "org.maplibre.gl:android-sdk", version.ref = "mapl
 play-services-location = { module = "com.google.android.gms:play-services-location", version.ref = "playServicesLocation" }
 coil-compose = { module = "io.coil-kt.coil3:coil-compose", version.ref = "coil" }
 robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
+androidx-test-core = { module = "androidx.test:core", version.ref = "androidxTestCore" }
+junit4 = { module = "junit:junit", version.ref = "junit4" }
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
