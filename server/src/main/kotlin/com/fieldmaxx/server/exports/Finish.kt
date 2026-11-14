@@ -24,12 +24,19 @@ private const val MAX_NAME_TRIES = 100
 
 private fun alreadyFinished() = HttpError(HttpStatusCode.Conflict, "This job is already finished")
 
+/**
+ * Open points, and photos not in OneDrive yet. I2: a deleted point's photos don't count. They stay registered on purpose
+ * (an admin's restore lets the server deliver their backups), but nobody can deliver them while the point is deleted.
+ */
 private fun java.sql.Connection.counts(jobId: String): Pair<Int, Int> {
     fun count(sql: String) = prepareStatement(sql).use { ps ->
         ps.setString(1, jobId); ps.executeQuery().use { it.next(); it.getInt(1) }
     }
     return count("SELECT COUNT(*) FROM points WHERE job_id = ? AND deleted_at IS NULL AND status = 'open'") to
-        count("SELECT COUNT(*) FROM photos WHERE job_id = ? AND status NOT IN ('confirmed', 'removed')")
+        count(
+            "SELECT COUNT(*) FROM photos ph JOIN points pt ON pt.id = ph.point_id " +
+                "WHERE ph.job_id = ? AND ph.status NOT IN ('confirmed', 'removed') AND pt.deleted_at IS NULL",
+        )
 }
 
 private fun finishJobLocked(ctx: Ctx, jobId: String): FinishResult {

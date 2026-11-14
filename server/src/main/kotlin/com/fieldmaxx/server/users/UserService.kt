@@ -14,6 +14,9 @@ import java.util.UUID
 
 const val MIN_PASSWORD = 8
 
+/** R92: why the last active admin can't be disabled or made a tech. */
+const val LAST_ADMIN = "Fieldmaxx needs at least one active admin. Make another user an admin first, then change this one."
+
 fun checkPassword(pw: String) = require(pw.length >= MIN_PASSWORD) { "Password must be at least $MIN_PASSWORD characters" }
 
 internal fun ResultSet.toUser() =
@@ -55,13 +58,25 @@ fun listUsers(ctx: Ctx): List<User> = ctx.db.read {
     }
 }
 
+/**
+ * Changes only the fields given. R92: refused (409, [LAST_ADMIN]) when it would disable or demote the last active admin,
+ * which would leave nobody to reach the admin screens; checked inside the write, so two admins changing each other at
+ * once can't both get through.
+ */
 fun updateUser(ctx: Ctx, id: String, displayName: String?, role: Role?, disabled: Boolean?, password: String?): User {
     password?.let(::checkPassword)
     require(displayName == null || displayName.isNotBlank()) { "Display name is required" }
     val hash = password?.let(::hashPassword)
     val updated = ctx.db.tx {
-        val exists = prepareStatement("SELECT 1 FROM users WHERE id = ?").use { ps -> ps.setString(1, id); ps.executeQuery().use { it.next() } }
-        if (!exists) throw HttpError(HttpStatusCode.NotFound, "No such user")
+        val current = prepareStatement("SELECT * FROM users WHERE id = ?").use { ps -> ps.setString(1, id); ps.executeQuery().use { if (it.next()) it.toUser() else null } }
+            ?: throw HttpError(HttpStatusCode.NotFound, "No such user")
+        val stopsBeingAdmin = disabled == true || (role != null && role != Role.admin)
+        if (current.role == Role.admin && !current.disabled && stopsBeingAdmin) {
+            val others = prepareStatement("SELECT COUNT(*) FROM users WHERE role = 'admin' AND disabled = 0 AND id != ?").use { ps ->
+                ps.setString(1, id); ps.executeQuery().use { it.next(); it.getInt(1) }
+            }
+            if (others == 0) throw HttpError(HttpStatusCode.Conflict, LAST_ADMIN)
+        }
         fun set(col: String, bind: PreparedStatement.() -> Unit) =
             prepareStatement("UPDATE users SET $col = ? WHERE id = ?").use { it.bind(); it.setString(2, id); it.executeUpdate() }
         displayName?.let { set("display_name") { setString(1, it.trim()) } }

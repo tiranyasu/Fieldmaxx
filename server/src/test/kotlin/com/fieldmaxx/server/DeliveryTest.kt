@@ -8,8 +8,10 @@ import com.fieldmaxx.core.model.PhotoStatus
 import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
+import com.fieldmaxx.core.retry.BUSY_RECHECKS
 import com.fieldmaxx.core.retry.BUSY_RECHECK_MS
 import com.fieldmaxx.core.retry.MAX_RETRY_DELAY_MS
+import com.fieldmaxx.core.retry.busyRecheckMs
 import com.fieldmaxx.core.retry.nextDelayMs
 import com.fieldmaxx.server.delivery.DeliveryWorker
 import com.fieldmaxx.server.delivery.backupDays
@@ -20,6 +22,7 @@ import com.fieldmaxx.server.delivery.retryPhoto
 import com.fieldmaxx.server.jobs.deleteJob
 import com.fieldmaxx.server.jobs.path
 import com.fieldmaxx.server.jobs.purgeDeletedJobs
+import com.fieldmaxx.server.jobs.restoreJob
 import com.fieldmaxx.server.jobs.toJob
 import com.fieldmaxx.server.jobs.toPhoto
 import com.fieldmaxx.server.jobs.toPoint
@@ -57,6 +60,7 @@ import kotlin.test.assertTrue
 private const val MIN = 60_000L
 private const val DAY = 24 * 60 * MIN
 private const val TAKEOVER = 30 * MIN
+private const val STUCK_AFTER = 6
 
 /** Wraps the fake to see what the worker asks for: resume sessions, parallel uploads, and a hook just before an upload. */
 private class Spy(val inner: FakeDestination) : PhotoDestination by inner {
@@ -382,6 +386,93 @@ class DeliveryTest {
         assertNull(col(app, "ph-1", "od_upload_id"))
     }
 
+    /** m3, R94: the server's own session expires mid-upload (SharePoint drops it): the restart ends in exactly one full-size file. */
+    @Test fun expiredSessionRestartsIntoOneFullSizeFile() = withApp(spy = true) { app, fake, spy ->
+        fake.restartLostSessions = true // as SharePoint's link does it
+        val bytes = jpeg(w = 400, h = 300)
+        val name = backedUp(app, "ph-1", bytes)
+        val path = "POLE/POLE_1/$name"
+        app.clock.nowMs += TAKEOVER
+        fake.dropChunkAfter = 2
+        app.worker(chunkBytes = 1024) { w -> assertEquals(1, w.runOnce()) }
+        val dead = assertNotNull(col(app, "ph-1", "od_upload_id")) as String
+        fake.expireSessions() // overnight: SharePoint has forgotten the session; its file still reads 0 bytes
+
+        app.clock.nowMs += nextDelayMs(1)
+        app.worker(chunkBytes = 1024) { w -> assertEquals(1, w.runOnce()) }
+        val p = photo(app, "ph-1")
+        assertEquals(PhotoStatus.confirmed, p.status)
+        assertEquals(name, p.fileName, "no new counter")
+        assertEquals(listOf(null, ChunkSession(dead, 2048)), spy.resumes, "the stored session resumed, and restarted by the destination")
+        assertEquals(setOf(path), fake.files.keys, "exactly one file")
+        assertContentEquals(bytes, fake.files[path], "full size")
+        assertNull(col(app, "ph-1", "od_upload_id"))
+    }
+
+    /** I3: the photo's file and folder were removed by hand during the server's delivery: the dead session is dropped, then a fresh upload. */
+    @Test fun deadSessionIsDroppedWhenItsFileIsGone() = withApp(spy = true) { app, fake, spy ->
+        fake.restartLostSessions = true // the real destination ends such a resume with NOT_FOUND
+        val bytes = jpeg(w = 400, h = 300)
+        val name = backedUp(app, "ph-1", bytes)
+        val path = "POLE/POLE_1/$name"
+        app.clock.nowMs += TAKEOVER
+        fake.dropChunkAfter = 2
+        app.worker(chunkBytes = 1024) { w -> assertEquals(1, w.runOnce()) }
+        assertNotNull(col(app, "ph-1", "od_upload_id"))
+        fake.expireSessions()
+        fake.files.remove(path)
+        fake.folders.removeAll { it.startsWith("POLE") } // the point's folder went too
+
+        app.clock.nowMs += nextDelayMs(1)
+        app.worker(chunkBytes = 1024) { w -> assertEquals(1, w.runOnce()) }
+        assertEquals(2L, col(app, "ph-1", "attempts"))
+        assertNotNull(photo(app, "ph-1").lastError)
+        for (c in listOf("od_upload_id", "od_offset", "od_upload_path")) assertNull(col(app, "ph-1", c), "$c dropped with the dead session")
+
+        app.clock.nowMs += nextDelayMs(2)
+        app.worker(chunkBytes = 1024) { w -> assertEquals(1, w.runOnce()) }
+        val p = photo(app, "ph-1")
+        assertEquals(PhotoStatus.confirmed, p.status)
+        assertEquals(name, p.fileName)
+        assertNull(spy.resumes.last(), "afresh, in a folder made again")
+        assertEquals(setOf(path), fake.files.keys)
+        assertContentEquals(bytes, fake.files[path])
+    }
+
+    /** I3: admin "Retry now" starts the photo over, its stored session too. */
+    @Test fun retryNowDropsTheStoredSession() = withApp { app, fake, _ ->
+        backedUp(app, "ph-1", jpeg(w = 400, h = 300))
+        app.clock.nowMs += TAKEOVER
+        fake.dropChunkAfter = 2
+        app.worker(chunkBytes = 1024) { w -> assertEquals(1, w.runOnce()) }
+        assertNotNull(col(app, "ph-1", "od_upload_id"))
+        retryPhoto(app.ctx, boss, "ph-1")
+        for (c in listOf("od_upload_id", "od_offset", "od_upload_path")) assertNull(col(app, "ph-1", c), c)
+        assertEquals(0L, col(app, "ph-1", "attempts"))
+    }
+
+    /** m4: the expired session's name holds another file now: the server takes a new counter and never writes over it. */
+    @Test fun expiredSessionMeetingAnotherFileTakesANewCounter() = withApp(spy = true) { app, fake, _ ->
+        fake.restartLostSessions = true
+        val bytes = jpeg(w = 400, h = 300)
+        val name = backedUp(app, "ph-1", bytes)
+        app.clock.nowMs += TAKEOVER
+        fake.dropChunkAfter = 2
+        app.worker(chunkBytes = 1024) { w -> assertEquals(1, w.runOnce()) }
+        fake.expireSessions()
+        val theirs = jpeg(seed = 9) // a whole photo of someone else's under the name meanwhile
+        fake.files["POLE/POLE_1/$name"] = theirs
+
+        app.clock.nowMs += nextDelayMs(1)
+        app.worker(chunkBytes = 1024) { w -> assertEquals(1, w.runOnce()) }
+        val p = photo(app, "ph-1")
+        assertEquals(PhotoStatus.confirmed, p.status)
+        assertNotEquals(name, p.fileName, "a new counter")
+        assertContentEquals(bytes, fake.files["POLE/POLE_1/${p.fileName}"])
+        assertContentEquals(theirs, fake.files["POLE/POLE_1/$name"], "never written over")
+        assertEquals(2, fake.files.size)
+    }
+
     // ---- R82: a 0-byte file under the photo's own name is its delivery in progress, never a reason to rename ----
 
     /** The phone's chunked upload, stopped short: SharePoint's empty file under the photo's name, its session open. */
@@ -449,6 +540,45 @@ class DeliveryTest {
         assertEquals(PhotoStatus.confirmed, photo(app, "ph-1").status)
         assertContentEquals(bytes, fake.files[path])
         assertEquals(1, fake.files.size)
+    }
+
+    /**
+     * Ledger item 6: a file that stays locked is looked at again after 2 min doubling to 30 min, uncounted for 6 rechecks;
+     * after that each BUSY counts as a failed attempt ("OneDrive keeps this file locked"), so the photo goes stuck and shows.
+     */
+    @Test fun busyBacksOffThenCountsAsAFailedAttempt() = withApp { app, fake, _ ->
+        val bytes = jpeg(w = 400, h = 300)
+        val name = backedUp(app, "ph-1", bytes)
+        val path = "POLE/POLE_1/$name"
+        fake.ensureFolder("POLE/POLE_1")
+        fake.busyWhileUploading = true
+        phoneStartedUpload(fake, path, bytes, chunks = 1) // the phone's session holds the file, and doesn't finish
+        app.clock.nowMs += TAKEOVER
+        app.worker(chunkBytes = 1024) { w ->
+            for (n in 1..BUSY_RECHECKS) {
+                assertEquals(0, w.runOnce(), "recheck $n is not an attempt")
+                assertEquals(0L, col(app, "ph-1", "attempts"))
+                assertEquals(app.clock.nowMs + busyRecheckMs(n), col(app, "ph-1", "next_attempt_at"), "recheck $n")
+                app.clock.nowMs += busyRecheckMs(n)
+            }
+            assertEquals(listOf(2, 4, 8, 16, 30, 30).map { it * MIN }, (1..BUSY_RECHECKS).map(::busyRecheckMs))
+            for (attempt in 1..STUCK_AFTER) {
+                assertEquals(1, w.runOnce(), "still locked: attempt $attempt")
+                val p = photo(app, "ph-1")
+                assertEquals(attempt.toLong(), col(app, "ph-1", "attempts"))
+                assertEquals("OneDrive keeps this file locked", p.lastError)
+                assertEquals(if (attempt < STUCK_AFTER) PhotoStatus.registered else PhotoStatus.stuck, p.status)
+                assertEquals(app.clock.nowMs + MAX_RETRY_DELAY_MS, col(app, "ph-1", "next_attempt_at"), "never sooner than the lock's own 30 min")
+                app.clock.nowMs += MAX_RETRY_DELAY_MS
+            }
+            assertEquals(PhotoStatus.stuck, changes(app, "photo", "ph-1").last().photo?.status, "reported: Delivery health shows it")
+
+            fake.expireSessions() // the lock goes at last
+            assertEquals(1, w.runOnce())
+        }
+        assertEquals(PhotoStatus.confirmed, photo(app, "ph-1").status)
+        assertContentEquals(bytes, fake.files[path])
+        assertEquals(0L, col(app, "ph-1", "busy_checks"))
     }
 
     /** R82 rule 4: a confirmation that finds the photo renamed under the upload doesn't record the old name; the new one decides. */
@@ -687,6 +817,13 @@ class DeliveryTest {
         app.clock.nowMs += TAKEOVER
         app.worker { w -> assertEquals(0, w.runOnce()) }
         assertTrue(fake.calls.isEmpty())
+
+        // R96: restoring the job resumes its photos' takeover; the deleted point's photo still waits.
+        restoreJob(app.ctx, boss, "job-1")
+        app.worker { w -> assertEquals(1, w.runOnce()) }
+        assertEquals(PhotoStatus.confirmed, photo(app, "ph-1").status)
+        assertEquals(PhotoStatus.registered, photo(app, "ph-2").status)
+        assertEquals(1, fake.files.size)
     }
 
     // ---- retention ----

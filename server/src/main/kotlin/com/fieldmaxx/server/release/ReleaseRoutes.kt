@@ -39,7 +39,11 @@ fun latestRelease(ctx: Ctx): AppRelease? = ctx.latestRow()?.let {
     AppRelease(it.code, it.name, "${ctx.config.publicOrigin.trimEnd('/')}/app/${apkFileName(it.name)}", it.sha256)
 }
 
-/** Copies [source] into `<dataDir>/apk/` and records it. Throws IllegalArgumentException on bad input or a repeated version. */
+/**
+ * Copies [source] into `<dataDir>/apk/` and records it. Throws IllegalArgumentException on bad input, a version name
+ * published before, or (R91) a version code at or below the highest published: the phones only update to a higher one,
+ * so such a release would be live on the download page and never reach a phone.
+ */
 fun publishApk(ctx: Ctx, source: java.nio.file.Path, versionCode: Int, versionName: String): AppRelease {
     require(Files.isRegularFile(source)) { "No such file: $source" }
     val magic = Files.newInputStream(source).use { it.readNBytes(4) }
@@ -68,10 +72,11 @@ fun publishApk(ctx: Ctx, source: java.nio.file.Path, versionCode: Int, versionNa
     }
     try {
         ctx.db.tx {
-            val exists = prepareStatement("SELECT 1 FROM app_releases WHERE version_code = ?").use { ps ->
-                ps.setInt(1, versionCode); ps.executeQuery().use { it.next() }
+            val highest = createStatement().use { st -> st.executeQuery("SELECT MAX(version_code) FROM app_releases").use { it.next(); it.getInt(1) } }
+            require(versionCode > highest) {
+                "Version code $versionCode is not higher than $highest, the highest already published. " +
+                    "The phones only update to a higher one: use ${highest + 1} or more."
             }
-            require(!exists) { "Version code $versionCode is already published" }
             prepareStatement("INSERT INTO app_releases(version_code, version_name, file_path, sha256, created_at) VALUES (?,?,?,?,?)").use {
                 it.setInt(1, versionCode); it.setString(2, versionName); it.setString(3, rel); it.setString(4, sha)
                 it.setLong(5, ctx.clock.millis()); it.executeUpdate()

@@ -67,14 +67,19 @@ private fun median(values: List<Long>): Long? {
     return if (s.size % 2 == 1) s[s.size / 2] else (s[s.size / 2 - 1] + s[s.size / 2]) / 2
 }
 
-/** Photos not yet confirmed (stuck first, then oldest first) and the typical delivery times of the last 24 hours. */
+/**
+ * Photos not yet confirmed (stuck first, then oldest first) and the typical delivery times of the last 24 hours. I2: only
+ * photos of live points in live jobs, the ones someone can still deliver; a deleted point's or job's photos wait for a
+ * restore, and "Retry now" can't move them.
+ */
 fun healthReport(ctx: Ctx): HealthReport {
     val since = ctx.clock.millis() - DAY_MS
     val (photos, phone, upload) = ctx.db.read {
         val photos = createStatement().use { st ->
             st.executeQuery(
-                "SELECT * FROM photos WHERE confirmed_at IS NULL AND status != 'removed' " +
-                    "ORDER BY CASE status WHEN 'stuck' THEN 0 ELSE 1 END, taken_at, id",
+                "SELECT ph.* FROM photos ph JOIN points pt ON pt.id = ph.point_id JOIN jobs j ON j.id = ph.job_id " +
+                    "WHERE ph.confirmed_at IS NULL AND ph.status != 'removed' AND pt.deleted_at IS NULL AND j.deleted_at IS NULL " +
+                    "ORDER BY CASE ph.status WHEN 'stuck' THEN 0 ELSE 1 END, ph.taken_at, ph.id",
             ).use { rs -> buildList<PhotoInfo> { while (rs.next()) add(rs.toPhoto()) } }
         }
         val phone = mutableListOf<Long>()

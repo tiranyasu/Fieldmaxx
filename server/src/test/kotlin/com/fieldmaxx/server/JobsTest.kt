@@ -396,6 +396,30 @@ class JobsTest {
         }
     }
 
+    /** m2, spec §6.6 "can we list the folder?": a link that opens but whose folder can't be listed fails at entry, readably. */
+    @Test fun linkCheckListsTheFolder() {
+        val listed = FakeDestination()
+        TestApp(destinations = { _ -> listed }).run {
+            val res = client.post("/api/links/check") {
+                bearerAuth(tokenFor("ann")); contentType(ContentType.Application.Json); setBody("""{"url":"https://example.com/x"}""")
+            }
+            assertEquals(LinkCheck(ok = true, rootName = "Field Notes"), FmxJson.decodeFromString(LinkCheck.serializer(), res.bodyAsText()))
+            assertEquals(listOf("listFolders "), listed.calls, "the folder was listed")
+        }
+        val unlistable = object : PhotoDestination by FakeDestination() {
+            override fun listFolders(relPath: String): List<String> = throw DestinationException(DestinationErrorCode.FORBIDDEN, "The link no longer allows uploads")
+        }
+        TestApp(destinations = { _ -> unlistable }).run {
+            val res = client.post("/api/links/check") {
+                bearerAuth(tokenFor("ann")); contentType(ContentType.Application.Json); setBody("""{"url":"https://example.com/x"}""")
+            }
+            assertEquals(
+                LinkCheck(ok = false, error = "The link no longer allows uploads"),
+                FmxJson.decodeFromString(LinkCheck.serializer(), res.bodyAsText()),
+            )
+        }
+    }
+
     @Test fun jobCreationRecordsChange() = TestApp().run { app ->
         val t = tokenFor("ann")
         val j = create(t, preview(t)).job

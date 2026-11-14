@@ -5,8 +5,10 @@ import com.fieldmaxx.core.model.PhotoStatus
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
 import com.fieldmaxx.core.naming.PointKey
-import com.fieldmaxx.core.retry.BUSY_RECHECK_MS
+import com.fieldmaxx.core.retry.BUSY_RECHECKS
+import com.fieldmaxx.core.retry.BUSY_TOO_LONG
 import com.fieldmaxx.core.retry.MAX_RETRY_DELAY_MS
+import com.fieldmaxx.core.retry.busyRecheckMs
 import com.fieldmaxx.core.retry.nextDelayMs
 import com.fieldmaxx.server.Ctx
 import com.fieldmaxx.server.DeliveryKick
@@ -80,6 +82,8 @@ private class Target(rs: ResultSet) {
     val reusedFrom: String? = rs.getString("reused_from")
     val backupPath: String? = rs.getString("backup_path")?.takeIf { rs.getObject("backup_purged_at") == null }
     val session: Persisted? = rs.getString("od_upload_id")?.let { Persisted(it, rs.getLong("od_offset"), rs.getString("od_upload_path")) }
+    /** BUSY answers in a row so far (ledger item 6). */
+    val busyChecks: Int = rs.getInt("busy_checks")
     val key = PointKey(rs.getString("layer"), rs.getString("type"), rs.getString("num"), rs.getString("label"))
     val folderPath: String? = rs.getString("folder_path")
     val url: String? = rs.getString("field_notes_url")?.takeIf { it.isNotBlank() }
@@ -214,11 +218,7 @@ class DeliveryWorker internal constructor(
             val folder = folder(t, dest) ?: return Outcome.SKIPPED
             val startedNs = System.nanoTime()
             when (val sent = send(t, dest, folder, source)) {
-                Sent.Busy -> {
-                    // R82: the phone's delivery holds the photo's file. Look again in 2 min; not a failed attempt.
-                    recheckLater(t, BUSY_RECHECK_MS)
-                    Outcome.SKIPPED
-                }
+                Sent.Busy -> busy(t)
                 // R82 rule 4: renamed under it, it goes round again, and the next round looks under its current name.
                 is Sent.Delivered -> if (confirm(t, sent.path, (System.nanoTime() - startedNs) / 1_000_000)) Outcome.CONFIRMED else Outcome.SKIPPED
             }
@@ -397,8 +397,12 @@ class DeliveryWorker internal constructor(
             upload(dest, folder, path, file(), resume) { persistSession(t.id, path, it) }
         } catch (e: DestinationException) {
             if (e.code == DestinationErrorCode.BUSY) return Sent.Busy
-            if (e.code != DestinationErrorCode.EXISTS || resume != null) throw e
-            // Someone (the phone) created the name between our check and our upload: look again.
+            // I3: the resumed session's file (or its folder) is gone from OneDrive, removed by hand, say. The dead session is
+            // dropped, so the next round makes the folder and uploads afresh, as the phone does; until then it is a failure.
+            if (e.code == DestinationErrorCode.NOT_FOUND && resume != null) forgetSession(t.id)
+            if (e.code != DestinationErrorCode.EXISTS) throw e
+            // Someone (the phone) created the name between our check and our upload; or the destination found another file
+            // at the name of a session SharePoint lost, and wrote nothing (m4). Look again.
             return when (dest.fileInfo(path)?.size) {
                 t.size -> Sent.Delivered(path)
                 0L -> adopt(t, dest, folder, path, file)
@@ -420,11 +424,27 @@ class DeliveryWorker internal constructor(
         return put(t, dest, folder, path, file, session)
     }
 
-    /** R82: the photo is looked at again after [delayMs]; no failure is counted. */
-    private fun recheckLater(t: Target, delayMs: Long) {
+    /**
+     * R82: the phone's delivery holds the photo's file (SharePoint's lock). It is looked at again after [busyRecheckMs] (2 min,
+     * doubling to 30 min), no failure counted; after [BUSY_RECHECKS] such answers in a row each one counts as a failed
+     * attempt, rechecked no sooner (ledger item 6), so a lock that never goes ends stuck in Delivery health.
+     */
+    private fun busy(t: Target): Outcome {
+        val checks = t.busyChecks + 1
+        if (checks > BUSY_RECHECKS) return fail(t, BUSY_TOO_LONG, null, busyChecks = checks, atLeastMs = busyRecheckMs(checks))
         ctx.db.tx {
-            prepareStatement("UPDATE photos SET next_attempt_at = ? WHERE id = ? AND confirmed_at IS NULL").use {
-                it.setLong(1, ctx.clock.millis() + delayMs); it.setString(2, t.id); it.executeUpdate()
+            prepareStatement("UPDATE photos SET busy_checks = ?, next_attempt_at = ? WHERE id = ? AND confirmed_at IS NULL").use {
+                it.setInt(1, checks); it.setLong(2, ctx.clock.millis() + busyRecheckMs(checks)); it.setString(3, t.id); it.executeUpdate()
+            }
+        }
+        return Outcome.SKIPPED
+    }
+
+    /** I3: the stored session is dead (its file is gone): forgotten, so the next attempt starts afresh. */
+    private fun forgetSession(photoId: String) {
+        ctx.db.tx {
+            prepareStatement("UPDATE photos SET od_upload_id = NULL, od_offset = NULL, od_upload_path = NULL WHERE id = ?").use {
+                it.setString(1, photoId); it.executeUpdate()
             }
         }
     }
@@ -479,8 +499,8 @@ class DeliveryWorker internal constructor(
             // Whoever confirms first wins; a photo removed meanwhile stays removed but is remembered as delivered.
             val n = prepareStatement(
                 "UPDATE photos SET status = CASE WHEN status = 'removed' THEN 'removed' ELSE 'confirmed' END, dest_path = ?, upload_ms = ?, " +
-                    "confirmed_at = ?, last_error = NULL, next_attempt_at = NULL, od_upload_id = NULL, od_offset = NULL, od_upload_path = NULL " +
-                    "WHERE id = ? AND confirmed_at IS NULL AND file_name = ?",
+                    "confirmed_at = ?, last_error = NULL, next_attempt_at = NULL, od_upload_id = NULL, od_offset = NULL, od_upload_path = NULL, " +
+                    "busy_checks = 0 WHERE id = ? AND confirmed_at IS NULL AND file_name = ?",
             ).use {
                 it.setString(1, path); it.setLong(2, uploadMs); it.setLong(3, now); it.setString(4, t.id)
                 it.setString(5, path.substringAfterLast('/')); it.executeUpdate()
@@ -498,7 +518,11 @@ class DeliveryWorker internal constructor(
         return confirmed
     }
 
-    private fun fail(t: Target, message: String, jobProblem: String?): Outcome {
+    /**
+     * A failed attempt: counted, retried after [nextDelayMs] (30 min once stuck), never sooner than [atLeastMs]. [busyChecks]:
+     * the BUSY answers in a row this failure continues (ledger item 6); any other failure ends such a run.
+     */
+    private fun fail(t: Target, message: String, jobProblem: String?, busyChecks: Int = 0, atLeastMs: Long = 0): Outcome {
         val changes = ctx.db.tx {
             val out = mutableListOf<Change>()
             val row = prepareStatement("SELECT status, attempts, confirmed_at FROM photos WHERE id = ?").use { ps ->
@@ -510,10 +534,10 @@ class DeliveryWorker internal constructor(
                 val stuck = attempts >= STUCK_AFTER_ATTEMPTS
                 val status = if (stuck) PhotoStatus.stuck else PhotoStatus.registered
                 // A stuck photo is still retried, every 30 min.
-                val wait = if (stuck) MAX_RETRY_DELAY_MS else nextDelayMs(attempts)
-                prepareStatement("UPDATE photos SET status = ?, attempts = ?, last_error = ?, next_attempt_at = ? WHERE id = ?").use {
+                val wait = maxOf(if (stuck) MAX_RETRY_DELAY_MS else nextDelayMs(attempts), atLeastMs)
+                prepareStatement("UPDATE photos SET status = ?, attempts = ?, last_error = ?, next_attempt_at = ?, busy_checks = ? WHERE id = ?").use {
                     it.setString(1, status.name); it.setInt(2, attempts); it.setString(3, message)
-                    it.setLong(4, ctx.clock.millis() + wait); it.setString(5, t.id); it.executeUpdate()
+                    it.setLong(4, ctx.clock.millis() + wait); it.setInt(5, busyChecks); it.setString(6, t.id); it.executeUpdate()
                 }
                 out += ctx.changes.recordInTx(this, t.jobId, "photo", t.id, photo = photoInfo(t.id))
             }
@@ -544,14 +568,20 @@ private fun daemon(name: String): ThreadFactory {
     return ThreadFactory { r -> Thread(r, "$name-${n.incrementAndGet()}").apply { isDaemon = true } }
 }
 
-/** Admin "Retry now": the photo starts over (attempts 0, not stuck) and the server tries it at once if it holds it. */
+/**
+ * Admin "Retry now": the photo starts over (attempts 0, not stuck, no BUSY run) and the server tries it at once if it holds
+ * it. Its stored OneDrive session goes too (I3): a dead one would only fail again, and a fresh session fills its file.
+ */
 fun retryPhoto(ctx: Ctx, admin: User, photoId: String) {
     if (admin.role != Role.admin) throw HttpError(HttpStatusCode.Forbidden, "Admins only")
     val change = ctx.db.tx {
         val p = photoInfo(photoId) ?: throw HttpError(HttpStatusCode.NotFound, "Photo not found")
         if (p.confirmedAt != null) throw HttpError(HttpStatusCode.Conflict, "Photo already delivered")
         if (p.status == PhotoStatus.removed) throw HttpError(HttpStatusCode.Gone, "Photo was removed")
-        prepareStatement("UPDATE photos SET status = 'registered', attempts = 0, last_error = NULL, next_attempt_at = NULL WHERE id = ?").use {
+        prepareStatement(
+            "UPDATE photos SET status = 'registered', attempts = 0, last_error = NULL, next_attempt_at = NULL, busy_checks = 0, " +
+                "od_upload_id = NULL, od_offset = NULL, od_upload_path = NULL WHERE id = ?",
+        ).use {
             it.setString(1, photoId); it.executeUpdate()
         }
         ctx.changes.recordInTx(this, p.jobId, "photo", photoId, photo = photoInfo(photoId))

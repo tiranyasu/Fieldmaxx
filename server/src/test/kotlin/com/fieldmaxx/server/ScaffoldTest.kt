@@ -6,7 +6,10 @@ import java.nio.file.Paths
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import org.slf4j.LoggerFactory
 
 class ScaffoldTest {
     private fun Db.tables(): Set<String> = read {
@@ -60,6 +63,23 @@ class ScaffoldTest {
         assertEquals(90, c.sessionDays)
         val o = loadConfig(mapOf("PORT" to "9000", "FMX_DESTINATION" to "fake", "FMX_BUILD_ID" to "x", "FMX_DATA_DIR" to "/d", "FMX_PUBLIC_ORIGIN" to "https://f"))
         assertEquals(9000, o.port); assertEquals("fake", o.destination); assertEquals("https://f", o.publicOrigin)
+    }
+
+    /**
+     * Ledger T32 M4: the server's own logback.xml, not logback's DEBUG default, so `docker compose logs app` shows what the
+     * owner should send: INFO and up, and PDFBox (chatty while it reads a job file) only from WARN.
+     */
+    @Test fun productionLogsAtInfoWithPdfboxAtWarn() {
+        assertNotNull(javaClass.getResource("/logback.xml"))
+        val root = LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME)
+        assertFalse(root.isDebugEnabled, "no DEBUG")
+        assertTrue(root.isInfoEnabled)
+        assertTrue(LoggerFactory.getLogger("com.fieldmaxx.server.delivery.DeliveryWorker").isInfoEnabled)
+        for (name in listOf("org.apache.pdfbox.pdmodel.font.PDType1Font", "org.apache.fontbox.ttf.TTFParser")) {
+            val pdfbox = LoggerFactory.getLogger(name)
+            assertFalse(pdfbox.isInfoEnabled, name)
+            assertTrue(pdfbox.isWarnEnabled, name)
+        }
     }
 
     private fun fileDb() = Db("jdbc:sqlite:${java.nio.file.Files.createTempDirectory("fmx-db").resolve("t.db")}")

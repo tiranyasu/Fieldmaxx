@@ -14,11 +14,18 @@ import kotlinx.serialization.Serializable
 
 @Serializable data class LinkCheckRequest(val url: String)
 
-/** Opens the Field Notes link and reports the folder name, or a readable reason it can't be used. */
+/**
+ * Opens the Field Notes link and lists its folder (spec §6.6: "can we list the folder?"), then reports the folder's name;
+ * or a readable reason it can't be used. A link that opens but whose folder can't be listed through the REST API fails
+ * here, at entry, rather than as the red banner once the photos start (m2).
+ */
 fun checkLink(ctx: Ctx, url: String): LinkCheck =
     if (url.isBlank()) LinkCheck(ok = false, error = "Paste the Field Notes link first")
     else try {
-        LinkCheck(ok = true, rootName = ctx.destinations(url.trim()).rootName())
+        val dest = ctx.destinations(url.trim())
+        val rootName = dest.rootName()
+        dest.listFolders("")
+        LinkCheck(ok = true, rootName = rootName)
     } catch (e: Exception) {
         LinkCheck(ok = false, error = e.message ?: "Could not open that link")
     }

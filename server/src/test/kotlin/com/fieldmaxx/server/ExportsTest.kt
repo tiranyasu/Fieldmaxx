@@ -185,6 +185,19 @@ class ExportsTest {
         assertEquals("active", jobStatus(app))
     }
 
+    /** I2: a deleted point's registered photo (its backup kept for a restore) doesn't keep the job from finishing. */
+    @Test fun deletedPointsPhotoDoesNotBlockFinish() = TestApp().run { app ->
+        seedJob(app)
+        point(app, "d", "1", status = "done")
+        point(app, "gone", "2", deleted = true)
+        photo(app, "ok", "d", "confirmed")
+        photo(app, "left", "gone", "registered") // shot, then its point was deleted before it reached OneDrive
+        val res = client.post("/api/jobs/$job/finish") { bearerAuth(tokenFor("sam")) }
+        assertEquals(HttpStatusCode.OK, res.status)
+        assertEquals(FinishResult(true), FmxJson.decodeFromString(FinishResult.serializer(), res.bodyAsText()))
+        assertEquals("finished", jobStatus(app))
+    }
+
     private fun jobStatus(app: TestApp) = app.ctx.db.read {
         createStatement().use { st -> st.executeQuery("SELECT status FROM jobs WHERE id = '$job'").use { it.next(); it.getString(1) } }
     }

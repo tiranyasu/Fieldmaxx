@@ -1,0 +1,17 @@
+<!--
+  The server's logging (docker compose logs app). INFO and up, one line each: what the owner can send to the developer
+  without library chatter. PDFBox and FontBox (reading job files) only say something when it is wrong. Without this file
+  logback logs everything at DEBUG.
+-->
+<configuration>
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+    <logger name="org.apache.pdfbox" level="WARN"/>
+    <logger name="org.apache.fontbox" level="WARN"/>
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>

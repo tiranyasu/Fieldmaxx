@@ -12,6 +12,7 @@ import com.fieldmaxx.core.model.PhotoStatus
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.server.ops.OpsRequest
 import com.fieldmaxx.server.ops.OpsResponse
+import com.fieldmaxx.server.release.latestRelease
 import com.fieldmaxx.server.release.publishApk
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.get
@@ -29,6 +30,7 @@ import java.security.MessageDigest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.serialization.builtins.ListSerializer
@@ -98,6 +100,33 @@ class AdminTest {
         assertEquals(30L, h.phoneToConfirmedMedianS)
         assertEquals(4L, h.uploadMedianS)
         assertTrue(h.diskUsedPct in 0..100)
+    }
+
+    /** I2: Delivery health lists only photos someone can still deliver: none of a deleted point, none of a deleted job. */
+    @Test fun healthSkipsPhotosOfDeletedPointsAndJobs() = TestApp().run { app ->
+        seed(app)
+        app.ctx.db.tx {
+            createStatement().use {
+                it.execute("INSERT INTO jobs(id, name, status, created_by, created_at, deleted_at) VALUES ('job-3','Run 3','active','x',0,5)")
+                for ((pt, job, deleted) in listOf(Triple("pt-gone", "job-1", "5"), Triple("pt-3", "job-3", "NULL"))) {
+                    it.execute(
+                        "INSERT INTO points(id, job_id, layer, type, num, label, lat, lon, description, status, created_at, updated_at, deleted_at) " +
+                            "VALUES ('$pt','$job','POLE','POLE','9','POLE 9',39.6,-119.7,'','open',0,0,$deleted)",
+                    )
+                }
+            }
+        }
+        photo(app, "live", "registered", takenAt = 1)
+        photo(app, "of-gone-point", "stuck", takenAt = 2, attempts = 6)
+        photo(app, "of-gone-job", "registered", takenAt = 3)
+        app.ctx.db.tx {
+            createStatement().use {
+                it.execute("UPDATE photos SET point_id = 'pt-gone' WHERE id = 'of-gone-point'")
+                it.execute("UPDATE photos SET job_id = 'job-3', point_id = 'pt-3' WHERE id = 'of-gone-job'")
+            }
+        }
+        val h = FmxJson.decodeFromString(HealthReport.serializer(), getAs(tokenFor("boss", Role.admin), "/api/admin/health").bodyAsText())
+        assertEquals(listOf("live"), h.photos.map { it.id })
     }
 
     @Test fun healthMediansNullWhenNothingConfirmed() = TestApp().run { app ->
@@ -288,8 +317,8 @@ class AdminTest {
         val v1 = ByteArray(5000) { (it % 251).toByte() }
         val v2 = ByteArray(7000) { (it % 13).toByte() }
         val f2 = apk(v2); val f1 = apk(v1)
-        publishApk(app.ctx, f2, 12, "1.2.0")
         publishApk(app.ctx, f1, 9, "0.9.0")
+        publishApk(app.ctx, f2, 12, "1.2.0")
         val latest = FmxJson.decodeFromString(AppRelease.serializer(), getAs(tech, "/api/app/latest").bodyAsText())
         assertEquals(12, latest.versionCode); assertEquals("1.2.0", latest.versionName)
         assertEquals("http://localhost/app/fieldmaxx-1.2.0.apk", latest.url)
@@ -306,6 +335,29 @@ class AdminTest {
         assertEquals(HttpStatusCode.NotFound, client.get("/app/fieldmaxx-..%2F..%2Fx.apk").status)
         // Re-publishing a version code is refused.
         assertTrue(runCatching { publishApk(app.ctx, f1, 12, "1.2.1") }.isFailure)
+    }
+
+    /** R91: a version code at or below the highest published is refused, saying which is highest; nothing is kept. */
+    @Test fun publishRefusesAVersionCodeNotAboveTheHighest() = TestApp().run { app ->
+        publishApk(app.ctx, apk(byteArrayOf(1)), 12, "1.2.0")
+        for ((code, name) in listOf(12 to "1.2.1", 11 to "1.1.9", 3 to "0.3.0")) {
+            val e = assertFailsWith<IllegalArgumentException> { publishApk(app.ctx, apk(byteArrayOf(2)), code, name) }
+            assertEquals(
+                "Version code $code is not higher than 12, the highest already published. The phones only update to a higher one: " +
+                    "use 13 or more.",
+                e.message,
+            )
+            assertTrue(!Files.exists(app.ctx.config.dataDir.resolve("apk/fieldmaxx-$name.apk")), "the copy of $name is removed")
+        }
+        val lines = mutableListOf<String>()
+        assertEquals(CliResult.Failed, runCli(arrayOf("publish-apk", apk(byteArrayOf(3)).toString(), "7", "0.7.0"), app.ctx, emptyMap(), lines::add))
+        assertEquals(
+            "Could not publish: Version code 7 is not higher than 12, the highest already published. The phones only update to a higher one: use 13 or more.",
+            lines.single(),
+        )
+        assertEquals(listOf(12), app.ctx.db.read { createStatement().use { st -> st.executeQuery("SELECT version_code FROM app_releases").use { buildList { while (it.next()) add(it.getInt(1)) } } } })
+        publishApk(app.ctx, apk(byteArrayOf(4)), 13, "1.3.0")
+        assertEquals(13, latestRelease(app.ctx)?.versionCode)
     }
 
     @Test fun publishApkCli() = TestApp().run { app ->

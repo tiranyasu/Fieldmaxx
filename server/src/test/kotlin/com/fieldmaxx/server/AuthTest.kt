@@ -166,6 +166,33 @@ class AuthTest {
         assertEquals(HttpStatusCode.NotFound, client.json("/api/admin/users/nope", """{"disabled":true}""", admin, patch = true).status)
     }
 
+    /** R92: the last active admin can't be disabled or made a tech, so nobody is locked out of the admin screens. */
+    @Test fun lastActiveAdminIsNeverDisabledOrDemoted() = TestApp().run { _ ->
+        val boss = tokenFor("boss", Role.admin)
+        val bossId = client.me(boss).obj().getValue("user").jsonObject.getValue("id").jsonPrimitive.content
+        val refused = "Fieldmaxx needs at least one active admin. Make another user an admin first, then change this one."
+        for (change in listOf("""{"disabled":true}""", """{"role":"tech"}""", """{"role":"tech","displayName":"Boss B"}""")) {
+            val r = client.json("/api/admin/users/$bossId", change, boss, patch = true)
+            assertEquals(HttpStatusCode.Conflict, r.status, change)
+            assertEquals(refused, r.obj().getValue("error").jsonPrimitive.content)
+        }
+        val me = client.me(boss).obj().getValue("user").jsonObject
+        assertEquals(listOf("admin", "false", "Boss"), listOf("role", "disabled", "displayName").map { me.getValue(it).jsonPrimitive.content }, "nothing changed")
+        assertEquals(HttpStatusCode.OK, client.json("/api/admin/users/$bossId", """{"displayName":"The Boss","disabled":false}""", boss, patch = true).status)
+
+        // A second active admin: then either may go, and the one left is the last again.
+        val created = client.json("/api/admin/users", """{"username":"deputy","displayName":"Deputy","password":"deputy-pass-1","role":"admin"}""", boss)
+        val deputyId = created.obj().getValue("id").jsonPrimitive.content
+        val disabledAdmin = client.json("/api/admin/users", """{"username":"old","displayName":"Old","password":"old-pass-12","role":"admin"}""", boss)
+        val oldId = disabledAdmin.obj().getValue("id").jsonPrimitive.content
+        assertEquals(HttpStatusCode.OK, client.json("/api/admin/users/$oldId", """{"disabled":true}""", boss, patch = true).status)
+        assertEquals(HttpStatusCode.OK, client.json("/api/admin/users/$bossId", """{"role":"tech"}""", boss, patch = true).status)
+        val deputy = client.login("deputy", "deputy-pass-1").obj().getValue("token").jsonPrimitive.content
+        val last = client.json("/api/admin/users/$deputyId", """{"disabled":true}""", deputy, patch = true)
+        assertEquals(HttpStatusCode.Conflict, last.status, "a disabled admin doesn't count")
+        assertEquals(refused, last.obj().getValue("error").jsonPrimitive.content)
+    }
+
     @Test fun duplicateUsername409() = TestApp().run { _ ->
         val admin = tokenFor("boss", Role.admin)
         val body = """{"username":"joe","displayName":"Joe","password":"first-pass-1"}"""
