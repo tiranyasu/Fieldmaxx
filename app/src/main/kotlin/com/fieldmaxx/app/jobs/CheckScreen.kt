@@ -103,7 +103,8 @@ fun CheckScreen(model: NewJobModel, api: Api, onBack: () -> Unit) {
                 colors = fmxBarColors(),
             )
         },
-        bottomBar = { SaveBar(model, s, onSave = { if (model.isNew && model.link.isBlank()) askNoLink = true else model.save() }) },
+        // A locked retry resends the draft exactly as it was first sent: its link (or none) was settled then.
+        bottomBar = { SaveBar(model, s, onSave = { if (model.isNew && model.link.isBlank() && !model.unsure) askNoLink = true else model.save() }) },
     ) { padding ->
         LazyColumn(
             Modifier.fillMaxSize().padding(padding).imePadding().testTag(CheckTags.LIST),

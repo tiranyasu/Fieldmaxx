@@ -563,6 +563,32 @@ class JobsScreensTest {
         assertEquals(1, api.createKeys.toSet().size, "every try of the draft sends one key: ${api.createKeys}")
     }
 
+    @Test fun lockedRetryResendsWithoutAskingAgain() {
+        val file = SharedFilesProvider.share("90", "A05J9XE.pdf", PDF_BYTES)
+        api.importReply = { name, _ -> preview((1..7).map { draft("POLE $it") }, fileName = name) }
+        var done: String? = null
+        compose.setContent {
+            FieldmaxxTheme {
+                NewJobScreen(api, openJob = {}, addToJobId = null, sharedFiles = listOf(file), sharedLink = null, onDone = { done = it }, onBack = {})
+            }
+        }
+        waitForText("Found 7 POLE points")
+
+        api.createError = IOException("no signal") // sent; whether it arrived is unknown
+        compose.onNodeWithTag(CheckTags.SAVE).performClick()
+        compose.onNodeWithText("Save without link").performClick()
+        waitForText(SAVE_UNSURE)
+
+        // The draft went without a link and stays as it was sent: the retry doesn't ask again.
+        api.createError = null
+        compose.onNodeWithTag(CheckTags.SAVE).performClick()
+        waitFor { done != null }
+        compose.onAllNodesWithText(PHOTOS_WILL_WAIT).assertCountEquals(0)
+        assertNull(api.created.single().fieldNotesUrl)
+        assertEquals(2, api.createKeys.size)
+        assertEquals(1, api.createKeys.toSet().size, "both tries carry the draft's key")
+    }
+
     @Test fun draftKeyOutlivesTheScreen() {
         fun model(a: ComponentActivity) = ViewModelProvider(
             a, viewModelFactory { initializer { NewJobModel(createSavedStateHandle(), api, a.contentResolver, {}, null, null) } },
