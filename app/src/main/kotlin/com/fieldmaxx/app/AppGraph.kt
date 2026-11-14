@@ -2,6 +2,8 @@ package com.fieldmaxx.app
 
 import android.content.Context
 import androidx.annotation.VisibleForTesting
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
 import coil3.ImageLoader
 import coil3.disk.DiskCache
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
@@ -23,6 +25,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -83,9 +87,21 @@ class AppGraph(context: Context, val vault: TokenVault = AndroidKeystoreTokenVau
         }
     }
 
-    /** While ops wait in the outbox, a background flush is lined up for when there's a network. */
+    /**
+     * While ops wait in the outbox, a background flush is lined up for when there's a network. An op that comes while a
+     * flush is running may miss that flush, which then ends without it (KEEP leaves the running flush in place), so the
+     * outbox is checked again once that run is over. Once per change, so a flush paused on sign-in can't loop.
+     */
     private fun watchOutbox() {
-        scope.launch { db.outbox().observeCount().collect { if (it > 0) OutboxWorker.enqueue(app) } }
+        scope.launch {
+            db.outbox().observeCount().collectLatest { count ->
+                if (count == 0) return@collectLatest
+                OutboxWorker.enqueue(app)
+                WorkManager.getInstance(app).getWorkInfosForUniqueWorkFlow(OutboxWorker.NAME)
+                    .first { runs -> runs.none { it.state == WorkInfo.State.RUNNING } }
+                if (db.outbox().count() > 0) OutboxWorker.enqueue(app)
+            }
+        }
     }
 
     /**

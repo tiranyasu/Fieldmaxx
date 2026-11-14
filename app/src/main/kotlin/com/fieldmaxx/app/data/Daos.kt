@@ -83,6 +83,9 @@ interface OutboxDao {
     suspend fun delete(seqs: List<Long>)
 
     @Query("SELECT COUNT(*) FROM OutboxEntity")
+    suspend fun count(): Int
+
+    @Query("SELECT COUNT(*) FROM OutboxEntity")
     fun observeCount(): Flow<Int>
 }
 

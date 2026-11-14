@@ -4,9 +4,12 @@ import android.content.Context
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.Configuration
+import androidx.work.CoroutineWorker
 import androidx.work.NetworkType
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
+import androidx.work.WorkerFactory
+import androidx.work.WorkerParameters
 import androidx.work.testing.SynchronousExecutor
 import androidx.work.testing.WorkManagerTestInitHelper
 import coil3.SingletonImageLoader
@@ -34,6 +37,7 @@ import java.io.IOException
 import java.util.Base64
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -49,6 +53,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
@@ -265,6 +270,67 @@ class SyncEngineTest {
                 assertEquals(emptyList(), graph.db.outbox().all())
             }
             assertEquals(1, server.requestCount, "ops only: no positions, no socket")
+        } finally {
+            graph.close()
+            WorkManagerTestInitHelper.closeWorkDatabase()
+            server.shutdown()
+        }
+    }
+
+    @Test fun opQueuedAsABackgroundFlushEndsGetsAnotherFlush() {
+        val server = MockWebServer()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val sent = FmxJson.parseToJsonElement(request.body.readUtf8()).jsonObject.getValue("ops").jsonArray
+                val results = FmxJson.decodeFromJsonElement(ListSerializer(Op.serializer()), sent).map { OpResult(it.opId, true) }
+                val body = FmxJson.encodeToString(ListSerializer(OpResult.serializer()), results)
+                return MockResponse().setHeader("Content-Type", "application/json").setBody("""{"results":$body}""")
+            }
+        }
+        server.start()
+        val app = context as FieldmaxxApp
+        val runs = AtomicInteger()
+        // The first background flush ends just as a photo step queues its result: past the flush's last look at the outbox.
+        val workers = object : WorkerFactory() {
+            override fun createWorker(appContext: Context, workerClassName: String, workerParameters: WorkerParameters) =
+                object : CoroutineWorker(appContext, workerParameters) {
+                    override suspend fun doWork(): Result {
+                        val result = OutboxWorker(appContext, workerParameters).doWork()
+                        if (runs.incrementAndGet() == 1) {
+                            app.graph.sync.enqueue(Op.PhotoFailed("op-2", "ph-2", "Read timed out", 1))
+                            delay(300) // still running while the outbox reports the new op
+                        }
+                        return result
+                    }
+                }
+        }
+        WorkManagerTestInitHelper.initializeTestWorkManager(
+            context, Configuration.Builder().setExecutor(SynchronousExecutor()).setWorkerFactory(workers).build(),
+        )
+        val graph = AppGraph(app, InMemoryTokenVault("tok-w")).also { app.graph = it }
+        graph.server.set(server.url("/").toString().trimEnd('/'))
+        val workManager = WorkManager.getInstance(context)
+        val driver = WorkManagerTestInitHelper.getTestDriver(context)!!
+        suspend fun queued(except: java.util.UUID? = null): WorkInfo {
+            var found: WorkInfo? = null
+            awaitTrue("a background flush lined up") {
+                found = workManager.getWorkInfosForUniqueWork(OutboxWorker.NAME).get().firstOrNull { it.id != except && it.state == WorkInfo.State.ENQUEUED }
+                found != null
+            }
+            return found!!
+        }
+        try {
+            runBlocking {
+                graph.sync.enqueue(Op.PhotoFailed("op-1", "ph-1", "Read timed out", 1))
+                val first = queued()
+                driver.setAllConstraintsMet(first.id)
+                awaitTrue("the first flush done") { workManager.getWorkInfoById(first.id).get()?.state == WorkInfo.State.SUCCEEDED }
+
+                val second = queued(except = first.id)
+                driver.setAllConstraintsMet(second.id)
+                graph.db.outbox().observeCount().await { it == 0 }
+            }
+            assertEquals(2, server.requestCount, "op-1, then op-2")
         } finally {
             graph.close()
             WorkManagerTestInitHelper.closeWorkDatabase()
