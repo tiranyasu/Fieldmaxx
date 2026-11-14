@@ -15,6 +15,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge(SystemBarStyle.dark(Color.TRANSPARENT), SystemBarStyle.dark(Color.TRANSPARENT))
         super.onCreate(savedInstanceState)
         val graph = (application as FieldmaxxApp).graph
+        graph.tracker // starts watching the app's lifecycle for location (foreground only)
         setContent {
             FieldmaxxTheme { FieldmaxxNav(graph) }
         }

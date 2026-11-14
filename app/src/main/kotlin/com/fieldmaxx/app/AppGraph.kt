@@ -10,12 +10,18 @@ import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import coil3.request.CachePolicy
 import coil3.request.ImageRequest
 import com.fieldmaxx.app.data.AppDatabase
+import androidx.lifecycle.ProcessLifecycleOwner
 import com.fieldmaxx.app.net.AndroidKeystoreTokenVault
 import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.AuthInterceptor
 import com.fieldmaxx.app.net.OkHttpApi
 import com.fieldmaxx.app.net.ServerAddress
 import com.fieldmaxx.app.net.TokenVault
+import com.fieldmaxx.app.platform.CompassSource
+import com.fieldmaxx.app.platform.ForegroundTracker
+import com.fieldmaxx.app.platform.FusedLocationSource
+import com.fieldmaxx.app.platform.LocationSource
+import com.fieldmaxx.app.platform.SensorCompassSource
 import com.fieldmaxx.app.sync.LiveSocket
 import com.fieldmaxx.app.sync.OutboxWorker
 import com.fieldmaxx.app.sync.SyncEngine
@@ -59,6 +65,18 @@ class AppGraph(context: Context, val vault: TokenVault = AndroidKeystoreTokenVau
 
     /** The live socket to the server; it only carries frames (positions are sent by the screen that owns location). */
     val live: LiveSocket by lazy { LiveSocket(http, { liveSocketUrl(server.get()) }, vault::load) }
+
+    /** The map and the camera stamp read these; they only produce values while the app is on screen. */
+    val location: LocationSource by lazy { FusedLocationSource(app) }
+    val compass: CompassSource by lazy { SensorCompassSource(app) }
+
+    /**
+     * Starts and stops location and compass with the process lifecycle and shares the position over [live]. Must be touched
+     * once at startup ([MainActivity] does) or nothing observes the lifecycle.
+     */
+    val tracker: ForegroundTracker by lazy {
+        ForegroundTracker(ProcessLifecycleOwner.get().lifecycle, location, compass, live, System::currentTimeMillis, scope)
+    }
 
     val sync: SyncEngine by lazy {
         SyncEngine(api, db, live, scope, System::currentTimeMillis, server::get) { urls -> prefetch(urls) }

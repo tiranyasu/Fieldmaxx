@@ -105,6 +105,8 @@ dependencies {
     implementation(libs.androidx.room.ktx)
     ksp(libs.androidx.room.compiler)
     implementation(libs.androidx.work.runtime)
+    implementation(libs.androidx.lifecycle.process)
+    implementation(libs.play.services.location)
     implementation(libs.coil)
     implementation(libs.coil.network.okhttp)
     debugImplementation(libs.androidx.compose.ui.test.manifest) // the empty activity createComposeRule() launches
@@ -118,4 +120,5 @@ dependencies {
     testImplementation(libs.okhttp.mockwebserver)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.androidx.work.testing)
+    testImplementation(libs.androidx.lifecycle.runtime.testing)
 }
