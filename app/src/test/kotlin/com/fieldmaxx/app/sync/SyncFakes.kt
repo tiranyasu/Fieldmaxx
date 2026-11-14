@@ -1,5 +1,14 @@
 package com.fieldmaxx.app.sync
 
+import android.content.Context
+import android.database.sqlite.SQLiteException
+import androidx.room.Room
+import androidx.sqlite.db.SupportSQLiteDatabase
+import androidx.sqlite.db.SupportSQLiteOpenHelper
+import androidx.sqlite.db.SupportSQLiteStatement
+import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
+import com.fieldmaxx.app.data.AppDatabase
+import com.fieldmaxx.app.data.LocalPhotoEntity
 import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.ApiException
 import com.fieldmaxx.core.model.Change
@@ -90,6 +99,9 @@ class FakeApi : Api by unused() {
 
     /** Set to hold every since-fetch until the test completes it. */
     @Volatile var changesGate: CompletableDeferred<Unit>? = null
+
+    /** Set to hold the ops' answer (the batch is recorded as sent at once) until the test completes it. */
+    @Volatile var opsGate: CompletableDeferred<Unit>? = null
     @Volatile var snapshotError: Exception? = null
     @Volatile var positionsError: Exception? = null
 
@@ -98,6 +110,12 @@ class FakeApi : Api by unused() {
     fun record(changes: List<Change>) = synchronized(log) {
         log += changes
         head = maxOf(head, changes.maxOf { it.seq })
+    }
+
+    /** The server is restored from a backup taken at [seq]: later changes are gone. */
+    fun restoreTo(seq: Long) = synchronized(log) {
+        log.removeAll { it.seq > seq }
+        head = seq
     }
 
     override suspend fun changes(since: Long): Pair<List<Change>, Long> {
@@ -112,6 +130,7 @@ class FakeApi : Api by unused() {
 
     override suspend fun ops(ops: List<Op>): List<OpResult> {
         sentBatches += ops
+        opsGate?.await()
         return opsReply(ops)
     }
 
@@ -131,8 +150,11 @@ private fun unused(): Api = Proxy.newProxyInstance(Api::class.java.classLoader, 
     throw UnsupportedOperationException("Api.${method.name} is not part of sync")
 } as Api
 
-/** The engine's socket, driven by the test as the server would. */
-class FakeLiveSocket : LiveSocket {
+/**
+ * The engine's socket, driven by the test as the server would. With [dropOnClose] false, a [close] isn't reflected in
+ * [connected] yet, as when the socket reports its state late.
+ */
+class FakeLiveSocket(private val dropOnClose: Boolean = true) : LiveSocket {
     private val frames = MutableSharedFlow<ServerMessage>()
     override val messages: SharedFlow<ServerMessage> = frames
     override val connected = MutableStateFlow(false)
@@ -149,7 +171,7 @@ class FakeLiveSocket : LiveSocket {
 
     override fun close() {
         closes.incrementAndGet()
-        connected.value = false
+        if (dropOnClose) connected.value = false
     }
 
     override fun send(m: ClientMessage) {
@@ -174,5 +196,69 @@ class FakeLiveSocket : LiveSocket {
         withTimeout(5_000) { connects.first { it > 0 } }
         connected.value = false
         signOut.emit(Unit)
+    }
+}
+
+/** A photo this phone took, as the photo pipeline keeps it. */
+fun localPhoto(id: String, pointId: String = "p1", jobId: String = "j1") = LocalPhotoEntity(
+    id = id, jobId = jobId, pointId = pointId, originalPath = "/photos/$id.jpg", stampedPath = null, metaJson = "{}",
+    state = "saved", fileName = null, oneDriveUploadId = null, oneDriveOffset = 0, createdThisFile = false, backupOffset = 0,
+    backupDone = false, attempts = 0, nextAttemptAt = 0, lastError = null, stuck = false, createdAt = 1, confirmedAt = null,
+)
+
+/**
+ * An in-memory database where the next write of the meta row [killAtMetaKey] fails, as if the app were killed at that
+ * moment: whatever that write's transaction holds is lost, and whatever committed before stays.
+ */
+class KillableDb(context: Context) {
+    @Volatile var killAtMetaKey: String? = null
+
+    val db: AppDatabase = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+        .openHelperFactory { config -> Helper(FrameworkSQLiteOpenHelperFactory().create(config)) }
+        .build()
+
+    private inner class Helper(private val d: SupportSQLiteOpenHelper) : SupportSQLiteOpenHelper by d {
+        override val writableDatabase: SupportSQLiteDatabase get() = Db(d.writableDatabase)
+        override val readableDatabase: SupportSQLiteDatabase get() = Db(d.readableDatabase)
+    }
+
+    private inner class Db(private val d: SupportSQLiteDatabase) : SupportSQLiteDatabase by d {
+        override fun compileStatement(sql: String): SupportSQLiteStatement = Statement(d.compileStatement(sql), sql)
+    }
+
+    private inner class Statement(private val s: SupportSQLiteStatement, private val sql: String) : SupportSQLiteStatement by s {
+        private val texts = HashMap<Int, String>()
+
+        override fun bindString(index: Int, value: String) {
+            texts[index] = value
+            s.bindString(index, value)
+        }
+
+        override fun clearBindings() {
+            texts.clear()
+            s.clearBindings()
+        }
+
+        override fun execute() {
+            killHere()
+            s.execute()
+        }
+
+        override fun executeInsert(): Long {
+            killHere()
+            return s.executeInsert()
+        }
+
+        override fun executeUpdateDelete(): Int {
+            killHere()
+            return s.executeUpdateDelete()
+        }
+
+        private fun killHere() {
+            val key = killAtMetaKey ?: return
+            if ("MetaEntity" !in sql || key !in texts.values) return
+            killAtMetaKey = null
+            throw SQLiteException("killed while writing $key")
+        }
     }
 }

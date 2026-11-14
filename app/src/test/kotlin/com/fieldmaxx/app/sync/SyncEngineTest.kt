@@ -17,6 +17,7 @@ import coil3.annotation.DelicateCoilApi
 import com.fieldmaxx.app.AppGraph
 import com.fieldmaxx.app.FieldmaxxApp
 import com.fieldmaxx.app.data.AppDatabase
+import com.fieldmaxx.app.data.MetaEntity
 import com.fieldmaxx.app.data.toOp
 import com.fieldmaxx.app.data.toOutbox
 import com.fieldmaxx.app.net.ApiException
@@ -42,6 +43,7 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFails
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -73,6 +75,8 @@ import okio.Buffer
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 
+private const val SERVER = "https://fmx.example.com"
+
 @RunWith(RobolectricTestRunner::class)
 class SyncEngineTest {
     private val context: Context = ApplicationProvider.getApplicationContext()
@@ -87,8 +91,8 @@ class SyncEngineTest {
     private val p1 = point("p1")
     private val p2 = point("p2")
 
-    private fun newEngine(database: AppDatabase = db, socket: LiveSocket = live) =
-        SyncEngine(api, database, socket, scope, clock::get).also { engines += it }
+    private fun newEngine(database: AppDatabase = db, socket: LiveSocket = live, server: () -> String = { SERVER }) =
+        SyncEngine(api, database, socket, scope, clock::get, server).also { engines += it }
 
     @AfterTest fun tearDown() {
         engines.forEach { it.stop() }
@@ -342,6 +346,135 @@ class SyncEngineTest {
 
     // ---- controller rulings ----
 
+    @Test fun opInFlightOverANewerWriteEndsOnTheWinner() = runBlocking {
+        val engine = newEngine()
+        engine.openSeededJob(seq = 10)
+        val answer = CompletableDeferred<Unit>().also { api.opsGate = it }
+        engine.start(ALICE)
+        engine.enqueue(Op.PointUpdate("op-1", "p1", comment = "mine"))
+        awaitTrue("the batch in flight") { api.sentBatches.isNotEmpty() }
+
+        // The server took ours (11), then another tech's write to the same field (12), and 12 reaches the phone first.
+        val theirs = p1.copy(comment = "theirs", updatedBy = "u2", updatedAt = 900)
+        api.record(pointChange(11, p1.copy(comment = "mine", updatedBy = ALICE.id, updatedAt = 800)))
+        api.snapshots["j1"] = snapshot(j1, listOf(theirs, p2), seq = 12)
+        serverChange(pointChange(12, theirs))
+        awaitTrue("their change applied") { db.points().get("p1")?.seq == 12L }
+        assertEquals("mine", engine.points("j1").first().first().comment, "ours, still unanswered, applied again on top (R16)")
+        answer.complete(Unit)
+
+        engine.points("j1").await { pts -> pts.first().comment == "theirs" }
+        assertEquals(listOf("j1", "j1"), api.snapshotCalls.toList(), "opened, then fetched again once the answer came")
+        assertEquals(emptyList(), outboxIds())
+    }
+
+    @Test fun ownChangeLandingInFlightNeedsNoNewSnapshot() = runBlocking {
+        val engine = newEngine()
+        engine.openSeededJob(seq = 10)
+        val answer = CompletableDeferred<Unit>().also { api.opsGate = it }
+        engine.start(ALICE)
+        engine.enqueue(Op.PointUpdate("op-1", "p1", comment = "mine"))
+        awaitTrue("the batch in flight") { api.sentBatches.isNotEmpty() }
+
+        // Our own write comes back over the socket before the answer, as it usually does.
+        val ours = p1.copy(comment = "mine", updatedBy = ALICE.id, updatedAt = 800)
+        serverChange(pointChange(11, ours))
+        awaitTrue("the change applied") { db.points().get("p1")?.seq == 11L }
+        answer.complete(Unit)
+
+        db.outbox().observeCount().await { it == 0 }
+        engine.enqueue(Op.PointUpdate("op-2", "p2", comment = "next")) // goes out after the answer was handled
+        db.outbox().observeCount().await { it == 0 }
+        assertEquals(listOf("j1"), api.snapshotCalls.toList(), "the server already has our value: no snapshot needed")
+        assertEquals("mine", engine.points("j1").first().first().comment)
+    }
+
+    @Test fun snapshotAndItsLastSeqRewindLandTogether() = runBlocking {
+        val killable = KillableDb(context)
+        try {
+            killable.db.meta().put(MetaEntity("lastSeq", "20"))
+            val engine = newEngine(database = killable.db)
+            api.snapshots["j1"] = snapshot(j1, listOf(p1, p2), seq = 12) // read before changes 13..20 reached the phone
+
+            killable.killAtMetaKey = "lastSeq"
+            assertFails { engine.openJob("j1") }
+
+            val stored = killable.db.meta().get("extras:j1") != null
+            val lastSeq = killable.db.meta().get("lastSeq")?.toLong()
+            assertFalse(stored && lastSeq!! > 12, "a stored job never sits under a lastSeq that skips its changes")
+            engine.openJob("j1") // the next try
+            assertEquals("12", killable.db.meta().get("lastSeq"))
+            assertEquals(listOf("p1", "p2"), engine.points("j1").first().map { it.id })
+        } finally {
+            engines.forEach { it.stop() }
+            scope.coroutineContext.job.cancelAndJoin()
+            killable.db.close()
+        }
+    }
+
+    @Test fun statusIsOfflineWhenAuthRequiredIsHeard() = runBlocking {
+        val socket = FakeLiveSocket(dropOnClose = false)
+        val engine = newEngine(socket = socket)
+        engine.openSeededJob()
+        api.opsReply = { throw ApiException(401, "Sign in required") }
+        var heard: SyncStatus? = null
+        // Unconfined: the listener runs the moment authRequired is emitted, as a quick screen would.
+        val listener = launch(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
+            engine.authRequired.first()
+            heard = engine.status.value
+        }
+        engine.start(ALICE)
+        socket.connects.await { it > 0 }
+        engine.enqueue(Op.PointUpdate("op-1", "p1", comment = "x"))
+
+        withTimeout(5_000) { listener.join() }
+        assertEquals(SyncStatus.OFFLINE, heard)
+    }
+
+    @Test fun anotherServerAddressStartsAFreshCache() = runBlocking {
+        var address = "https://old.example.com"
+        val engine = newEngine(server = { address })
+        api.opsReply = { throw IOException("no signal") }
+        engine.start(ALICE)
+        engine.openSeededJob(seq = 10)
+        live.serverSends(ServerMessage.Hello(10))
+        awaitTrue("caught up") { db.meta().get("lastSeq") == "10" }
+        engine.enqueue(Op.PointUpdate("op-1", "p1", comment = "kept"))
+        db.localPhotos().upsert(localPhoto("lp-1"))
+
+        // Signed in again, to another server: its j1 is another job.
+        engine.stop()
+        address = "https://new.example.com"
+        api.restoreTo(3)
+        api.snapshots["j1"] = snapshot(job("j1", "A05K51V"), listOf(point("q7")), seq = 3)
+        engine.start(ALICE)
+        live.serverSends(ServerMessage.Hello(3))
+
+        engine.points("j1").await { pts -> pts.map { it.id } == listOf("q7") }
+        assertEquals("A05K51V", engine.job("j1").first()?.name)
+        awaitTrue("lastSeq follows the new server") { db.meta().get("lastSeq") == "3" }
+        assertEquals(listOf("op-1"), outboxIds(), "the outbox stays")
+        assertNotNull(db.localPhotos().get("lp-1"), "photos taken here stay")
+        assertEquals(ALICE, engine.savedUser())
+    }
+
+    @Test fun serverRestoredFromABackupStartsAFreshCache() = runBlocking {
+        val engine = newEngine()
+        engine.start(ALICE)
+        engine.openSeededJob(seq = 10)
+        live.serverSends(ServerMessage.Hello(10))
+        awaitTrue("caught up") { db.meta().get("lastSeq") == "10" }
+
+        // The server comes back from a backup taken at seq 6: there j1 has only p1, with an older comment.
+        val restored = p1.copy(comment = "from the backup")
+        api.restoreTo(6)
+        api.snapshots["j1"] = snapshot(j1, listOf(restored), seq = 6)
+        live.serverReconnects(ServerMessage.Hello(6))
+
+        engine.points("j1").await { pts -> pts == listOf(restored) }
+        awaitTrue("lastSeq follows the restored server") { db.meta().get("lastSeq") == "6" }
+    }
+
     @Test fun olderChangeArrivingLateIsIgnored() = runBlocking {
         val engine = newEngine()
         engine.start(ALICE)
@@ -493,7 +626,7 @@ class SyncEngineTest {
 
     @Test fun openJobKeepsExtrasAndPrefetchesReferenceImages() = runBlocking {
         val asked = CopyOnWriteArrayList<List<String>>()
-        val engine = SyncEngine(api, db, live, scope, clock::get, server = { "https://fmx.example.com" }) { urls -> asked += urls }
+        val engine = SyncEngine(api, db, live, scope, clock::get, server = { SERVER }) { urls -> asked += urls }
             .also { engines += it }
         val refs = listOf(RefImageInfo("imp-1-page-1", "page", 1), RefImageInfo("imp-1-item-3", "item", null))
         val files = listOf(JobFileInfo("f1", "A05J9XE.pdf", "POLE"))

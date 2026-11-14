@@ -19,6 +19,9 @@ interface JobDao {
 
     @Upsert
     suspend fun upsert(job: JobEntity)
+
+    @Query("DELETE FROM JobEntity")
+    suspend fun deleteAll()
 }
 
 @Dao
@@ -41,6 +44,9 @@ interface PointDao {
     /** At most a few hundred ids per call (SQLite's bound-parameter limit is 999 on older Android). */
     @Query("DELETE FROM PointEntity WHERE id IN (:ids)")
     suspend fun delete(ids: List<String>)
+
+    @Query("DELETE FROM PointEntity")
+    suspend fun deleteAll()
 }
 
 @Dao
@@ -66,6 +72,9 @@ interface PhotoInfoDao {
     /** At most a few hundred ids per call, as [PointDao.delete]. */
     @Query("DELETE FROM PhotoInfoEntity WHERE id IN (:ids)")
     suspend fun delete(ids: List<String>)
+
+    @Query("DELETE FROM PhotoInfoEntity")
+    suspend fun deleteAll()
 }
 
 @Dao
@@ -102,6 +111,12 @@ interface MetaDao {
 
     @Query("SELECT `key` FROM MetaEntity WHERE substr(`key`, 1, length(:prefix)) = :prefix")
     suspend fun keysStartingWith(prefix: String): List<String>
+
+    @Query("DELETE FROM MetaEntity WHERE `key` = :key")
+    suspend fun delete(key: String)
+
+    @Query("DELETE FROM MetaEntity WHERE substr(`key`, 1, length(:prefix)) = :prefix")
+    suspend fun deleteStartingWith(prefix: String)
 }
 
 @Dao

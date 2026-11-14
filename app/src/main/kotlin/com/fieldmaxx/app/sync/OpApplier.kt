@@ -26,6 +26,9 @@ internal object MetaKeys {
     const val USER = "user"
     const val LAST_SEQ = "lastSeq"
 
+    /** The server address the cached server state came from (it belongs to that server's history). */
+    const val SERVER = "server"
+
     /** A job's [JobExtras]; the row also marks that the job's snapshot is stored on this phone. */
     const val EXTRAS = "extras:"
     fun extras(jobId: String) = EXTRAS + jobId
@@ -46,23 +49,28 @@ private const val DELETE_CHUNK = 500
  *
  * Server state goes through a seq gate: a change only replaces a row it is newer than, a snapshot only rows no newer than
  * it. After server state lands on a point or photo, the ops still waiting in the outbox for it are applied again, in
- * outbox order, so an edit that hasn't reached the server yet stays on screen.
+ * outbox order, so an edit that hasn't reached the server yet stays on screen. An op already sent but not yet answered
+ * may have been taken by the server before a newer write that just landed; where applying it again changes the row,
+ * the job is reported, for a fresh snapshot once the answer is in (R24).
  */
 class OpApplier(private val db: AppDatabase, private val clock: () -> Long = System::currentTimeMillis) {
 
     suspend fun applyLocally(op: Op, userId: String, now: Long): Unit = db.withTransaction { apply(op, userId, now) }
 
-    suspend fun applyChange(c: Change): Unit = applyChanges(listOf(c))
+    suspend fun applyChange(c: Change) {
+        applyChanges(listOf(c))
+    }
 
     /**
      * Job changes always apply. Point and photo changes apply only to jobs whose snapshot is stored here: the rest arrive
-     * with [applySnapshot], so a point list is never partial.
+     * with [applySnapshot], so a point list is never partial. Returns the jobs where an op in [sent] (sent, not answered
+     * yet) changed the server state it was applied again on.
      */
-    suspend fun applyChanges(changes: List<Change>) {
-        if (changes.isEmpty()) return
-        db.withTransaction {
+    suspend fun applyChanges(changes: List<Change>, sent: Set<String> = emptySet()): Set<String> {
+        if (changes.isEmpty()) return emptySet()
+        return db.withTransaction {
             val stored = storedJobs()
-            val waiting = WaitingOps()
+            val waiting = WaitingOps(sent)
             for (c in changes) {
                 when (c.entity) {
                     "job" -> c.job?.let { job ->
@@ -73,28 +81,30 @@ class OpApplier(private val db: AppDatabase, private val clock: () -> Long = Sys
                         val row = db.points().get(p.id)
                         if (row == null || c.seq > row.seq) {
                             db.points().upsert(p.toEntity(c.seq))
-                            waiting.applyFor(pointId = p.id)
+                            waiting.applyFor(p.jobId, pointId = p.id)
                         }
                     }
                     "photo" -> c.photo?.takeIf { it.jobId in stored }?.let { ph ->
                         val row = db.photos().get(ph.id)
                         if (row == null || c.seq > row.seq) {
                             db.photos().upsert(ph.toEntity(c.seq))
-                            waiting.applyFor(photoId = ph.id)
+                            waiting.applyFor(ph.jobId, photoId = ph.id)
                         }
                     }
                     // Anything else is an entity this version doesn't know.
                 }
             }
+            waiting.moved
         }
     }
 
     /**
      * Stores a job's snapshot (taken at [JobSnapshot.seq]) and its extras. The job's rows the snapshot doesn't list are
      * gone on the server and are removed here too, unless they are newer than the snapshot; ops still waiting for the
-     * job are then applied again, which brings back a point this phone added that the server doesn't have yet.
+     * job are then applied again, which brings back a point this phone added that the server doesn't have yet. True when
+     * an op in [sent] changed the snapshot's state that way, as [applyChanges] reports.
      */
-    suspend fun applySnapshot(s: JobSnapshot): Unit = db.withTransaction {
+    suspend fun applySnapshot(s: JobSnapshot, sent: Set<String> = emptySet()): Boolean = db.withTransaction {
         val jobId = s.job.id
         val pointIds = s.points.mapTo(HashSet()) { it.id }
         val photoIds = s.photos.mapTo(HashSet()) { it.id }
@@ -118,10 +128,23 @@ class OpApplier(private val db: AppDatabase, private val clock: () -> Long = Sys
         val extras = JobExtras(s.refImages, s.files, s.crew)
         db.meta().put(MetaEntity(MetaKeys.extras(jobId), FmxJson.encodeToString(JobExtras.serializer(), extras)))
 
-        if (again.isNotEmpty()) {
-            val userId = savedUserId()
-            again.forEach { apply(it, userId, clock()) }
-        }
+        again.isNotEmpty() && reapply(again, savedUserId(), sent)
+    }
+
+    /**
+     * Clears every row of server state (jobs, points, photo infos, extras with their stored-job marks, lastSeq and the
+     * server it came from) in one transaction. The outbox, the photos taken here and the saved user stay. Returns the
+     * jobs whose snapshot was stored.
+     */
+    suspend fun clearServerState(): Set<String> = db.withTransaction {
+        val stored = storedJobs()
+        db.jobs().deleteAll()
+        db.points().deleteAll()
+        db.photos().deleteAll()
+        db.meta().deleteStartingWith(MetaKeys.EXTRAS)
+        db.meta().delete(MetaKeys.LAST_SEQ)
+        db.meta().delete(MetaKeys.SERVER)
+        stored
     }
 
     /** The job an op belongs to, by the rows on this phone; null when they aren't here. */
@@ -138,19 +161,43 @@ class OpApplier(private val db: AppDatabase, private val clock: () -> Long = Sys
     private suspend fun savedUserId(): String =
         db.meta().get(MetaKeys.USER)?.let { FmxJson.decodeFromString(User.serializer(), it).id }.orEmpty()
 
-    /** The outbox, read once per transaction and only if needed. */
-    private inner class WaitingOps {
+    /** The outbox, read once per transaction and only if needed; [moved] collects the jobs [reapply] reports. */
+    private inner class WaitingOps(private val sent: Set<String>) {
         private var ops: List<Op>? = null
         private var userId: String? = null
+        val moved = HashSet<String>()
 
-        suspend fun applyFor(pointId: String? = null, photoId: String? = null) {
+        suspend fun applyFor(jobId: String, pointId: String? = null, photoId: String? = null) {
             val all = ops ?: db.outbox().all().map { it.toOp() }.also { ops = it }
             val mine = all.filter { (pointId != null && it.targetPoint == pointId) || (photoId != null && it.targetPhoto == photoId) }
             if (mine.isEmpty()) return
             val uid = userId ?: savedUserId().also { userId = it }
-            mine.forEach { apply(it, uid, clock()) }
+            if (reapply(mine, uid, sent)) moved += jobId
         }
     }
+
+    /**
+     * Applies [ops] again, in outbox order. True when one already [sent] still changed its row: the server state it
+     * landed on doesn't have it, so the server took it before that state's write, or hasn't taken it yet.
+     */
+    private suspend fun reapply(ops: List<Op>, userId: String, sent: Set<String>): Boolean {
+        var changed = false
+        for (op in ops) {
+            if (op.opId !in sent) {
+                apply(op, userId, clock())
+                continue
+            }
+            val before = rowOf(op)
+            apply(op, userId, clock())
+            if (rowOf(op) != before) changed = true
+        }
+        return changed
+    }
+
+    /** The row [op] writes, for comparing; a point's updatedAt is left out, as applying an op sets it to this phone's clock. */
+    private suspend fun rowOf(op: Op): Any? =
+        op.targetPoint?.let { id -> db.points().get(id)?.toPoint()?.copy(updatedAt = 0) }
+            ?: op.targetPhoto?.let { id -> db.photos().get(id)?.toPhoto() }
 
     private suspend fun apply(op: Op, userId: String, now: Long) {
         fun Point.touched() = copy(updatedAt = now, updatedBy = userId)

@@ -99,9 +99,15 @@ private enum class Fetched { CAUGHT_UP, RETRY, PAUSED }
  *   background.
  * - Server changes come over the [live] socket. On every connection the engine fetches everything after `lastSeq`, the
  *   last change applied with none missing before it, page by page until a page comes back empty.
- * - A change replaces only a row it is newer than; ops not yet sent are applied again on top.
+ * - A change replaces only a row it is newer than; ops not yet answered are applied again on top. Where an op already
+ *   sent no longer matches the state that landed, the job is snapshotted again once the answer is in (R24).
  * - A job's points and photos arrive with its snapshot ([openJob]), never partially.
+ * - The cached server state belongs to one server history: state from another [server] address, or a Hello behind
+ *   lastSeq (a server restored from a backup), clears it; the outbox, the photos taken here and the saved user stay, and
+ *   the jobs that were stored are snapshotted again.
  * - A 401 anywhere (or the socket's 4401) pauses everything: socket closed, ops kept, [authRequired]. [start] resumes.
+ *
+ * [server] is the server's address: the history the cache belongs to, and where reference images come from.
  */
 class SyncEngine(
     private val api: Api,
@@ -109,7 +115,7 @@ class SyncEngine(
     private val live: LiveSocket,
     private val scope: CoroutineScope,
     private val now: () -> Long,
-    private val server: () -> String = { "" },
+    private val server: () -> String,
     private val prefetch: suspend (urls: List<String>) -> Unit = {},
 ) {
     private val _status = MutableStateFlow(SyncStatus.OFFLINE)
@@ -144,6 +150,8 @@ class SyncEngine(
     private val reconnected = Channel<Unit>(Channel.CONFLATED)
     private val catchUpPending = AtomicBoolean(false)
     private val staleJobs: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val sent: MutableSet<String> = ConcurrentHashMap.newKeySet() // op ids sent and not answered yet
+    private val moved: MutableSet<String> = ConcurrentHashMap.newKeySet() // jobs to snapshot again at the next answer; under applyLock
     private val busy = AtomicInteger()
     @Volatile private var waiting = UNKNOWN // ops in the outbox, while a session runs
     @Volatile private var flushDelayMs = BACKOFF_FIRST_MS
@@ -275,6 +283,8 @@ class SyncEngine(
         when (m) {
             is ServerMessage.Hello -> {
                 // A new connection: catch up from lastSeq (never from the Hello's seq), send what waits, refresh the crew.
+                // A server behind lastSeq has another history (restored from a backup), as has one at another address.
+                applyLock.withLock { if (otherServer() || m.seq < lastSeq()) resetCache() }
                 fetchAsked.trySend(Unit)
                 reconnected.trySend(Unit)
                 flushAsked.trySend(Unit)
@@ -293,8 +303,8 @@ class SyncEngine(
             session.also { session = null }
         }
         live.close()
+        refreshStatus() // first, so whoever hears authRequired reads the paused status
         _authRequired.tryEmit(Unit)
-        refreshStatus()
         old?.cancel() // may be the caller's own session: last
     }
 
@@ -312,16 +322,51 @@ class SyncEngine(
 
     private suspend fun store(s: JobSnapshot) {
         val rewound = applyLock.withLock {
-            applier.applySnapshot(s)
-            // Changes after the snapshot may have been skipped while the job wasn't stored here: fetch them again.
-            (s.seq < lastSeq()).also { if (it) setLastSeq(s.seq) }
+            var rewind = false
+            land {
+                if (applier.applySnapshot(s, sent.toSet())) moved += s.job.id
+                // Changes after the snapshot may have been skipped while the job wasn't stored here: fetch them again. In
+                // the snapshot's own transaction, so a stored job never sits under a lastSeq that skips its changes.
+                rewind = s.seq < lastSeq()
+                if (rewind) db.meta().put(MetaEntity(MetaKeys.LAST_SEQ, s.seq.toString()))
+            }
+            if (rewind) lastSeqRead = s.seq
+            rewind
         }
         if (rewound) fetchAsked.trySend(Unit)
     }
 
+    /**
+     * Under [applyLock]: one write of server state, in one transaction. The cache is stamped with the server address it
+     * is filled from; state from another address clears it first.
+     */
+    private suspend fun <T> land(write: suspend () -> T): T {
+        if (otherServer()) resetCache()
+        val here = server()
+        return db.withTransaction {
+            if (db.meta().get(MetaKeys.SERVER) != here) db.meta().put(MetaEntity(MetaKeys.SERVER, here))
+            write()
+        }
+    }
+
+    /** Under [applyLock]: the cached state came from another server address than the current one. */
+    private suspend fun otherServer(): Boolean = db.meta().get(MetaKeys.SERVER).let { it != null && it != server() }
+
+    /**
+     * Under [applyLock]: drops the cached server state, which belongs to another server history. The outbox, the photos
+     * taken here and the saved user stay; the jobs that were stored are snapshotted again, and everything is fetched
+     * from the start. A waiting op that no longer matches anything gets the server's refusal ([rejected]).
+     */
+    private suspend fun resetCache() {
+        staleJobs += applier.clearServerState()
+        lastSeqRead = 0L
+        moved.clear()
+        fetchAsked.trySend(Unit)
+    }
+
     private suspend fun applyLive(c: Change) {
         val gap = applyLock.withLock {
-            applier.applyChange(c)
+            land { moved += applier.applyChanges(listOf(c), sent.toSet()) }
             val last = lastSeq()
             if (c.seq == last + 1) setLastSeq(c.seq)
             c.seq > last + 1
@@ -357,7 +402,7 @@ class SyncEngine(
             while (true) {
                 val (changes, seq) = api.changes(cursor)
                 applyLock.withLock {
-                    applier.applyChanges(changes)
+                    land { moved += applier.applyChanges(changes, sent.toSet()) }
                     // The page covers (cursor, seq]: it extends lastSeq only if nothing before it is missing.
                     val last = lastSeq()
                     if (cursor <= last && seq > last) setLastSeq(seq)
@@ -450,6 +495,7 @@ class SyncEngine(
     /** Sends one batch; null when it got somewhere and flushing goes on. */
     private suspend fun send(batch: List<OutboxEntity>): FlushResult? {
         val ops = batch.map { it.toOp() }
+        sent += ops.map { it.opId } // from here on the server may have them, whatever the answer
         val results = try {
             api.ops(ops)
         } catch (e: IOException) {
@@ -465,15 +511,22 @@ class SyncEngine(
 
     /**
      * Removes the answered ops (unanswered ones go again). A refused op's job gets the server's state back, and the
-     * refusal is reported on [rejected]. False when nothing was answered.
+     * refusal is reported on [rejected]. So does a job whose state moved under an op in flight: only the server knows
+     * which write came last (R24). False when nothing was answered.
      */
     private suspend fun settle(batch: List<OutboxEntity>, ops: List<Op>, results: List<OpResult>): Boolean {
         val byId = results.associateBy { it.opId }
         val answered = batch.indices.filter { ops[it].opId in byId }
         if (answered.isEmpty()) return false
         val refused = answered.filter { !byId.getValue(ops[it].opId).ok }
-        val jobs = refused.mapNotNullTo(LinkedHashSet()) { applier.jobOf(ops[it]) }
-        db.outbox().delete(answered.map { batch[it].seq })
+        val jobs = applyLock.withLock {
+            val jobs = refused.mapNotNullTo(LinkedHashSet()) { applier.jobOf(ops[it]) }
+            db.outbox().delete(answered.map { batch[it].seq })
+            sent -= answered.mapTo(HashSet()) { ops[it].opId }
+            jobs += moved
+            moved.clear()
+            jobs
+        }
         jobs.forEach { refetch(it) }
         refused.forEach { _rejected.tryEmit(byId.getValue(ops[it].opId)) }
         return true
