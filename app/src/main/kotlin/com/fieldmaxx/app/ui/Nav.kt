@@ -186,7 +186,7 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
                 pointSheet = { pointId, close ->
                     PointSheet(
                         entry.jobId(), pointId, pointDeps, controller, onClose = close,
-                        onTakePhoto = { p -> navController.navigate(Routes.camera(p.jobId, p.id)) },
+                        onTakePhoto = { p -> navController.navigate(Routes.camera(p.jobId, p.id)) { launchSingleTop = true } },
                         onPickFromGallery = { p -> gallery.pick(p.jobId, p.id) },
                     )
                 },

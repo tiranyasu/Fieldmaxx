@@ -37,7 +37,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -50,6 +49,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LifecycleResumeEffect
+import androidx.lifecycle.createSavedStateHandle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.fieldmaxx.app.AppGraph
 import com.fieldmaxx.app.photos.LocalPhotos
 import com.fieldmaxx.app.photos.cameraMeta
@@ -57,14 +58,12 @@ import com.fieldmaxx.app.platform.Fix
 import com.fieldmaxx.app.platform.Heading
 import com.fieldmaxx.app.ui.FmxColors
 import java.time.ZoneId
-import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.launch
 
 /** The job and point as the stamp names them: "A05J9XE · POLE 1". */
 data class CameraTarget(val jobName: String, val pointLabel: String)
@@ -140,15 +139,19 @@ fun CameraScreen(
     // Main-confined, as on the other screens: the screen's state is written on the main thread wherever a value comes from.
     val loaded by remember(deps, jobId, pointId) { deps.target(jobId, pointId).map(::Loaded) }.collectAsState(null, Dispatchers.Main.immediate)
     val access = rememberCameraAccess()
-    val shutter = remember(deps, controller) { Shutter(deps.photos, controller) }
+    val shutter = viewModel { Shutter(createSavedStateHandle(), deps.photos) }
     val gallery = rememberGalleryPick(deps)
-    val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
-    // Back waits for the photos still being written, then goes.
+    // Back waits for the photos still being written, then goes; if one of them couldn't be saved, it stays to say so.
     var leaving by remember { mutableStateOf(false) }
     BackHandler(enabled = shutter.saving > 0) { leaving = true }
-    if (leaving && shutter.saving == 0) LaunchedEffect(Unit) { onBack() }
+    if (leaving && shutter.saving == 0) {
+        LaunchedEffect(Unit) {
+            leaving = false
+            if (shutter.problem == null) onBack()
+        }
+    }
     val close: () -> Unit = {
         if (shutter.saving > 0) {
             leaving = true
@@ -174,8 +177,7 @@ fun CameraScreen(
                         onPress = target?.let { t ->
                             {
                                 // The reading of this moment, before the camera starts writing.
-                                val meta = cameraMeta(t.jobName, t.pointLabel, deps.fixes.value, deps.heading.value, deps.now())
-                                scope.launch(Dispatchers.Main.immediate, CoroutineStart.UNDISPATCHED) { shutter.take(jobId, pointId, meta) }
+                                shutter.press(jobId, pointId, cameraMeta(t.jobName, t.pointLabel, deps.fixes.value, deps.heading.value, deps.now()), controller)
                             }
                         },
                     )

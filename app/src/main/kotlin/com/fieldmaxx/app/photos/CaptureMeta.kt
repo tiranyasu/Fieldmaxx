@@ -4,6 +4,7 @@ import androidx.exifinterface.media.ExifInterface
 import com.fieldmaxx.app.platform.Fix
 import com.fieldmaxx.app.platform.Heading
 import com.fieldmaxx.core.stamp.StampMeta
+import java.time.DateTimeException
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.ZoneOffset
@@ -157,7 +158,7 @@ private fun takenAt(exif: ExifInterface, zone: ZoneId): Long? {
         val offset = exif.getAttribute(offsetTag)?.trim()?.let { text ->
             try {
                 ZoneOffset.of(text)
-            } catch (e: java.time.DateTimeException) {
+            } catch (e: DateTimeException) {
                 null
             }
         }

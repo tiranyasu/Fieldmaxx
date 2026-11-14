@@ -19,6 +19,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.assertCountEquals
@@ -107,14 +108,16 @@ private fun fixture(name: String): ByteArray =
 /** What the camera writes for a photo here. */
 private val JPEG: ByteArray by lazy { fixture("plain.jpg") }
 
-/** The camera's capture. With [gate] set, it waits there, as while CameraX is still writing the photo. */
+/** The camera's capture. With [gate] set, it waits there, as while CameraX is still writing the photo; [failure] it throws. */
 private class FakeCapture : CaptureController {
     @Volatile var gate: CompletableDeferred<Unit>? = null
+    @Volatile var failure: Exception? = null
     val started = AtomicInteger()
 
     override suspend fun capture(to: File) {
         started.incrementAndGet()
         gate?.await()
+        failure?.let { throw it }
         to.writeBytes(JPEG)
     }
 }
@@ -230,8 +233,11 @@ class CameraTest {
         CompositionLocalProvider(LocalActivityResultRegistryOwner provides owner) { FieldmaxxTheme { content() } }
     }
 
+    /** Shown while [shown], so a test can rebuild the screen as a rotation does; what outlives the screen stays. */
+    private val shown = mutableStateOf(true)
+
     private fun show() = compose.setContent {
-        Host { CameraScreen("j1", "p1", deps, capture, onBack = { backs.incrementAndGet() }) }
+        Host { if (shown.value) CameraScreen("j1", "p1", deps, capture, onBack = { backs.incrementAndGet() }) }
     }
 
     /** "Pick from gallery" on its own, as the point sheet offers it. */
@@ -646,6 +652,49 @@ class CameraTest {
         } finally {
             full.db.close()
         }
+    }
+
+    @Test fun countSurvivesTheScreenBeingRebuilt() { // turning the phone rebuilds the screen: the count stays
+        grant(Manifest.permission.CAMERA)
+        show()
+        waitFor { enabled(CameraTags.SHUTTER) }
+        press(CameraTags.SHUTTER)
+        waitFor { textOf(CameraTags.COUNT) == "1 photo taken" }
+        press(CameraTags.SHUTTER)
+        waitFor { textOf(CameraTags.COUNT) == "2 photos taken" }
+
+        compose.runOnUiThread { shown.value = false }
+        waitFor { !exists(CameraTags.SHUTTER) }
+        compose.runOnUiThread { shown.value = true }
+        waitFor { enabled(CameraTags.SHUTTER) }
+        assertEquals("2 photos taken", textOf(CameraTags.COUNT))
+    }
+
+    @Test fun failedPhotoSaysWhyAndBackStays() {
+        grant(Manifest.permission.CAMERA)
+        capture.gate = CompletableDeferred()
+        capture.failure = IOException("the camera closed")
+        show()
+        waitFor { enabled(CameraTags.SHUTTER) }
+        press(CameraTags.SHUTTER)
+        waitFor { capture.started.get() == 1 }
+        press(CameraTags.CLOSE) // the tech is leaving while it's written
+        capture.gate!!.complete(Unit)
+
+        waitFor { textOf(CameraTags.PROBLEM) == "Photo not saved: the camera closed. Try again." }
+        assertEquals(0, backs.get(), "it stays to say so")
+        assertFalse(exists(CameraTags.COUNT))
+        assertEquals(emptyList(), rows())
+        assertEquals(emptyList(), leftOnDisk())
+
+        // The next photo works; then Back goes at once.
+        capture.gate = null
+        capture.failure = null
+        press(CameraTags.SHUTTER)
+        waitFor { textOf(CameraTags.COUNT) == "1 photo taken" }
+        assertFalse(exists(CameraTags.PROBLEM))
+        press(CameraTags.CLOSE)
+        waitFor { backs.get() == 1 }
     }
 
     @Test fun backWaitsForThePhotoBeingSaved() {
