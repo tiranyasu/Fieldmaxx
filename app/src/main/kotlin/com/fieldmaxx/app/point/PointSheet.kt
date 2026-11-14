@@ -237,8 +237,9 @@ private class Loaded(val point: Point?)
  * Every edit saves as you go ([PointEditor]): it shows at once, is queued for the crew, and waits on the phone while
  * there is no signal. The sheet never moves the camera (R38); Move point drags the marker through [controller].
  *
- * Hooks for later tasks (R45), hidden until set: [onTakePhoto] and [onPickFromGallery] (Task 27), [onUseExistingPhotos]
- * and [photoStrip] (Task 29).
+ * Hooks for later tasks (R45), hidden until set: [onTakePhoto] and [onPickFromGallery] (Task 27), [photoStrip] and
+ * [onUseExistingPhotos] (Task 29). Use existing photos shows on query points, as §6.4 and R45 place it (§6.6.2 would
+ * allow it on any point).
  */
 @Composable
 fun PointSheet(
@@ -359,9 +360,9 @@ private fun OpenSheet(
             if (isQueryLayer(point.layer)) {
                 val server = deps.server()
                 QueryReference(point.refImageIds.map { RefImage(it, refImageUrl(server, point.jobId, it)) }, deps.imageLoader)
-            }
-            onUseExistingPhotos?.let { use ->
-                OutlinedButton(onClick = { use(point) }, modifier = Modifier.testTag(PointTags.USE_EXISTING)) { Text("Use existing photos") }
+                onUseExistingPhotos?.let { use ->
+                    OutlinedButton(onClick = { use(point) }, modifier = Modifier.testTag(PointTags.USE_EXISTING)) { Text("Use existing photos") }
+                }
             }
 
             OutlinedTextField(

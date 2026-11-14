@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import androidx.activity.ComponentActivity
+import androidx.compose.material3.Text
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -322,7 +323,7 @@ class PointSheetTest {
         assertNull(map.dragging, "the drag is over")
 
         compose.mainClock.advanceTimeBy(9_000)
-        tap(PointTags.UNDO_MOVE)
+        press(PointTags.UNDO_MOVE) // at the top of the sheet: no scrolling, whose animation would take time
         waitFor { deps.ops.size == 2 }
         assertEquals(Op.PointMove(deps.ops[1].opId, "p18", pole18.lat, pole18.lon), deps.ops[1], "back where it was before the drag")
         waitFor { !exists(PointTags.UNDO_MOVE) }
@@ -383,6 +384,7 @@ class PointSheetTest {
         // Through the app's loader, at the addresses the job's opening prefetched (R21): they show without signal.
         val urls = setOf(refImageUrl(SERVER, "j1", "imp-2-item-3"), refImageUrl(SERVER, "j1", "imp-2-page-1"))
         waitFor { deps.requested.map { it.toString() }.toSet() == urls }
+        waitFor { compose.onAllNodesWithText("Not on this phone yet: it loads once there's signal.").fetchSemanticsNodes().size == 2 }
         compose.onAllNodesWithTag(PointTags.LINE_HEIGHT).assertCountEquals(0) // pole data is for poles
     }
 
@@ -534,6 +536,37 @@ class PointSheetTest {
         waitFor { deps.ops.isNotEmpty() }
         val update = deps.ops.single() as Op.PointUpdate
         assertEquals("p18" to "Pole 18 note", update.pointId to update.comment, "the first point keeps its own edit")
+    }
+
+    @Test fun hooksForLaterTasksStayHiddenUntilSet() { // R45
+        val used = CopyOnWriteArrayList<String>()
+        var hooked by mutableStateOf(false)
+        deps.pointsFlow.value = listOf(query43)
+        compose.setContent {
+            FieldmaxxTheme {
+                PointSheet(
+                    "j1", "q43", deps, map, onClose = {},
+                    onTakePhoto = if (hooked) ({ p -> used += "camera:${p.id}" }) else null,
+                    onPickFromGallery = if (hooked) ({ p -> used += "gallery:${p.id}" }) else null,
+                    onUseExistingPhotos = if (hooked) ({ p -> used += "reuse:${p.id}" }) else null,
+                    photoStrip = { p, photos -> if (hooked) Text("strip of ${p.id}: ${photos.size}") },
+                )
+            }
+        }
+        waitForTag(PointTags.TITLE)
+        for (tag in listOf(PointTags.TAKE_PHOTO, PointTags.PICK_GALLERY, PointTags.USE_EXISTING)) compose.onAllNodesWithTag(tag).assertCountEquals(0)
+
+        hooked = true
+        waitForTag(PointTags.TAKE_PHOTO)
+        tap(PointTags.TAKE_PHOTO)
+        tap(PointTags.PICK_GALLERY)
+        tap(PointTags.USE_EXISTING)
+        assertEquals(listOf("camera:q43", "gallery:q43", "reuse:q43"), used.toList())
+        compose.onNodeWithText("strip of q43: 0").assertExists()
+
+        deps.pointsFlow.value = listOf(query43.copy(layer = "POLE", type = "POLE")) // the same point, as a pole
+        waitFor { !exists(PointTags.USE_EXISTING) } // reusing photos is offered on query points (§6.4)
+        compose.onNodeWithTag(PointTags.TAKE_PHOTO).assertExists()
     }
 
     @Test fun gpsBadgeShowsAccuracyInFeet() {

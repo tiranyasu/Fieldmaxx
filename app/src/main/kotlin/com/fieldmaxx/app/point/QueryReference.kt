@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.dp
 import coil3.ImageLoader
 import coil3.compose.AsyncImage
 import coil3.compose.AsyncImagePainter
+import java.io.IOException
 
 /** One of a query point's reference images: its id, and its address ([com.fieldmaxx.app.sync.refImageUrl]). */
 internal data class RefImage(val id: String, val url: String)
@@ -57,13 +58,18 @@ private fun ReferenceImage(image: RefImage, description: String, imageLoader: Im
             contentScale = ContentScale.FillWidth,
             modifier = Modifier.fillMaxWidth(),
         )
-        if (state !is AsyncImagePainter.State.Success) {
+        val s = state
+        if (s !is AsyncImagePainter.State.Success) {
             Box(
                 Modifier.fillMaxWidth().height(120.dp).background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp)),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    if (state is AsyncImagePainter.State.Error) "Not on this phone yet: it loads once there's signal." else "Loading…",
+                    when {
+                        s !is AsyncImagePainter.State.Error -> "Loading…"
+                        s.result.throwable is IOException -> "Not on this phone yet: it loads once there's signal."
+                        else -> "This image couldn't be loaded."
+                    },
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center,
                     modifier = Modifier.padding(16.dp),
