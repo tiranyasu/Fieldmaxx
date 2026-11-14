@@ -19,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.room.withTransaction
 import com.fieldmaxx.app.data.AppDatabase
 import com.fieldmaxx.app.data.LocalPhotoEntity
 import com.fieldmaxx.app.data.toPhoto
@@ -75,7 +76,12 @@ fun removalPrompt(p: PhotoView): RemovalPrompt = when (removalOf(p)) {
  *   with the usual cleanup;
  * - before OneDrive: [Op.PhotoRemove] first when the server knows the photo, so that it never delivers it from its backup,
  *   then this phone's copy goes through [discard] (the pipeline's: its work stopped, `meta.json` first, then its folder,
- *   then its row, so that a kill in between can't let the orphan sweep bring it back, Task 28).
+ *   then its row, Task 28).
+ *
+ * A delete is recorded first (fix round 1): its tombstone ([PhotoTombstones]) goes in the same transaction as the decision
+ * and any [Op.PhotoRemove], before the first file goes. So a kill partway can't bring the photo back (the pipeline finishes
+ * the delete, I1), and a registration that reaches the server meanwhile is answered with a PhotoRemove (I2): one answered
+ * before this transaction makes the photo known here, one answered after finds the tombstone.
  *
  * Once asked, it finishes even if the screen goes. Null when the photo is gone already.
  */
@@ -83,17 +89,25 @@ class PhotoRemover(
     private val db: AppDatabase,
     private val enqueue: suspend (Op) -> Unit,
     private val discard: suspend (LocalPhotoEntity) -> Unit,
+    private val now: () -> Long = System::currentTimeMillis,
 ) {
+    private val tombstones = PhotoTombstones(db.meta())
+
     suspend fun remove(photoId: String): Removal? = withContext(NonCancellable) {
-        val local = db.localPhotos().get(photoId)
-        val server = db.photos().get(photoId)?.toPhoto()
-        val hidden = server?.status == PhotoStatus.removed
-        if (local == null && (server == null || hidden)) return@withContext null
-        val known = server != null || local?.state == REGISTERED || local?.state == CONFIRMED
-        if (known && !hidden) enqueue(Op.PhotoRemove(UUID.randomUUID().toString(), photoId))
-        if (local?.state == CONFIRMED || server?.delivered() == true) return@withContext Removal.HIDE
-        local?.let { discard(it) }
-        Removal.DELETE
+        val removal = db.withTransaction {
+            val local = db.localPhotos().get(photoId)
+            val server = db.photos().get(photoId)?.toPhoto()
+            val hidden = server?.status == PhotoStatus.removed
+            if (local == null && (server == null || hidden)) return@withTransaction null
+            val known = server != null || local?.state == REGISTERED || local?.state == CONFIRMED
+            val tell = if (known && !hidden) Op.PhotoRemove(UUID.randomUUID().toString(), photoId) else null
+            tell?.let { enqueue(it) }
+            if (local?.state == CONFIRMED || server?.delivered() == true) return@withTransaction Removal.HIDE
+            tombstones.put(photoId, PhotoTombstone(now(), tell?.opId))
+            Removal.DELETE
+        }
+        if (removal == Removal.DELETE) db.localPhotos().get(photoId)?.let { discard(it) }
+        removal
     }
 }
 

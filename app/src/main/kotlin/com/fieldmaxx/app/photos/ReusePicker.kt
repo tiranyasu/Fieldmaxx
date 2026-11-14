@@ -151,6 +151,9 @@ interface ReuseDeps {
     /** The job's photos on this phone (the sync engine's copy), removed ones left out: "This job" without signal. */
     fun jobPhotos(jobId: String): Flow<List<PhotoInfo>>
 
+    /** The photos deleted on this phone ([deletedPhotoIds]): never offered, whichever list has them. */
+    fun deletedPhotoIds(): Flow<Set<String>>
+
     /** Photos within 150 m of the spot from any job, nearest first (`Api.nearby`); needs signal. */
     suspend fun nearby(lat: Double, lon: Double, excludePointId: String?): List<ReuseCandidate>
 
@@ -173,6 +176,7 @@ class GraphReuseDeps(private val graph: AppGraph) : ReuseDeps {
     override fun job(jobId: String): Flow<Job?> = graph.sync.job(jobId)
     override fun points(jobId: String): Flow<List<Point>> = graph.sync.points(jobId)
     override fun jobPhotos(jobId: String): Flow<List<PhotoInfo>> = graph.sync.jobPhotos(jobId)
+    override fun deletedPhotoIds(): Flow<Set<String>> = deletedPhotoIds(graph.db)
     override suspend fun nearby(lat: Double, lon: Double, excludePointId: String?): List<ReuseCandidate> = graph.api.nearby(lat, lon, excludePointId)
     override suspend fun serverJobPhotos(jobId: String): List<ReuseCandidate> = graph.api.jobPhotos(jobId)
     override suspend fun enqueue(op: Op) = graph.sync.enqueue(op)
@@ -240,9 +244,9 @@ private suspend fun fetch(call: suspend () -> List<ReuseCandidate>): Fetch = try
 
 /**
  * "Use existing photos" (spec §6.6.2) for one point, from its sheet: photos already taken, with thumbnail, point label,
- * job and date, to copy into this point's folder. **Nearby**: within 150 m of the point, from any job, with the distance
- * (this point's own left out); **This job**: all the job's photos, grouped by point, newest first; **Search**: by point
- * label, over both. This job works without signal, from the phone's copy of the job; Nearby and searching other jobs
+ * job and date, to copy into this point's folder. **Nearby**: within 150 m of the point, from any job, newest first with
+ * the distance (R87; this point's own left out); **This job**: all the job's photos, grouped by point, newest first;
+ * **Search**: by point label, over both. This job works without signal, from the phone's copy of the job; Nearby and searching other jobs
  * need it, and say so (R66). Each picked photo becomes one [Op.PhotoReuse]; [onDone] closes the picker.
  */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -253,6 +257,7 @@ fun ReusePicker(jobId: String, pointId: String, deps: ReuseDeps, onDone: () -> U
     val job by remember(deps, jobId) { deps.job(jobId) }.collectAsState(null, main)
     val points by remember(deps, jobId) { deps.points(jobId) }.collectAsState(null, main)
     val stored by remember(deps, jobId) { deps.jobPhotos(jobId) }.collectAsState(emptyList(), main)
+    val deleted by remember(deps) { deps.deletedPhotoIds() }.collectAsState(emptySet(), main)
     val done by rememberUpdatedState(onDone)
     val point = points?.firstOrNull { it.id == pointId }
     if (points != null && point == null) {
@@ -270,19 +275,22 @@ fun ReusePicker(jobId: String, pointId: String, deps: ReuseDeps, onDone: () -> U
     val zone = remember(deps) { deps.zone() }
     val server = remember(deps) { deps.server() }
 
-    // Asked once the point is known, and again on "Try again".
+    // Asked once the point is known, and again on "Try again". Newest first like the rest of the picker (R87), not the
+    // server's nearest first; each shows its distance.
     val nearby by produceState<Fetch>(Fetch.Loading, point?.lat, point?.lon, attempt) {
         val here = point ?: return@produceState
         value = Fetch.Loading
-        value = fetch { deps.nearby(here.lat, here.lon, here.id) }
+        value = fetch { deps.nearby(here.lat, here.lon, here.id).sortedByDescending { it.photo.takenAt } }
     }
     val fromServer by produceState<Fetch>(Fetch.Loading, jobId, attempt) { value = fetch { deps.serverJobPhotos(jobId) } }
 
     val reusedHere = remember(stored, pointId) { stored.filter { it.pointId == pointId }.mapNotNullTo(HashSet()) { it.reusedFrom } }
-    val thisJob = remember(stored, points, job, fromServer, pointId) {
+    // A photo deleted on this phone is never offered, whichever list still has it (fix round 1).
+    val thisJob = remember(stored, points, job, fromServer, pointId, deleted) {
         thisJobCandidates(stored, points.orEmpty(), job?.name.orEmpty(), (fromServer as? Fetch.Done)?.photos.orEmpty(), pointId)
+            .filter { it.photo.id !in deleted }
     }
-    val nearbyPhotos = (nearby as? Fetch.Done)?.photos.orEmpty()
+    val nearbyPhotos = remember(nearby, deleted) { (nearby as? Fetch.Done)?.photos.orEmpty().filter { it.photo.id !in deleted } }
     val results = remember(query, nearbyPhotos, thisJob) { searchCandidates(query, nearbyPhotos + thisJob) }
     val choice = Choice(picked.mapTo(HashSet()) { it.photo.id }, reusedHere, server, zone, deps.imageLoader) { c ->
         val i = picked.indexOfFirst { it.photo.id == c.photo.id }
@@ -343,7 +351,7 @@ fun ReusePicker(jobId: String, pointId: String, deps: ReuseDeps, onDone: () -> U
                         Text(n.message, color = FmxColors.Warning)
                         OutlinedButton(onClick = { attempt++ }, modifier = Modifier.testTag(ReuseTags.TRY_AGAIN)) { Text("Try again") }
                     }
-                    is Fetch.Done -> if (n.photos.isEmpty()) Message(NO_NEARBY) else Candidates(n.photos, choice, grouped = false)
+                    is Fetch.Done -> if (nearbyPhotos.isEmpty()) Message(NO_NEARBY) else Candidates(nearbyPhotos, choice, grouped = false)
                 }
                 ReuseTab.THIS_JOB -> when {
                     thisJob.isNotEmpty() -> Candidates(thisJob, choice, grouped = true)

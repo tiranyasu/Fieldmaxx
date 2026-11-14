@@ -43,7 +43,7 @@ class BackupWorker internal constructor(context: Context, params: WorkerParamete
  */
 internal suspend fun PhotoPipeline.backUp(id: String, attempt: Int) {
     val row = photos.get(id) ?: return
-    if (discardIfRemoved(row)) return // R86
+    if (finishIfDeleted(row) || discardIfRemoved(row)) return // deleted here (fix round 1), removed on the server (R86)
     if (row.backupDone || row.fileName == null) return // registering starts it
     if (row.state != CONFIRMED && pointDeleted(row)) {
         waitFor(row, Wait.DELETED)

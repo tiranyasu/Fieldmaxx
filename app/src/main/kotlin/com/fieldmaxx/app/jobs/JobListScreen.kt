@@ -48,6 +48,7 @@ import com.fieldmaxx.app.data.AppDatabase
 import com.fieldmaxx.app.data.MetaEntity
 import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.ApiException
+import com.fieldmaxx.app.photos.PhotoTombstones
 import com.fieldmaxx.app.sync.SyncStatus
 import com.fieldmaxx.app.ui.FmxColors
 import com.fieldmaxx.app.ui.fmxBarColors
@@ -121,9 +122,10 @@ class JobList(private val api: Api, private val db: AppDatabase, private val ser
      */
     suspend fun contents(jobId: String): JobContents {
         val snapshot = api.snapshot(jobId)
-        val photos = snapshot.photos.filter { it.status != PhotoStatus.removed }
+        val deleted = PhotoTombstones(db.meta()).ids() // deleted on this phone: the server may not have heard yet
+        val photos = snapshot.photos.filter { it.status != PhotoStatus.removed && it.id !in deleted }
         val known = photos.mapTo(HashSet()) { it.id }
-        val local = db.localPhotos().inStates(NOT_REGISTERED).filter { it.jobId == jobId && it.id !in known }
+        val local = db.localPhotos().inStates(NOT_REGISTERED).filter { it.jobId == jobId && it.id !in known && it.id !in deleted }
         return JobContents(
             points = snapshot.points.count { it.deletedAt == null },
             photos = photos.size + local.size,

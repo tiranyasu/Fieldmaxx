@@ -43,12 +43,14 @@ import com.fieldmaxx.app.data.LocalPhotoEntity
 import com.fieldmaxx.app.data.MetaEntity
 import com.fieldmaxx.app.data.toOp
 import com.fieldmaxx.app.data.toPhoto
+import com.fieldmaxx.app.jobs.JobList
 import com.fieldmaxx.app.jobs.PHOTOS_WILL_WAIT
 import com.fieldmaxx.app.point.DragMap
 import com.fieldmaxx.app.point.FakePointDeps
 import com.fieldmaxx.app.point.PointSheet
 import com.fieldmaxx.app.point.PointTags
 import com.fieldmaxx.app.point.canDeletePoint
+import com.fieldmaxx.app.map.pendingPointIds
 import com.fieldmaxx.app.sync.ALICE
 import com.fieldmaxx.app.sync.FakeApi
 import com.fieldmaxx.app.sync.FakeLiveSocket
@@ -153,6 +155,7 @@ private class FakeReuseDeps(private val sync: SyncEngine, private val db: AppDat
     override fun job(jobId: String): Flow<Job?> = sync.job(jobId)
     override fun points(jobId: String): Flow<List<Point>> = sync.points(jobId)
     override fun jobPhotos(jobId: String): Flow<List<PhotoInfo>> = sync.jobPhotos(jobId)
+    override fun deletedPhotoIds(): Flow<Set<String>> = deletedPhotoIds(db)
 
     override suspend fun nearby(lat: Double, lon: Double, excludePointId: String?): List<ReuseCandidate> {
         nearbyAsked += Triple(lat, lon, excludePointId)
@@ -512,8 +515,9 @@ class PhotoUiTest {
 
     @Test fun reusePickerTabsNearbyThisJobSearch() {
         seedJob()
-        val older = photo("phx", "px", jobId = "j0").copy(takenAt = NOV5 - 300 * DAY) // the same pole in an earlier job
-        reuse.nearbyReply = { listOf(ReuseCandidate(ph5, "POLE 5", "A05J9XE", 80.4), ReuseCandidate(older, "POLE 5", "A04X1Y", 121.0)) }
+        val older = photo("phx", "px", jobId = "j0").copy(takenAt = NOV5 - 300 * DAY) // the same pole in an earlier job, and nearer
+        // The server's order: nearest first.
+        reuse.nearbyReply = { listOf(ReuseCandidate(older, "POLE 5", "A04X1Y", 40.0), ReuseCandidate(ph5, "POLE 5", "A05J9XE", 80.4)) }
         reuse.jobReply = { throw IOException("no signal") } // This job comes from the phone's own copy of the job
         var picking by mutableStateOf(true)
         compose.setContent {
@@ -527,12 +531,13 @@ class PhotoUiTest {
             }
         }
 
-        // Nearby: photos within 150 m of this point, from any job, with the distance.
+        // Nearby: photos within 150 m of this point, from any job, newest first (R87), each with its distance.
         waitForTag(ReuseTags.candidate("phx"))
         assertEquals(listOf(Triple(query43.lat, query43.lon, "q43")), reuse.nearbyAsked.toList(), "this point's own photos left out")
+        assertTrue(top(ReuseTags.candidate("ph5")) < top(ReuseTags.candidate("phx")), "newest first, not nearest first")
         assertEquals("POLE 5 · A05J9XE · 11/05/26", textOf(ReuseTags.line("ph5"), unmerged = true))
         assertEquals("80 m", textOf(ReuseTags.distance("ph5"), unmerged = true))
-        assertEquals("121 m", textOf(ReuseTags.distance("phx"), unmerged = true))
+        assertEquals("40 m", textOf(ReuseTags.distance("phx"), unmerged = true))
 
         // This job: all its photos, grouped by point, newest first; the query point's own photo isn't offered.
         press(ReuseTags.THIS_JOB)
@@ -813,6 +818,40 @@ class PhotoUiTest {
         assertTrue(hasTextNode("It won't go to OneDrive."))
         press(PhotoTags.REMOVE_CONFIRM)
         waitFor { strip.removed.toList() == listOf("theirs") }
+    }
+
+    @Test fun tombstonedPhotosAreNeitherListedNorCounted() { // fix round 1: a photo deleted here, its server row not removed yet
+        val gone = photo("gone", "p19").copy(userId = ALICE.id, fileName = "POLE_19_39.636130_-119.691104_9.jpg")
+        seedJob(listOf(ph5, gone))
+        // A kill left its row (I1) and the server still has it registered (I2); a photo of POLE 18 waits too.
+        store(mine("gone", REGISTERED, pointId = "p19", fileName = gone.fileName, files = true), mine("kept", STAMPED, files = true))
+        runBlocking { PhotoTombstones(db.meta()).put("gone", PhotoTombstone(NOV5)) }
+
+        runBlocking {
+            assertEquals(emptyList(), photoViewsFor("p19", db, { SERVER }).first(), "the point sheet's strip and Done")
+            val job = jobPhotoViewsFor("j1", db, { SERVER }).first()
+            assertEquals(setOf("p18", "p5"), job.byPoint.keys, "where the photos went: POLE 19's photo was deleted")
+            assertEquals(mapOf("p18" to 1, "p5" to 1), job.pending)
+            assertEquals(1, db.localPhotos().observeWaitingCount().first(), "the map's pill")
+            assertEquals(listOf("p18"), db.localPhotos().observeWaitingPointIds("j1").first(), "the map's badge, this phone's part")
+            assertEquals(setOf("p5"), pendingPointIds(listOf(ph5, gone), emptyList(), deleted = setOf("gone")), "and the server's part")
+            assertEquals(0, db.localPhotos().observeOnPhoneCount("p19").first(), "the delete-point warning")
+            val contents = JobList(api, db) { SERVER }.contents("j1")
+            assertEquals(2 to 2, contents.photos to contents.undelivered, "the job's delete warning: ph5 and kept")
+        }
+        assertNull(runBlocking { exportPhotosToOneDriveApp(compose.activity, db, "j1") })
+        val shared = File(context.cacheDir, "shared").walk().single { it.isFile }
+        assertEquals(setOf("POLES/Pole 18/kept.jpg"), ZipFile(shared).use { zip -> zip.entries().toList().map { it.name }.toSet() }, "nor exported")
+
+        // Nor offered for reuse, from this phone's copy of the job or from the server's lists.
+        reuse.nearbyReply = { listOf(ReuseCandidate(gone, "POLE 19", "A05J9XE", 30.0), ReuseCandidate(ph5, "POLE 5", "A05J9XE", 80.0)) }
+        reuse.jobReply = { listOf(ReuseCandidate(gone, "POLE 19", "A05J9XE", null)) }
+        compose.setContent { FieldmaxxTheme { ReusePicker("j1", "q43", reuse, onDone = {}) } }
+        waitForTag(ReuseTags.candidate("ph5"))
+        assertFalse(exists(ReuseTags.candidate("gone")), "Nearby")
+        press(ReuseTags.THIS_JOB)
+        waitForTag(ReuseTags.candidate("ph5"))
+        assertFalse(exists(ReuseTags.candidate("gone")), "This job")
     }
 
     @Test fun reusePickerWorksOfflineOnThisJob() { // R66

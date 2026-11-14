@@ -142,6 +142,9 @@ internal sealed interface Outcome {
  *   in-process watchers line it up again when its job, point or the outbox change.
  * - A photo the server shows removed before it reached OneDrive (an admin's delete) is never delivered (R86): each step,
  *   and the watcher for a photo that waits, discard it as [discardIfRemoved] says.
+ * - A photo deleted on this phone keeps a tombstone (fix round 1): each step finishes its delete instead of running
+ *   ([finishIfDeleted]), and the watcher finishes one a kill cut short and tells the server of one it turns out to have
+ *   ([settleDeletes]).
  * - [resumeAll] at app start, and the cleanup worker every 6 hours, recover what a power cut left (R80) and line up every
  *   unfinished photo's step again from its persisted state.
  *
@@ -166,6 +169,9 @@ class PhotoPipeline(
     private val app: Context = context.applicationContext
     internal val filesDir: File = app.filesDir
     internal val photos get() = db.localPhotos()
+
+    /** The photos deleted on this phone (fix round 1): never stamped, registered or uploaded, and their deletes finished. */
+    internal val tombstones = PhotoTombstones(db.meta())
     private val workManager: WorkManager by lazy { WorkManager.getInstance(app) }
 
     /** Photos waiting (not failing), and what for; this process only: resumeAll lines everything up after a restart. */
@@ -218,13 +224,14 @@ class PhotoPipeline(
     // ---- running a step ----
 
     /**
-     * One run of a delivery step (stamp, register, OneDrive). A vanished row ends it quietly (R58). A photo the server shows
-     * removed is discarded (R86). A row at another state lines up the step it is at instead. A deleted point holds the photo
+     * One run of a delivery step (stamp, register, OneDrive). A vanished row ends it quietly (R58). A photo deleted on this
+     * phone has its delete finished (fix round 1), and one the server shows removed is discarded (R86). A row at another
+     * state lines up the step it is at instead. A deleted point holds the photo
      * (R67). Then [body]'s [Outcome] is recorded; a stopped worker records nothing (WorkManager runs it again).
      */
     internal suspend fun runStep(step: Step, id: String, body: suspend (LocalPhotoEntity) -> Outcome) {
         val row = photos.get(id) ?: return
-        if (discardIfRemoved(row)) return
+        if (finishIfDeleted(row) || discardIfRemoved(row)) return
         if (row.state != step.state) {
             enqueueCurrent(row, ExistingWorkPolicy.KEEP)
             return
@@ -311,12 +318,14 @@ class PhotoPipeline(
     }
 
     /**
-     * Brings into each unfinished photo what the server and its point say: R86 (removed on the server before OneDrive, it
-     * is discarded, also while it waits for a link, a folder or a stream), R67 (a deleted point holds its photos; once the
+     * Settles this phone's deletes first ([settleDeletes]), then brings into each unfinished photo what the server and its
+     * point say: R86 (removed on the server before OneDrive, it is discarded, also while it waits for a link, a folder or a
+     * stream), R67 (a deleted point holds its photos; once the
      * server shows it deleted, those not in OneDrive are discarded), R57 (the server delivered the photo itself, or renamed
      * it), the server's backup, and the photos waiting for a link, a folder or their rows.
      */
     internal suspend fun reconcile() = reconciling.withLock {
+        settleDeletes()
         var inOutbox: Set<String>? = null
         for (row in photos.unfinished()) {
             val info = db.photos().get(row.id)?.toPhoto()
@@ -409,6 +418,51 @@ class PhotoPipeline(
         if (row.state == CONFIRMED || info == null || info.status != PhotoStatus.removed || info.delivered()) return false
         withContext(NonCancellable) { discard(row) }
         return true
+    }
+
+    /**
+     * Fix round 1 (I1): a photo deleted on this phone is never stamped, registered or uploaded. A step that finds its
+     * tombstone finishes the delete instead, as [discard] does (a kill may have cut it short). Not cancellable, as in
+     * [discardIfRemoved]. True when the photo is deleted.
+     */
+    internal suspend fun finishIfDeleted(row: LocalPhotoEntity): Boolean {
+        if (tombstones.get(row.id) == null) return false
+        withContext(NonCancellable) { discard(row) }
+        return true
+    }
+
+    /**
+     * Fix round 1 (I2): the server has a photo deleted on this phone, which wasn't known to have it when it was deleted (its
+     * registration was on its way, or its answer was lost). It is told now, once: one PhotoRemove, noted on the tombstone in
+     * the same transaction.
+     */
+    internal suspend fun tellServerDeleted(id: String) = db.withTransaction {
+        val tombstone = tombstones.get(id) ?: return@withTransaction
+        if (tombstone.removeOpId != null) return@withTransaction
+        val op = Op.PhotoRemove("photo.remove:$id", id)
+        sync.enqueue(op)
+        tombstones.put(id, tombstone.copy(removeOpId = op.opId))
+    }
+
+    /**
+     * Fix round 1, for each tombstone: a row a kill left is discarded (I1); a server row that arrived for it, not removed,
+     * gets its PhotoRemove (I2); and the tombstone goes once it has done its work. That is once the server's state shows the
+     * photo removed and any PhotoRemove of it is answered, or 7 days on (no server row ever came, or the server refused).
+     * Until then every list and count of photos leaves the photo out ([deletedPhotoIds]).
+     */
+    private suspend fun settleDeletes() {
+        val deleted = tombstones.all()
+        if (deleted.isEmpty()) return
+        val queued = db.outbox().all().mapTo(HashSet()) { it.toOp().opId }
+        for ((id, tombstone) in deleted) {
+            photos.get(id)?.let { withContext(NonCancellable) { discard(it) } }
+            val server = db.photos().get(id)?.toPhoto()
+            when {
+                server != null && server.status != PhotoStatus.removed && tombstone.removeOpId == null -> tellServerDeleted(id)
+                server?.status == PhotoStatus.removed && (tombstone.removeOpId == null || tombstone.removeOpId !in queued) -> tombstones.clear(id)
+                now() - tombstone.deletedAt >= TOMBSTONE_KEEP_MS -> tombstones.clear(id)
+            }
+        }
     }
 
     /** The photo's own folder, meta.json first: a sweep must never find a meta.json whose row is gone. */

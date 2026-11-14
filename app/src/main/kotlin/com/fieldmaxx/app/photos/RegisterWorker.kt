@@ -1,6 +1,7 @@
 package com.fieldmaxx.app.photos
 
 import android.content.Context
+import androidx.room.withTransaction
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
 import androidx.work.WorkerParameters
@@ -13,6 +14,7 @@ import java.io.IOException
 import java.security.DigestInputStream
 import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 
 /** Step 3 of spec §6.6, "stamped" → "registered". */
@@ -31,6 +33,11 @@ class RegisterWorker internal constructor(context: Context, params: WorkerParame
  * file name it assigns. Registering again is harmless: the server answers with the same name (the photo id is the
  * server's id). Then the OneDrive upload and the server backup are lined up, side by side. The tech is the session's
  * (R78).
+ *
+ * Once the server has answered, its answer is acted on even if the step was stopped meanwhile (a delete stops the photo's
+ * work): the server has the photo now. One deleted on this phone while the call was out (fix round 1, I2) gets its
+ * PhotoRemove and nothing more. Its tombstone is read in the same transaction as the step's own record, so a delete
+ * either comes before it and is seen here, or after it and finds the photo registered.
  */
 internal suspend fun PhotoPipeline.register(id: String) = runStep(Step.REGISTER, id) { row ->
     val stamped = row.stampedFile() ?: return@runStep restampOrStuck(row)
@@ -47,14 +54,24 @@ internal suspend fun PhotoPipeline.register(id: String) = runStep(Step.REGISTER,
     } catch (e: ApiException) {
         return@runStep Outcome.Failed(e.message)
     }
-    if (photos.markRegistered(id, registered.fileName, registered.backupOffset) == 0) return@runStep Outcome.Done // deleted meanwhile
-    if (registered.status == PhotoStatus.confirmed) {
-        // The server delivered it already (an answer lost long ago): nothing left for OneDrive.
-        photos.get(id)?.let { confirmedByServer(it, null, cancelUpload = false) }
-    } else {
-        enqueue(Step.ONEDRIVE, id, ExistingWorkPolicy.KEEP)
+    withContext(NonCancellable) {
+        val marked = db.withTransaction {
+            if (tombstones.get(id) != null) null else photos.markRegistered(id, registered.fileName, registered.backupOffset)
+        }
+        if (marked == null) {
+            tellServerDeleted(id)
+            photos.get(id)?.let { finishIfDeleted(it) }
+            return@withContext
+        }
+        if (marked == 0) return@withContext // deleted meanwhile
+        if (registered.status == PhotoStatus.confirmed) {
+            // The server delivered it already (an answer lost long ago): nothing left for OneDrive.
+            photos.get(id)?.let { confirmedByServer(it, null, cancelUpload = false) }
+        } else {
+            enqueue(Step.ONEDRIVE, id, ExistingWorkPolicy.KEEP)
+        }
+        enqueue(Step.BACKUP, id, ExistingWorkPolicy.KEEP)
     }
-    enqueue(Step.BACKUP, id, ExistingWorkPolicy.KEEP)
     Outcome.Done
 }
 

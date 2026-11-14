@@ -71,7 +71,7 @@ internal suspend fun PhotoPipeline.uploadToOneDrive(id: String) = runStep(Step.O
 private suspend fun PhotoPipeline.deliver(id: String, link: String, stamped: File): Outcome {
     // Read again: it may have been confirmed by the server, renamed, removed (R86) or deleted while it waited for a stream.
     val row = photos.get(id)?.takeIf { it.state == REGISTERED } ?: return Outcome.Done
-    if (discardIfRemoved(row)) return Outcome.Done
+    if (finishIfDeleted(row) || discardIfRemoved(row)) return Outcome.Done
     val point = db.points().get(row.pointId)?.toPoint() ?: return Outcome.Waiting(Wait.ROWS)
     val dest = destinations(link)
     val folder = folderOf(point, dest) ?: return Outcome.Waiting(Wait.FOLDER)

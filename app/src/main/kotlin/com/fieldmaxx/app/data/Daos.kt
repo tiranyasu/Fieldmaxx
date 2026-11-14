@@ -7,6 +7,15 @@ import androidx.room.Query
 import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
 
+/**
+ * A photo deleted on this phone keeps a tombstone, a [MetaEntity] row keyed by this prefix and the photo's id, from before
+ * its first file goes until the delete is settled (com.fieldmaxx.app.photos.PhotoTombstones).
+ */
+const val DELETED_PHOTO_PREFIX = "photoDeleted:"
+
+/** SQL: the LocalPhotoEntity row's photo has no tombstone. Counts of this phone's photos leave deleted ones out. */
+private const val NOT_DELETED = "('" + DELETED_PHOTO_PREFIX + "' || id) NOT IN (SELECT `key` FROM MetaEntity)"
+
 // Lists come back in insertion order (rowid): a job's points in the order its snapshot listed them, later ones after.
 // @Upsert updates an existing row in place, so a row keeps its place.
 
@@ -113,6 +122,9 @@ interface MetaDao {
     @Query("SELECT `key` FROM MetaEntity WHERE substr(`key`, 1, length(:prefix)) = :prefix")
     suspend fun keysStartingWith(prefix: String): List<String>
 
+    @Query("SELECT `key` FROM MetaEntity WHERE substr(`key`, 1, length(:prefix)) = :prefix")
+    fun observeKeysStartingWith(prefix: String): Flow<List<String>>
+
     @Query("DELETE FROM MetaEntity WHERE `key` = :key")
     suspend fun delete(key: String)
 
@@ -139,16 +151,19 @@ interface LocalPhotoDao {
     @Query("SELECT * FROM LocalPhotoEntity WHERE state IN (:states) ORDER BY createdAt")
     suspend fun inStates(states: List<String>): List<LocalPhotoEntity>
 
-    /** This phone's photos that OneDrive hasn't confirmed yet, across all jobs: the map's "3 photos waiting" (R40). */
-    @Query("SELECT COUNT(*) FROM LocalPhotoEntity WHERE state != 'confirmed'")
+    /**
+     * This phone's photos that OneDrive hasn't confirmed yet, across all jobs: the map's "3 photos waiting" (R40).
+     * Deleted ones are left out.
+     */
+    @Query("SELECT COUNT(*) FROM LocalPhotoEntity WHERE state != 'confirmed' AND " + NOT_DELETED)
     fun observeWaitingCount(): Flow<Int>
 
-    /** The job's points with a photo on this phone that OneDrive hasn't confirmed yet: the map's badge. */
-    @Query("SELECT DISTINCT pointId FROM LocalPhotoEntity WHERE jobId = :jobId AND state != 'confirmed'")
+    /** The job's points with a photo on this phone that OneDrive hasn't confirmed yet: the map's badge. Deleted ones left out. */
+    @Query("SELECT DISTINCT pointId FROM LocalPhotoEntity WHERE jobId = :jobId AND state != 'confirmed' AND " + NOT_DELETED)
     fun observeWaitingPointIds(jobId: String): Flow<List<String>>
 
     /** How many of the point's photos are still only on this phone: the count the point sheet's delete warning gives. */
-    @Query("SELECT COUNT(*) FROM LocalPhotoEntity WHERE pointId = :pointId AND state != 'confirmed'")
+    @Query("SELECT COUNT(*) FROM LocalPhotoEntity WHERE pointId = :pointId AND state != 'confirmed' AND " + NOT_DELETED)
     fun observeOnPhoneCount(pointId: String): Flow<Int>
 
     @Upsert

@@ -29,6 +29,7 @@ import com.fieldmaxx.app.FieldmaxxApp
 import com.fieldmaxx.app.data.AppDatabase
 import com.fieldmaxx.app.data.LocalPhotoEntity
 import com.fieldmaxx.app.data.toOp
+import com.fieldmaxx.app.data.toPhoto
 import com.fieldmaxx.app.data.toPoint
 import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.ApiException
@@ -69,6 +70,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -91,6 +93,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.job
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
@@ -813,6 +816,162 @@ class PipelineTest {
         assertTrue(fake.calls.none { it.startsWith("uploadChunked") && name in it }, "the phone never uploads it")
     }
 
+    /**
+     * Fix round 1, I1: a delete that a kill cuts short, wherever it is, finishes after the restart. The photo never comes back,
+     * never reaches the server or OneDrive, and never shows, stuck or otherwise.
+     */
+    @Test fun deleteKilledPartwayNeverBringsThePhotoBack() {
+        // How far the delete got when the phone died: nothing yet; meta.json gone; the folder gone; all but the row.
+        val kills: List<Pair<String, suspend (LocalPhotoEntity) -> Unit>> = listOf(
+            "before any file went" to { _ -> throw Killed() },
+            "after meta.json" to { row ->
+                workManager.cancelAllWorkByTag(photoTag(row.id)).result.get()
+                File(folder(row.id), META_JSON).delete()
+                throw Killed()
+            },
+            "after the folder" to { row ->
+                workManager.cancelAllWorkByTag(photoTag(row.id)).result.get()
+                File(folder(row.id), META_JSON).delete()
+                folder(row.id).deleteRecursively()
+                throw Killed()
+            },
+            "before the row" to { row ->
+                dying.killOn = "DELETE FROM LocalPhotoEntity"
+                pipeline.discard(row) // the real one, killed at its last statement
+            },
+        )
+        for ((moment, killedDiscard) in kills) {
+            val id = take()
+            await("stamped") { row(id)?.state == STAMPED } // never registered: the server doesn't know it
+            assertFailsWith<Killed>(moment) { runBlocking { PhotoRemover(db, sync::enqueue, killedDiscard, clock::get).remove(id) } }
+            disarm()
+            restart(loseQueue = false)
+            assertNull(row(id), "finished at the restart, before any step ran ($moment)")
+            runUntil("any step lined up ran ($moment)") { idle() && photoWork().none { it.state == WorkInfo.State.ENQUEUED && it.periodicityInfo == null } }
+            awaitIdle()
+            assertNull(row(id), moment)
+            assertFalse(folder(id).exists(), moment)
+            assertNull(server.registrations[id], "never registered ($moment)")
+            assertTrue(runBlocking { photoViewsFor("p1", db, { SERVER }).first() }.none { it.id == id }, "never shown ($moment)")
+            assertEquals(0, runBlocking { db.localPhotos().observeWaitingCount().first() }, "nor counted ($moment)")
+        }
+        assertEquals(emptyList(), fake.calls.toList(), "nothing went to OneDrive")
+    }
+
+    /**
+     * Fix round 1, I2: deleted while its registration is out. The server answers for a photo already gone here, and is told
+     * at once; its row, when it arrives through sync, never shows.
+     */
+    @Test fun deleteWhileItsRegistrationIsOutTellsTheServer() {
+        val reached = CountDownLatch(1)
+        val answer = CountDownLatch(1)
+        server.afterRegister = { reached.countDown(); answer.await() } // the server has it; its answer is held
+        val id = take()
+        await("stamped") { row(id)?.state == STAMPED }
+        signal() // the register step goes out
+        assertTrue(reached.await(5, TimeUnit.SECONDS), "the registration reached the server")
+        assertEquals(Removal.DELETE, runBlocking { PhotoRemover(db, sync::enqueue, pipeline::discard, clock::get).remove(id) })
+        assertEquals(emptyList(), ops().filterIsInstance<Op.PhotoRemove>(), "not known to have it yet: nothing to tell the server")
+        assertNull(row(id))
+        assertFalse(folder(id).exists())
+
+        answer.countDown() // the answer comes back, for a photo deleted meanwhile
+        await("the server told") { ops().filterIsInstance<Op.PhotoRemove>().map { it.photoId } == listOf(id) }
+        awaitIdle()
+        assertNull(row(id), "not brought back by its registration")
+
+        serverRegistered(id) // its server row arrives through sync
+        assertEquals(PhotoStatus.removed, runBlocking { db.photos().get(id)?.toPhoto() }?.status, "the waiting PhotoRemove holds")
+        assertTrue(runBlocking { photoViewsFor("p1", db, { SERVER }).first() }.none { it.id == id }, "never shown")
+        assertEquals(emptyMap(), runBlocking { jobPhotoViewsFor("j1", db, { SERVER }).first() }.pending, "nor counted")
+        assertEquals(emptyList(), fake.calls.toList(), "never in OneDrive")
+    }
+
+    /** Fix round 1, I2: the registration's answer was lost, so nothing here knew the server had the photo, until its row arrives. */
+    @Test fun deletedPhotoWhoseServerRowArrivesLaterIsRemovedThere() {
+        server.afterRegister = { throw IOException("the answer was lost") } // registered on the server; the phone hears nothing
+        val id = take()
+        runUntil("its registration tried", backoffOver = false) { server.registrations[id] != null && (row(id)?.attempts ?: 0) >= 1 }
+        awaitIdle()
+        assertEquals(STAMPED, row(id)?.state)
+        assertEquals(Removal.DELETE, runBlocking { PhotoRemover(db, sync::enqueue, pipeline::discard, clock::get).remove(id) })
+        assertEquals(emptyList(), ops().filterIsInstance<Op.PhotoRemove>())
+
+        serverRegistered(id) // the server's row of it reaches this phone through sync
+        await("the server told") { ops().filterIsInstance<Op.PhotoRemove>().map { it.photoId } == listOf(id) }
+        assertEquals(PhotoStatus.removed, runBlocking { db.photos().get(id)?.toPhoto() }?.status)
+        assertTrue(runBlocking { photoViewsFor("p1", db, { SERVER }).first() }.none { it.id == id }, "never shown")
+        assertEquals(emptyMap(), runBlocking { jobPhotoViewsFor("j1", db, { SERVER }).first() }.pending, "nor counted")
+    }
+
+    /** Fix round 1: a deleted photo's steps already lined up never register, back up or upload it (each step's own check). */
+    @Test fun deletedPhotoIsNeverRegisteredOrUploadedByWorkAlreadyQueued() {
+        val stamped = take()
+        await("stamped") { row(stamped)?.state == STAMPED } // its register step lined up, waiting for signal
+        val registered = take()
+        runStep(Step.REGISTER, registered) // its OneDrive and backup steps lined up
+        for (id in listOf(stamped, registered)) {
+            // Killed just after the delete was recorded: everything else is as it was, its work still queued.
+            assertFailsWith<Killed> { runBlocking { PhotoRemover(db, sync::enqueue, { throw Killed() }, clock::get).remove(id) } }
+        }
+        pipelineScope.cancel() // no watcher: only the steps see the deletes
+        runUntil("their steps ran") { row(stamped) == null && row(registered) == null }
+        awaitIdle()
+        assertNull(server.registrations[stamped], "never registered")
+        assertNull(server.copies[registered], "never backed up")
+        assertEquals(emptyList(), fake.calls.toList(), "never uploaded")
+        assertFalse(folder(stamped).exists())
+        assertFalse(folder(registered).exists())
+    }
+
+    /** Fix round 1: the orphan sweep (R80) never rebuilds a photo deleted on this phone from its meta.json, whatever is left. */
+    @Test fun orphanSweepNeverRebuildsADeletedPhoto() {
+        val id = take()
+        await("stamped") { row(id)?.state == STAMPED }
+        // The delete recorded, then its row gone first (no order may do this): its folder and meta.json are left behind.
+        val rowFirst: suspend (LocalPhotoEntity) -> Unit = { row ->
+            workManager.cancelAllWorkByTag(photoTag(row.id)).result.get()
+            db.localPhotos().delete(row.id)
+            throw Killed()
+        }
+        assertFailsWith<Killed> { runBlocking { PhotoRemover(db, sync::enqueue, rowFirst, clock::get).remove(id) } }
+        assertTrue(File(folder(id), META_JSON).isFile)
+        pipelineScope.cancel() // no watcher: the sweep alone
+        val work = workManager.getWorkInfosByTag(photoTag(id)).get().map { it.id }.toSet()
+        runBlocking { pipeline.sweepOrphans() }
+        assertNull(row(id), "not rebuilt from its meta.json")
+        assertEquals(work, workManager.getWorkInfosByTag(photoTag(id)).get().map { it.id }.toSet(), "nor started again")
+        assertFalse(folder(id).exists(), "its folder went, meta.json first")
+    }
+
+    /** Fix round 1: a tombstone goes once its PhotoRemove is answered, or after 7 days with no server row. */
+    @Test fun tombstoneClearsOnceItsRemovalIsAnsweredOrAfter7Days() {
+        val tombstones = PhotoTombstones(db.meta())
+        // Known to the server: its PhotoRemove goes with the delete.
+        val known = take()
+        runStep(Step.REGISTER, known)
+        serverRegistered(known)
+        runBlocking { PhotoRemover(db, sync::enqueue, pipeline::discard, clock::get).remove(known) }
+        val removal = ops().filterIsInstance<Op.PhotoRemove>().single()
+        assertEquals(removal.opId, runBlocking { tombstones.get(known) }?.removeOpId)
+        runBlocking { pipeline.reconcile() }
+        assertNotNull(runBlocking { tombstones.get(known) }, "kept while its PhotoRemove waits")
+        runBlocking { sync.flushOutbox() } // answered
+        runBlocking { pipeline.reconcile() }
+        assertNull(runBlocking { tombstones.get(known) }, "cleared once answered")
+
+        // Never known to the server: kept 7 days in case its registration turns up after all, then cleared.
+        val unknown = take()
+        await("stamped") { row(unknown)?.state == STAMPED }
+        runBlocking { PhotoRemover(db, sync::enqueue, pipeline::discard, clock::get).remove(unknown) }
+        clock.addAndGet(6 * DAY)
+        runBlocking { pipeline.reconcile() }
+        assertNotNull(runBlocking { tombstones.get(unknown) }, "kept 6 days on")
+        clock.addAndGet(DAY)
+        runBlocking { pipeline.reconcile() }
+        assertNull(runBlocking { tombstones.get(unknown) }, "cleared after 7 days with no server row")
+    }
+
     /** R80: a photo folder a power cut left without its row is rebuilt from its meta.json; one with neither is swept after 1 h. */
     @Test fun orphanFoldersAreRecoveredOrSwept() {
         val kept = take()
@@ -1185,6 +1344,16 @@ class PipelineTest {
     }
 
     private val removals = AtomicLong(40)
+
+    /** The server's registration of the photo reaches this phone through sync, as the sync engine applies it. */
+    private fun serverRegistered(id: String) = runBlocking {
+        val info = PhotoInfo(
+            id = id, jobId = "j1", pointId = "p1", userId = "u1", fileName = server.names[id], size = 1000,
+            status = PhotoStatus.registered, destPath = null, lastError = null, takenAt = NOW, lat = META.lat, lon = META.lon,
+            backedUp = false, confirmedAt = null, uploadMs = null, reusedFrom = null,
+        )
+        OpApplier(db).applyChange(Change(removals.incrementAndGet(), "j1", "photo", id, photo = info, at = NOW + 1))
+    }
 
     /**
      * R86: an admin removed the photo on their phone; the server's state arrives here, as the sync engine applies it.

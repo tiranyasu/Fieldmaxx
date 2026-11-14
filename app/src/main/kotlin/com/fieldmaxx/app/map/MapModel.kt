@@ -137,10 +137,12 @@ fun distanceText(meters: Double): String {
 
 /**
  * Points with a photo not in OneDrive yet, for the marker badge: the server's photos that are waiting or stuck (any
- * phone's), and [localWaiting], the points of this phone's photos the server may not know yet.
+ * phone's), and [localWaiting], the points of this phone's photos the server may not know yet. Photos [deleted] on this
+ * phone don't count, though the server may still list them (fix round 1).
  */
-fun pendingPointIds(serverPhotos: List<PhotoInfo>, localWaiting: List<String>): Set<String> =
-    serverPhotos.filter { it.status == PhotoStatus.registered || it.status == PhotoStatus.stuck }.mapTo(HashSet()) { it.pointId } + localWaiting
+fun pendingPointIds(serverPhotos: List<PhotoInfo>, localWaiting: List<String>, deleted: Set<String> = emptySet()): Set<String> =
+    serverPhotos.filter { (it.status == PhotoStatus.registered || it.status == PhotoStatus.stuck) && it.id !in deleted }
+        .mapTo(HashSet()) { it.pointId } + localWaiting
 
 /** The top bar's connection pill (R40); [waiting] counts this phone's photos not in OneDrive yet, across all jobs. */
 fun pillText(status: SyncStatus, waiting: Int): String = when (status) {

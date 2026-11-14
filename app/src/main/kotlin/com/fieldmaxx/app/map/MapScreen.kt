@@ -49,6 +49,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.fieldmaxx.app.AppGraph
 import com.fieldmaxx.app.net.ApiException
+import com.fieldmaxx.app.photos.deletedPhotoIds
 import com.fieldmaxx.app.platform.Fix
 import com.fieldmaxx.app.sync.SyncStatus
 import com.fieldmaxx.app.ui.FmxColors
@@ -149,7 +150,11 @@ class GraphMapDeps(private val graph: AppGraph) : MapDeps {
     override fun job(jobId: String): Flow<Job?> = graph.sync.job(jobId)
     override fun points(jobId: String): Flow<List<Point>> = graph.sync.points(jobId)
     override fun pendingPhotoPointIds(jobId: String): Flow<Set<String>> =
-        combine(graph.sync.jobPhotos(jobId), graph.db.localPhotos().observeWaitingPointIds(jobId)) { server, local -> pendingPointIds(server, local) }
+        combine(
+            graph.sync.jobPhotos(jobId),
+            graph.db.localPhotos().observeWaitingPointIds(jobId),
+            deletedPhotoIds(graph.db),
+        ) { server, local, deleted -> pendingPointIds(server, local, deleted) }
     override val crew: StateFlow<List<CrewPosition>> get() = graph.sync.crew
     override val status: StateFlow<SyncStatus> get() = graph.sync.status
     override val photosWaiting: Flow<Int> get() = graph.db.localPhotos().observeWaitingCount()

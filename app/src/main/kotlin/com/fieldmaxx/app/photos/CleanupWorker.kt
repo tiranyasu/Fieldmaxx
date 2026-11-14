@@ -42,6 +42,7 @@ internal suspend fun PhotoPipeline.cleanUp() {
  * R80: each `photos/<id>/` folder that has no row. Its readable meta.json brings the row back as it was saved, and the
  * photo is started: a dead battery must never lose a photo. A folder with neither is a capture that never finished,
  * deleted once it is an hour old; a meta.json that can't be read was cut off as it was written, so it counts as none.
+ * The folder of a photo deleted on this phone (its tombstone, fix round 1) is never brought back: it goes, meta.json first.
  */
 internal suspend fun PhotoPipeline.sweepOrphans() {
     val folders = withContext(Dispatchers.IO) { File(filesDir, PHOTO_FOLDERS).listFiles()?.filter { it.isDirectory }.orEmpty() }
@@ -49,6 +50,13 @@ internal suspend fun PhotoPipeline.sweepOrphans() {
     val known = photos.ids().toHashSet()
     for (folder in folders) {
         if (folder.name in known) continue
+        if (tombstones.get(folder.name) != null) {
+            withContext(Dispatchers.IO) {
+                File(folder, META_JSON).delete()
+                folder.deleteRecursively()
+            }
+            continue
+        }
         val saved = withContext(Dispatchers.IO) { savedRow(folder) }
         if (saved != null) {
             if (photos.insertIfAbsent(saved) != -1L) start(saved.id)

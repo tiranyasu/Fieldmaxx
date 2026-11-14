@@ -40,11 +40,14 @@ data class PhotoView(
 /**
  * The point's photos (R63), kept up to date: this phone's (Room's LocalPhotoEntity) merged with the server's (the sync
  * engine's copy). The server's photos are read with removed ones included, so that one hidden on the server never shows
- * from this phone's copy either. [server] is the server's address, for the thumbnails; [zone], the day a reused photo
- * was taken. Done closes the point with these photos (R48).
+ * from this phone's copy either; a photo deleted on this phone ([deletedPhotoIds]) never shows from either side. [server]
+ * is the server's address, for the thumbnails; [zone], the day a reused photo was taken. Done closes the point with these
+ * photos (R48).
  */
 fun photoViewsFor(pointId: String, db: AppDatabase, server: () -> String, zone: () -> ZoneId = ZoneId::systemDefault): Flow<List<PhotoView>> =
-    combine(db.localPhotos().observeForPoint(pointId), db.photos().observeForPoint(pointId)) { local, rows -> local to rows.map { it.toPhoto() } }
+    combine(db.localPhotos().observeForPoint(pointId), db.photos().observeForPoint(pointId), deletedPhotoIds(db)) { local, rows, deleted ->
+        local.filter { it.id !in deleted } to rows.map { it.toPhoto() }.filter { it.id !in deleted }
+    }
         .map { (local, photos) -> withReuseNotes(photoViews(local, photos, server()), photos, db, zone()) }
         .distinctUntilChanged()
         .flowOn(Dispatchers.IO) // the thumbnails check this phone's files
@@ -61,11 +64,11 @@ fun hiddenDeliveredFor(pointId: String, db: AppDatabase): Flow<Boolean> =
 /** A job's photos by point ([photoViews] per point; points with none left out), and how many of each aren't in OneDrive yet ([pendingCount]). */
 data class JobPhotoViews(val byPoint: Map<String, List<PhotoView>>, val pending: Map<String, Int>)
 
-/** "Where the photos went": the job's photos, both sides merged point by point, kept up to date. */
+/** "Where the photos went": the job's photos, both sides merged point by point, kept up to date; deleted ones left out. */
 fun jobPhotoViewsFor(jobId: String, db: AppDatabase, server: () -> String): Flow<JobPhotoViews> =
-    combine(db.localPhotos().observeForJob(jobId), db.photos().observeForJob(jobId)) { local, rows ->
-        val localByPoint = local.groupBy { it.pointId }
-        val serverByPoint = rows.map { it.toPhoto() }.groupBy { it.pointId }
+    combine(db.localPhotos().observeForJob(jobId), db.photos().observeForJob(jobId), deletedPhotoIds(db)) { local, rows, deleted ->
+        val localByPoint = local.filter { it.id !in deleted }.groupBy { it.pointId }
+        val serverByPoint = rows.map { it.toPhoto() }.filter { it.id !in deleted }.groupBy { it.pointId }
         val pointIds = localByPoint.keys + serverByPoint.keys
         val address = server()
         val byPoint = pointIds.associateWith { photoViews(localByPoint[it].orEmpty(), serverByPoint[it].orEmpty(), address) }.filterValues { it.isNotEmpty() }

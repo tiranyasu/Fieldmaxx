@@ -65,15 +65,18 @@ fun buildExportZip(photos: List<LocalPhotoEntity>, points: Map<String, Point>, o
 /**
  * Menu → "Export photos to OneDrive app" (spec §6.6.2): the job's photos on this phone that aren't in OneDrive, in a
  * Field-Notes-shaped ZIP ([buildExportZip]) under `cacheDir/shared/`, handed to Android's share sheet through the app's
- * FileProvider (the OneDrive app, Drive, email…). Photos the server shows delivered (its takeover) or removed are left
- * out. Returns what to tell the tech instead when there is nothing to export; null once the share sheet is shown.
+ * FileProvider (the OneDrive app, Drive, email…). Photos the server shows delivered (its takeover) or removed, and those
+ * deleted on this phone, are left out. Returns what to tell the tech instead when there is nothing to export; null once
+ * the share sheet is shown.
  * Throws [IOException] when the ZIP can't be written.
  */
 suspend fun exportPhotosToOneDriveApp(context: Context, db: AppDatabase, jobId: String): String? {
     val zip = withContext(Dispatchers.IO) {
         val job = db.jobs().get(jobId)?.toJob()
         val points = db.points().forJob(jobId).map { it.toPoint() }.filter { it.deletedAt == null }.associateBy { it.id }
+        val deleted = PhotoTombstones(db.meta()).ids()
         val waiting = db.localPhotos().forJob(jobId).filter { row ->
+            if (row.id in deleted) return@filter false
             val server = db.photos().get(row.id)?.toPhoto()
             server == null || (!server.delivered() && server.status != PhotoStatus.removed)
         }
