@@ -24,9 +24,12 @@ import com.fieldmaxx.app.ui.FmxColors
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
 
-/** Spec §6.5a, as the server decides it (ops/Ops.kt): anyone while none of the point's photos reached OneDrive, then admins only. */
-fun canDeletePoint(user: User, photos: List<PhotoView>): Boolean =
-    user.role == Role.admin || photos.none { it.status == PhotoUiStatus.IN_ONEDRIVE }
+/**
+ * Spec §6.5a, as the server decides it (ops/Ops.kt): anyone while none of the point's photos reached OneDrive, then admins
+ * only. [hiddenDelivered]: one that reached OneDrive was hidden since, so [photos] no longer lists it, and it still counts.
+ */
+fun canDeletePoint(user: User, photos: List<PhotoView>, hiddenDelivered: Boolean = false): Boolean =
+    user.role == Role.admin || (!hiddenDelivered && photos.none { it.status == PhotoUiStatus.IN_ONEDRIVE })
 
 /** "2 photos on this phone will be discarded"; null when there are none to discard. */
 internal fun discardWarning(onPhone: Int): String? = when {

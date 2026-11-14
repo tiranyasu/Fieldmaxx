@@ -44,6 +44,7 @@ import coil3.ImageLoader
 import com.fieldmaxx.app.AppGraph
 import com.fieldmaxx.app.map.MapController
 import com.fieldmaxx.app.photos.PhotoView
+import com.fieldmaxx.app.photos.hiddenDeliveredFor
 import com.fieldmaxx.app.photos.photoViewsFor
 import com.fieldmaxx.app.platform.Fix
 import com.fieldmaxx.app.sync.refImageUrl
@@ -125,6 +126,12 @@ interface PointDeps {
     /** How many of the point's photos are still only on this phone: the delete warning's count. */
     fun photosOnPhone(pointId: String): Flow<Int>
 
+    /**
+     * Whether a photo of the point reached OneDrive and was hidden since: no longer listed, it still keeps a tech from
+     * deleting the point, as the server rules (ops/Ops.kt). [hiddenDeliveredFor], which reads removed photos too.
+     */
+    fun hiddenDelivered(pointId: String): Flow<Boolean>
+
     val fixes: StateFlow<Fix?>
 
     /** The app's Coil loader: the signed-in client, and the disk cache that keeps reference images for work without signal. */
@@ -142,8 +149,9 @@ interface PointDeps {
 /** [PointDeps] from the app's graph. */
 class GraphPointDeps(private val graph: AppGraph) : PointDeps {
     override fun points(jobId: String): Flow<List<Point>> = graph.sync.points(jobId)
-    override fun photos(pointId: String): Flow<List<PhotoView>> = photoViewsFor(pointId)
+    override fun photos(pointId: String): Flow<List<PhotoView>> = graph.photoViewsFor(pointId)
     override fun photosOnPhone(pointId: String): Flow<Int> = graph.db.localPhotos().observeOnPhoneCount(pointId)
+    override fun hiddenDelivered(pointId: String): Flow<Boolean> = hiddenDeliveredFor(pointId, graph.db)
     override val fixes: StateFlow<Fix?> get() = graph.location.fixes
     override val imageLoader: ImageLoader get() = graph.imageLoader
     override fun server(): String = graph.server.get()
@@ -277,6 +285,7 @@ private fun OpenSheet(
     val main = Dispatchers.Main.immediate
     val photos by remember(deps, point.id) { deps.photos(point.id) }.collectAsState(emptyList(), main)
     val onPhone by remember(deps, point.id) { deps.photosOnPhone(point.id) }.collectAsState(0, main)
+    val hiddenDelivered by remember(deps, point.id) { deps.hiddenDelivered(point.id) }.collectAsState(false, main)
     val fix by deps.fixes.collectAsState(main)
     val user by produceState<User?>(null, deps) { value = deps.user() }
     val context = LocalContext.current
@@ -387,7 +396,7 @@ private fun OpenSheet(
             )
 
             val me = user
-            if (me != null && canDeletePoint(me, photos)) {
+            if (me != null && canDeletePoint(me, photos, hiddenDelivered)) {
                 DeletePoint(point.label, onPhone) {
                     // R67: only the delete is queued; its photos stay on the phone until the server accepts it.
                     editor.send(Op.PointDelete(newOpId(), point.id))

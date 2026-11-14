@@ -31,6 +31,12 @@ import com.fieldmaxx.app.map.MapScreen
 import com.fieldmaxx.app.map.rememberMapLibreController
 import com.fieldmaxx.app.menu.PointsIAddedScreen
 import com.fieldmaxx.app.net.ApiException
+import com.fieldmaxx.app.photos.GraphPhotoStripDeps
+import com.fieldmaxx.app.photos.GraphReuseDeps
+import com.fieldmaxx.app.photos.PhotoStrip
+import com.fieldmaxx.app.photos.ReusePicker
+import com.fieldmaxx.app.photos.WherePhotosWentScreen
+import com.fieldmaxx.app.photos.jobPhotoViewsFor
 import com.fieldmaxx.app.point.GraphPointDeps
 import com.fieldmaxx.app.point.PointSheet
 import java.io.IOException
@@ -57,6 +63,12 @@ object Routes {
     /** The built-in camera for one point (Task 27), from the point sheet's "Take photo". */
     const val CAMERA = "camera/{jobId}/{pointId}"
 
+    /** "Use existing photos" for one point (Task 29), from the point sheet. */
+    const val REUSE = "reuse/{jobId}/{pointId}"
+
+    /** Menu → "Where the photos went" (Task 29); Task 30's menu links here. */
+    const val WHERE_PHOTOS = "wherePhotos/{jobId}"
+
     /** [files]: picked or shared files to read at once, instead of opening the picker. */
     fun newJob(files: List<Uri> = emptyList(), link: String? = null) = "newJob" + query("files" to filesArg(files), "link" to link)
     fun addFiles(jobId: String, files: List<Uri> = emptyList()) = "addFiles/${Uri.encode(jobId)}" + query("files" to filesArg(files))
@@ -64,6 +76,8 @@ object Routes {
     fun map(jobId: String, select: String? = null) = "map/${Uri.encode(jobId)}" + query("select" to select)
     fun pointsAdded(jobId: String) = "pointsAdded/${Uri.encode(jobId)}"
     fun camera(jobId: String, pointId: String) = "camera/${Uri.encode(jobId)}/${Uri.encode(pointId)}"
+    fun reuse(jobId: String, pointId: String) = "reuse/${Uri.encode(jobId)}/${Uri.encode(pointId)}"
+    fun wherePhotos(jobId: String) = "wherePhotos/${Uri.encode(jobId)}"
 
     private fun filesArg(files: List<Uri>) = files.joinToString("\n").ifEmpty { null }
 
@@ -112,6 +126,7 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
     val toMap: (String) -> Unit = { jobId -> navController.navigate(Routes.map(jobId)) { popUpTo(Routes.JOBS) } }
     val back: () -> Unit = { navController.popBackStack() }
     val cameraDeps = remember(graph) { GraphCameraDeps(graph) }
+    val stripDeps = remember(graph) { GraphPhotoStripDeps(graph) }
     NavHost(navController, startDestination = start) {
         composable(Routes.LOGIN) {
             LoginScreen(graph.api, graph.vault, graph.server) { user ->
@@ -188,6 +203,8 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
                         entry.jobId(), pointId, pointDeps, controller, onClose = close,
                         onTakePhoto = { p -> navController.navigate(Routes.camera(p.jobId, p.id)) { launchSingleTop = true } },
                         onPickFromGallery = { p -> gallery.pick(p.jobId, p.id) },
+                        onUseExistingPhotos = { p -> navController.navigate(Routes.reuse(p.jobId, p.id)) { launchSingleTop = true } },
+                        photoStrip = { p, photos -> PhotoStrip(p, photos, stripDeps) },
                     )
                 },
             )
@@ -195,6 +212,18 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
         composable(Routes.CAMERA, arguments = listOf(jobIdArg, pointIdArg)) { entry ->
             val camera = rememberCameraXCaptureController()
             CameraScreen(entry.jobId(), entry.pointId(), cameraDeps, camera, onBack = back, preview = { camera.Preview(it) })
+        }
+        composable(Routes.REUSE, arguments = listOf(jobIdArg, pointIdArg)) { entry ->
+            ReusePicker(entry.jobId(), entry.pointId(), remember(graph) { GraphReuseDeps(graph) }, onDone = back)
+        }
+        composable(Routes.WHERE_PHOTOS, arguments = listOf(jobIdArg)) { entry ->
+            val jobId = entry.jobId()
+            WherePhotosWentScreen(
+                remember(graph, jobId) { graph.sync.job(jobId) },
+                remember(graph, jobId) { graph.sync.points(jobId) },
+                remember(graph, jobId) { jobPhotoViewsFor(jobId, graph.db, graph.server::get) },
+                onBack = back,
+            )
         }
         composable(Routes.POINTS_ADDED, arguments = listOf(jobIdArg)) { entry ->
             val jobId = entry.jobId()

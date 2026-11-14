@@ -128,6 +128,14 @@ interface LocalPhotoDao {
     @Query("SELECT * FROM LocalPhotoEntity WHERE pointId = :pointId ORDER BY createdAt")
     fun observeForPoint(pointId: String): Flow<List<LocalPhotoEntity>>
 
+    /** The job's photos on this phone: "Where the photos went" (Task 29). */
+    @Query("SELECT * FROM LocalPhotoEntity WHERE jobId = :jobId ORDER BY createdAt")
+    fun observeForJob(jobId: String): Flow<List<LocalPhotoEntity>>
+
+    /** The job's photos on this phone: "Export photos to OneDrive app" (Task 29). */
+    @Query("SELECT * FROM LocalPhotoEntity WHERE jobId = :jobId ORDER BY createdAt")
+    suspend fun forJob(jobId: String): List<LocalPhotoEntity>
+
     @Query("SELECT * FROM LocalPhotoEntity WHERE state IN (:states) ORDER BY createdAt")
     suspend fun inStates(states: List<String>): List<LocalPhotoEntity>
 

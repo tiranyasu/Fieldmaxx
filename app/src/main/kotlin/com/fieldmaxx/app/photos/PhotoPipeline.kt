@@ -379,8 +379,11 @@ class PhotoPipeline(
     private suspend fun settling(jobId: String): List<LocalPhotoEntity> =
         photos.unfinished().filter { it.jobId == jobId && it.state != CONFIRMED && pointDeleted(it) }
 
-    /** R67: the photo goes with its point: files first (meta.json first of all, or the orphan sweep would bring it back), then its row. */
-    private suspend fun discard(row: LocalPhotoEntity) {
+    /**
+     * R67: the photo goes with its point; or alone, deleted before OneDrive (R64, Task 29's PhotoRemover). Its work stops, then
+     * its files go (meta.json first of all, or the orphan sweep would bring it back), then its row.
+     */
+    internal suspend fun discard(row: LocalPhotoEntity) {
         workManager.cancelAllWorkByTag(photoTag(row.id))
         deleteFiles(row)
         photos.delete(row.id)

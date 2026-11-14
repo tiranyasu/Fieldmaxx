@@ -216,7 +216,7 @@ A05J9XE_Additional fielding/Field Notes`):
 
 ### 5.6 Test folder findings (owner's test folder, 2026-11-13)
 The owner's test folder is a **personal OneDrive** "anyone can edit" link
-(`https://1drv.ms/f/c/184ec04aa3230f57/…`). Personal OneDrive now runs on the
+(`https://1drv.ms/f/c/<cid>/…`). Personal OneDrive now runs on the
 same SharePoint back end, so the same calls work:
 - `1drv.ms` → 301 to `onedrive.live.com/:f:/g/personal/<cid>/…` → 302 to
   `onedrive.live.com/?id=…&spopath=%2Fpersonal%2F<cid>%2FDocuments%2FFieldmaxx&listurl=…`

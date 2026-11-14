@@ -78,6 +78,7 @@ class FakePointDeps(context: Context, private val db: AppDatabase? = null) : Poi
     val pointsFlow = MutableStateFlow<List<Point>>(emptyList())
     val photosFlow = MutableStateFlow<List<PhotoView>>(emptyList())
     val onPhoneFlow = MutableStateFlow(0)
+    val hiddenDeliveredFlow = MutableStateFlow(false)
     override val fixes = MutableStateFlow<Fix?>(null)
     @Volatile var me: User? = ALICE
     val ops = CopyOnWriteArrayList<Op>()
@@ -103,6 +104,7 @@ class FakePointDeps(context: Context, private val db: AppDatabase? = null) : Poi
     override fun points(jobId: String): Flow<List<Point>> = pointsFlow
     override fun photos(pointId: String): Flow<List<PhotoView>> = photosFlow
     override fun photosOnPhone(pointId: String): Flow<Int> = db?.localPhotos()?.observeOnPhoneCount(pointId) ?: onPhoneFlow
+    override fun hiddenDelivered(pointId: String): Flow<Boolean> = hiddenDeliveredFlow
     override fun server(): String = SERVER
     override suspend fun user(): User? = me
 
