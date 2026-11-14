@@ -26,10 +26,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.fieldmaxx.core.model.Point
-import java.time.Instant
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
-import java.util.Locale
 import kotlinx.coroutines.flow.Flow
 
 object AddedTags {
@@ -39,16 +35,10 @@ object AddedTags {
 
 /** The points this user added, newest first (R50). */
 fun myAddedPoints(points: List<Point>, userId: String): List<Point> =
-    points.filter { it.addedBy == userId && it.deletedAt == null }.sortedByDescending { it.updatedAt }
-
-private val WHEN: DateTimeFormatter = DateTimeFormatter.ofPattern("MMM d, h:mm a", Locale.US)
-
-fun addedWhen(at: Long, zone: ZoneId = ZoneId.systemDefault()): String = WHEN.format(Instant.ofEpochMilli(at).atZone(zone))
+    points.filter { it.addedBy == userId && it.deletedAt == null }.sortedBy { it.label }
 
 /**
- * Menu → "Points I added" (spec §6.5): this job's points added by the signed-in user, each with its label and when it
- * was added; tapping one opens it on the map. The phone keeps no separate add time, so the time is the point's
- * stored change time, which is the add time until the point is edited.
+ * Menu → "Points I added" (spec §6.5): this job's points added by the signed-in user, each with its label, type and status (R50a: no time); tapping one opens it on the map. 
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -77,7 +67,7 @@ fun PointsIAddedScreen(
                 items(mine, key = { it.id }) { p ->
                     ListItem(
                         headlineContent = { Text(p.label) },
-                        supportingContent = { Text("Added ${addedWhen(p.updatedAt)}") },
+                        supportingContent = { Text("${p.type} · ${p.status.name.replace('_', ' ')}") },
                         modifier = Modifier.fillMaxWidth().clickable { onOpen(p.id) }.testTag(AddedTags.row(p.id)),
                     )
                 }

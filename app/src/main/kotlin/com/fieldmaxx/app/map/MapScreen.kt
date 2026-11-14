@@ -236,7 +236,8 @@ fun MapScreen(
     LaunchedEffect(controller, me) { controller.setMyFix(me) }
     LaunchedEffect(controller, labels) { controller.setLabelsVisible(labels) }
     LaunchedEffect(controller) { controller.setHouseNumbers(emptyList()) } // the house-number overlay comes with Task 31
-    LaunchedEffect(controller) { controller.pointTaps.collect { selectedPointId = it } }
+    val addingNow by rememberUpdatedState(adding)
+    LaunchedEffect(controller) { controller.pointTaps.collect { if (!addingNow) selectedPointId = it } }
     LaunchedEffect(controller, deps, jobId) { withContext(main) { placeCamera(jobId, deps, controller) } }
 
     LaunchedEffect(deps, jobId) {

@@ -190,6 +190,7 @@ class FakeMapDeps : MapDeps {
     val opened = CopyOnWriteArrayList<String>()
     val permissionChanges = AtomicInteger()
     val enqueued = CopyOnWriteArrayList<Op>()
+    @Volatile var enqueueError: Exception? = null
 
     override fun job(jobId: String): Flow<Job?> = jobFlow
     override fun points(jobId: String): Flow<List<Point>> = pointsFlow
@@ -197,6 +198,7 @@ class FakeMapDeps : MapDeps {
     override fun now(): Long = clock.value
     override suspend fun userId(): String = "u1"
     override suspend fun enqueue(op: Op) {
+        enqueueError?.let { throw it }
         enqueued += op
     }
 

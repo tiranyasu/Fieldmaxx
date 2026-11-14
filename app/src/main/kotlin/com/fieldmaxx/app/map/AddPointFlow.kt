@@ -49,6 +49,7 @@ import com.fieldmaxx.core.naming.pointLabel
 import com.fieldmaxx.core.naming.suggestAddedPoleNum
 import java.util.UUID
 import kotlin.math.max
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 // "+" on the map (spec §6.5): a crosshair at your position to adjust, then the type, then the name.
@@ -100,23 +101,26 @@ sealed interface NameResult {
     data class Bad(val message: String) : NameResult
 }
 
-const val NAME_NEEDS_NUMBER = "Add a number after the name, like POLE 14B"
+private val QUERY_NAME = Regex("""^query\s*(\d+)\s*-\s*(\S+)$""", RegexOption.IGNORE_CASE)
+private val QUERY_LAYER = Regex("""^query\s*(\d+)$""", RegexOption.IGNORE_CASE)
 
-private val QUERY_NAME = Regex("""^query\s*\d+\s*-\s*(\S+)$""", RegexOption.IGNORE_CASE)
-
-/** Splits the name into [type] and number (R49); an empty number is refused. */
+/**
+ * Splits the name into the number after the chosen [type] (R49). The name has to match the chosen layer and type: an
+ * empty number, a different type, or another query's number is refused with the form to use.
+ */
 fun splitName(layer: String, type: String, name: String): NameResult {
     val text = name.trim().replace(Regex("""\s+"""), " ")
     if (isQueryLayer(layer)) {
-        val num = QUERY_NAME.matchEntire(text)?.groupValues?.get(1)
-        return if (num == null) NameResult.Bad("Name it like Query 1-44") else NameResult.Ok(type, num)
+        val q = QUERY_LAYER.matchEntire(layer.trim())!!.groupValues[1]
+        val m = QUERY_NAME.matchEntire(text)
+        return if (m == null || m.groupValues[1].toInt() != q.toInt()) {
+            NameResult.Bad("This point is in ${layer.trim()} \u2014 name it Query $q-<number>")
+        } else {
+            NameResult.Ok(type, m.groupValues[2])
+        }
     }
-    if (text.startsWith(type, ignoreCase = true) && text.length > type.length && text[type.length] == ' ') {
-        return NameResult.Ok(type, text.substring(type.length + 1).trim())
-    }
-    val cut = text.lastIndexOf(' ')
-    if (cut <= 0) return NameResult.Bad(NAME_NEEDS_NUMBER)
-    return NameResult.Ok(text.substring(0, cut), text.substring(cut + 1))
+    val num = if (text.startsWith("$type ", ignoreCase = true)) text.substring(type.length + 1).trim() else ""
+    return if (num.isEmpty()) NameResult.Bad("Name it $type <number>, like $type 1") else NameResult.Ok(type, num)
 }
 
 /** The op for the confirmed [name], or the message to show. */
@@ -160,13 +164,19 @@ internal fun AddPointFlow(
     var choice by rememberSaveable { mutableStateOf("") }
     var name by rememberSaveable { mutableStateOf("") }
     var error by rememberSaveable { mutableStateOf<String?>(null) }
+    var started by rememberSaveable { mutableStateOf(false) }
     var saving by remember { mutableStateOf(false) }
     val camera by controller.camera.collectAsState()
     val scope = rememberCoroutineScope()
 
     // The start is the user's own tap on "+", so this move is allowed (R38).
     LaunchedEffect(Unit) {
-        if (step == Step.PLACE && start != null) {
+        if (!started) {
+            started = true
+        } else {
+            return@LaunchedEffect // rotation or a restart: the tech's own drag stays
+        }
+        if (start != null) {
             controller.moveTo(CameraView(start.lat, start.lon, max(controller.camera.value?.zoom ?: ADD_ZOOM, ADD_ZOOM)))
         }
     }
@@ -231,12 +241,20 @@ internal fun AddPointFlow(
                             enabled = !saving,
                             onClick = {
                                 val id = newId()
-                                val (op, message) = addPointOp(jobId, points, choice, name, LatLon(lat, lon), newId(), id)
+                                val (op, message) = addPointOp(jobId, points, choice, name, LatLon(lat, lon), "add-$id", id)
                                 error = message
                                 if (op != null) {
                                     saving = true
                                     scope.launch {
-                                        enqueue(op)
+                                        try {
+                                            enqueue(op)
+                                        } catch (e: CancellationException) {
+                                            throw e
+                                        } catch (e: Exception) {
+                                            saving = false
+                                            error = "Couldn't save the point. Try again."
+                                            return@launch
+                                        }
                                         onAdded(id)
                                     }
                                 }
