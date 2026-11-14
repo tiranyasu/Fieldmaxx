@@ -85,10 +85,14 @@ fun healthReport(ctx: Ctx): HealthReport {
     return HealthReport(diskUsedPct(ctx.config.dataDir), photos, median(phone), median(upload))
 }
 
-/** Newest first; "Can't shoot" entries carry their reason (and the tech's text) in `detail`. */
+/**
+ * Newest first; "Can't shoot" entries carry their reason (and the tech's text) in `detail`. A point's event names the
+ * point (R68), so a deleted one can be restored from its entry.
+ */
 fun activity(ctx: Ctx, jobId: String?): List<ActivityItem> = ctx.db.read {
     prepareStatement(
-        "SELECT e.at, e.kind, u.display_name, p.label, json_extract(e.data_json, '\$.reason') AS reason, json_extract(e.data_json, '\$.text') AS text FROM events e " +
+        "SELECT e.at, e.kind, u.display_name, p.label, json_extract(e.data_json, '\$.pointId') AS point_id, " +
+            "json_extract(e.data_json, '\$.reason') AS reason, json_extract(e.data_json, '\$.text') AS text FROM events e " +
             "LEFT JOIN users u ON u.id = e.user_id " +
             "LEFT JOIN points p ON p.id = json_extract(e.data_json, '\$.pointId') " +
             "WHERE (? IS NULL OR e.job_id = ?) ORDER BY e.at DESC, e.id DESC LIMIT $ACTIVITY_LIMIT",
@@ -103,7 +107,7 @@ fun activity(ctx: Ctx, jobId: String?): List<ActivityItem> = ctx.db.read {
                         val text = rs.getString("text")
                         if (text.isNullOrBlank()) reason else "$reason: $text"
                     } else ""
-                    add(ActivityItem(rs.getLong("at"), rs.getString("display_name") ?: "", kind, rs.getString("label"), detail))
+                    add(ActivityItem(rs.getLong("at"), rs.getString("display_name") ?: "", kind, rs.getString("label"), detail, rs.getString("point_id")))
                 }
             }
         }

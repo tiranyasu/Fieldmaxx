@@ -26,8 +26,11 @@ const val NOTHING_TO_EXPORT = "No photos on this phone are waiting for OneDrive.
 
 private const val ZIP_TYPE = "application/zip"
 
-/** Characters Windows and zip tools refuse in a name, as the server's photos ZIP replaces them (exports/PhotosZip.kt). */
-private val UNSAFE = Regex("""[\\/:*?"<>|\r\n]""")
+/**
+ * Characters Windows and zip tools refuse in a name, as the server's photos ZIP replaces them (exports/PhotosZip.kt).
+ * The pole data and server ZIP exports name their files with it too (jobs/ExportPoleData.kt).
+ */
+internal val UNSAFE = Regex("""[\\/:*?"<>|\r\n]""")
 
 /** A path's safe segments: no empty, `.` or `..` parts, nothing a zip tool or Windows would refuse. */
 private fun safeSegments(path: String): List<String> =

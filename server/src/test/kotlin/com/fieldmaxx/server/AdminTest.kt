@@ -10,6 +10,7 @@ import com.fieldmaxx.core.model.Op
 import com.fieldmaxx.core.model.PhotoStatus
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.server.ops.OpsRequest
+import com.fieldmaxx.server.ops.OpsResponse
 import com.fieldmaxx.server.release.publishApk
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.get
@@ -139,6 +140,44 @@ class AdminTest {
         assertEquals("point.cantShoot", all[1].kind)
         val one = FmxJson.decodeFromString(ListSerializer(ActivityItem.serializer()), getAs(boss, "/api/admin/activity?jobId=job-1").bodyAsText())
         assertEquals(listOf("POLE 1"), one.map { it.label })
+    }
+
+    /** R68: an activity item names its point, so the admin's Activity screen can restore a deleted one from it. */
+    @Test fun activityItemsCarryTheirPointForRestore() = TestApp().run { app ->
+        seed(app)
+        val ann = tokenFor("ann")
+        val boss = tokenFor("boss", Role.admin)
+        suspend fun send(token: String, op: Op): OpsResponse {
+            val r = client.post("/api/ops") {
+                bearerAuth(token); contentType(ContentType.Application.Json)
+                setBody(FmxJson.encodeToString(OpsRequest.serializer(), OpsRequest(listOf(op))))
+            }
+            assertEquals(HttpStatusCode.OK, r.status)
+            return FmxJson.decodeFromString(OpsResponse.serializer(), r.bodyAsText())
+        }
+        suspend fun activity() = FmxJson.decodeFromString(ListSerializer(ActivityItem.serializer()), getAs(boss, "/api/admin/activity").bodyAsText())
+
+        app.clock.nowMs += 1000
+        assertTrue(send(ann, Op.PointCantShoot("c1", "pt-2", CantShootReason.no_access)).results.single().ok)
+        app.clock.nowMs += 1000
+        assertTrue(send(ann, Op.PointDelete("d1", "pt-1")).results.single().ok)
+        val deleted = activity().first()
+        assertEquals("point.delete", deleted.kind)
+        assertEquals("pt-1", deleted.pointId)
+        assertEquals("POLE 1", deleted.label)
+        assertEquals("pt-2", activity()[1].pointId, "every point event names its point")
+
+        // The admin restores it from that item.
+        app.clock.nowMs += 1000
+        assertTrue(send(boss, Op.PointRestore("r1", deleted.pointId!!)).results.single().ok)
+        assertEquals(
+            listOf("point.restore" to "pt-1", "point.delete" to "pt-1", "point.cantShoot" to "pt-2"),
+            activity().map { it.kind to it.pointId },
+        )
+        val restored = app.ctx.db.read {
+            prepareStatement("SELECT deleted_at FROM points WHERE id = 'pt-1'").use { ps -> ps.executeQuery().use { it.next(); it.getObject(1) } }
+        }
+        assertNull(restored, "the point is back")
     }
 
     @Test fun settingsDefaultsAndBackupDaysMin3() = TestApp().run { app ->

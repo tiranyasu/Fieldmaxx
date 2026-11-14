@@ -49,8 +49,9 @@ class PhotoSettings(private val store: DataStore<Preferences>) {
 
 /**
  * Puts a copy of a stamped photo in the phone's gallery, album "Fieldmaxx" (R60). From Android 10, MediaStore takes it with
- * no permission at all (Pictures/Fieldmaxx). Android 9 needs WRITE_EXTERNAL_STORAGE, declared for it alone and never asked
- * for: without it the copy is skipped. [save] never throws: a gallery copy must never hold a photo back.
+ * no permission at all (Pictures/Fieldmaxx). Android 9 needs WRITE_EXTERNAL_STORAGE, declared for it alone and asked for
+ * only by the settings screen, when the copy is switched on: without it the copy is skipped. [save] never throws: a
+ * gallery copy must never hold a photo back.
  */
 class GallerySaver internal constructor(
     private val resolver: ContentResolver,

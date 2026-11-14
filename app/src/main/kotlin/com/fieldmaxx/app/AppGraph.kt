@@ -21,6 +21,7 @@ import com.fieldmaxx.app.data.AppDatabase
 import com.fieldmaxx.app.jobs.JobList
 import com.fieldmaxx.app.map.DataStoreViewMemory
 import com.fieldmaxx.app.map.ViewMemory
+import com.fieldmaxx.app.menu.StuckPhotos
 import com.fieldmaxx.app.net.AndroidKeystoreTokenVault
 import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.AuthInterceptor
@@ -41,6 +42,7 @@ import com.fieldmaxx.app.sync.LiveSocket
 import com.fieldmaxx.app.sync.OutboxWorker
 import com.fieldmaxx.app.sync.SyncEngine
 import com.fieldmaxx.app.sync.liveSocketUrl
+import com.fieldmaxx.app.update.UpdateChecker
 import com.fieldmaxx.core.model.AppConfig
 import com.fieldmaxx.sharepoint.sharePointDestinations
 import java.util.concurrent.TimeUnit
@@ -131,6 +133,15 @@ class AppGraph(context: Context, val vault: TokenVault = AndroidKeystoreTokenVau
 
     /** The phone's own photo settings: the gallery copy (R60), which the settings screen toggles. */
     val photoSettings: PhotoSettings by lazy { PhotoSettings(dataStore("photo_settings")) }
+
+    /**
+     * In-app updates (spec §6.11, R69): our server is asked at most once a day, when the last check was is kept on the
+     * phone; Menu → Check for update asks at once.
+     */
+    val updates: UpdateChecker by lazy { UpdateChecker(api, BuildConfig.VERSION_CODE, System::currentTimeMillis, dataStore("updates")) }
+
+    /** R71: the menu's red count of stuck photos, for admins, kept for the session. */
+    val stuckPhotos: StuckPhotos by lazy { StuckPhotos(api) }
 
     /**
      * Takes each saved photo to OneDrive and to the server backup (spec §6.6), at the server's photo quality read once the

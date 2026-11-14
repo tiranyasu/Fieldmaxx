@@ -12,6 +12,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
@@ -83,6 +84,7 @@ private val LIST = ListSerializer(JobListItem.serializer())
 private val NOT_REGISTERED = listOf("saved", "stamped")
 
 object JobListTags {
+    const val OPEN_MENU = "jobs.openMenu"
     const val NEW = "jobs.new"
     const val OFFLINE = "jobs.offline"
     const val DELETE_CONFIRM = "jobs.delete.confirm"
@@ -156,6 +158,7 @@ private fun count(n: Int, noun: String) = if (n == 1) "1 $noun" else "$n ${noun}
  * every start, on pull-to-refresh and when sync comes online; with no signal the kept list stays, with an offline note.
  * Tapping a job opens it. Each job's menu has its info, adding files (active jobs) and, for its creator or an admin,
  * delete. A [notice] (the map came back because its job is gone, R42) shows as a snackbar; [onNoticeShown] once it went.
+ * [onMenu] is the ☰ (Task 30's menu, without a job); [banner] shows above the list (the update banner).
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -169,6 +172,8 @@ fun JobListScreen(
     onJobInfo: (jobId: String) -> Unit,
     notice: String? = null,
     onNoticeShown: () -> Unit = {},
+    onMenu: (() -> Unit)? = null,
+    banner: @Composable () -> Unit = {},
 ) {
     var items by remember { mutableStateOf<List<JobListItem>?>(null) } // null until the kept list or the server's
     var offline by remember { mutableStateOf(false) }
@@ -222,7 +227,17 @@ fun JobListScreen(
     }
 
     Scaffold(
-        topBar = { TopAppBar(title = { Text("Jobs") }, colors = fmxBarColors()) },
+        topBar = {
+            TopAppBar(
+                title = { Text("Jobs") },
+                navigationIcon = {
+                    onMenu?.let { open ->
+                        IconButton(onClick = open, modifier = Modifier.testTag(JobListTags.OPEN_MENU)) { Icon(Icons.Default.Menu, contentDescription = "Menu") }
+                    }
+                },
+                colors = fmxBarColors(),
+            )
+        },
         snackbarHost = { SnackbarHost(snackbar) },
         floatingActionButton = {
             ExtendedFloatingActionButton(
@@ -238,6 +253,7 @@ fun JobListScreen(
             val active = list.filter { it.job.status != FINISHED }
             val finished = list.filter { it.job.status == FINISHED }
             LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 96.dp)) {
+                item(key = "banner") { banner() }
                 if (offline) {
                     item(key = "offline") { Note(if (items == null) OFFLINE_EMPTY else OFFLINE_CACHED, Modifier.testTag(JobListTags.OFFLINE)) }
                 }

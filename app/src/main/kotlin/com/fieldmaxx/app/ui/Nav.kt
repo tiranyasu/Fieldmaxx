@@ -6,8 +6,11 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.navigation.NavBackStackEntry
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
@@ -16,6 +19,11 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.fieldmaxx.app.AppGraph
+import com.fieldmaxx.app.admin.ActivityScreen
+import com.fieldmaxx.app.admin.AdminJobsScreen
+import com.fieldmaxx.app.admin.AdminSettingsScreen
+import com.fieldmaxx.app.admin.DeliveryHealthScreen
+import com.fieldmaxx.app.admin.UsersScreen
 import com.fieldmaxx.app.auth.LoginScreen
 import com.fieldmaxx.app.camera.CameraScreen
 import com.fieldmaxx.app.camera.GraphCameraDeps
@@ -29,7 +37,10 @@ import com.fieldmaxx.app.jobs.SharedIntake
 import com.fieldmaxx.app.map.GraphMapDeps
 import com.fieldmaxx.app.map.MapScreen
 import com.fieldmaxx.app.map.rememberMapLibreController
+import com.fieldmaxx.app.menu.GraphMenuDeps
+import com.fieldmaxx.app.menu.MenuSheet
 import com.fieldmaxx.app.menu.PointsIAddedScreen
+import com.fieldmaxx.app.menu.SettingsScreen
 import com.fieldmaxx.app.net.ApiException
 import com.fieldmaxx.app.photos.GraphPhotoStripDeps
 import com.fieldmaxx.app.photos.GraphReuseDeps
@@ -39,6 +50,9 @@ import com.fieldmaxx.app.photos.WherePhotosWentScreen
 import com.fieldmaxx.app.photos.jobPhotoViewsFor
 import com.fieldmaxx.app.point.GraphPointDeps
 import com.fieldmaxx.app.point.PointSheet
+import com.fieldmaxx.app.update.UpdateBanner
+import com.fieldmaxx.app.update.UpdateInstaller
+import com.fieldmaxx.app.update.checkQuietly
 import java.io.IOException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -69,6 +83,16 @@ object Routes {
     /** Menu → "Where the photos went" (Task 29); Task 30's menu links here. */
     const val WHERE_PHOTOS = "wherePhotos/{jobId}"
 
+    /** Menu → Settings: the phone's own settings (the gallery copy). */
+    const val SETTINGS = "settings"
+
+    // The admin screens (spec §6.9), from the menu's Admin section.
+    const val USERS = "admin/users"
+    const val ADMIN_JOBS = "admin/jobs"
+    const val DELIVERY_HEALTH = "admin/health"
+    const val ACTIVITY = "admin/activity?jobId={jobId}&name={name}"
+    const val ADMIN_SETTINGS = "admin/settings"
+
     /** [files]: picked or shared files to read at once, instead of opening the picker. */
     fun newJob(files: List<Uri> = emptyList(), link: String? = null) = "newJob" + query("files" to filesArg(files), "link" to link)
     fun addFiles(jobId: String, files: List<Uri> = emptyList()) = "addFiles/${Uri.encode(jobId)}" + query("files" to filesArg(files))
@@ -78,6 +102,9 @@ object Routes {
     fun camera(jobId: String, pointId: String) = "camera/${Uri.encode(jobId)}/${Uri.encode(pointId)}"
     fun reuse(jobId: String, pointId: String) = "reuse/${Uri.encode(jobId)}/${Uri.encode(pointId)}"
     fun wherePhotos(jobId: String) = "wherePhotos/${Uri.encode(jobId)}"
+
+    /** One job's activity when [jobId] is given ([jobName] titles it), else every job's. */
+    fun activity(jobId: String? = null, jobName: String? = null) = "admin/activity" + query("jobId" to jobId, "name" to jobName)
 
     private fun filesArg(files: List<Uri>) = files.joinToString("\n").ifEmpty { null }
 
@@ -103,6 +130,10 @@ private val pointIdArg = navArgument("pointId") { type = NavType.StringType }
  *
  * [intake] is what another app shared ("Share → Fieldmaxx"): once signed in, "New job / Add to job" shows for it, once.
  * Saving a new job or adding files opens the job's map (R34).
+ *
+ * The menu (Task 30) opens from the map's ☰ for its job, and from the job list's without one. Signing out there comes
+ * back to the login screen as an ended session does. Each time the job list starts, the app checks for an update
+ * (at most once a day, R69), and the banner shows above the list.
  */
 @Composable
 fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNavController(), intake: SharedIntake? = null) {
@@ -112,10 +143,7 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
         withContext(Dispatchers.Main.immediate) {
             val toLogin: suspend () -> Unit = {
                 withContext(Dispatchers.IO) { graph.vault.save(null) }
-                navController.navigate(Routes.LOGIN) {
-                    popUpTo(Routes.JOBS) { inclusive = true }
-                    launchSingleTop = true
-                }
+                navController.toLogin()
             }
             launch { graph.sync.authRequired.collect { toLogin() } }
             if (start == Routes.JOBS) resumeSync(graph, toLogin)
@@ -125,8 +153,36 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
     var jobsNotice by rememberSaveable { mutableStateOf<String?>(null) } // e.g. the map's "This job was deleted" (R42)
     val toMap: (String) -> Unit = { jobId -> navController.navigate(Routes.map(jobId)) { popUpTo(Routes.JOBS) } }
     val back: () -> Unit = { navController.popBackStack() }
+    val toJobs: () -> Unit = {
+        if (!navController.popBackStack(Routes.JOBS, inclusive = false)) {
+            navController.navigate(Routes.JOBS) { popUpTo(navController.graph.id) { inclusive = true } }
+        }
+    }
     val cameraDeps = remember(graph) { GraphCameraDeps(graph) }
     val stripDeps = remember(graph) { GraphPhotoStripDeps(graph) }
+    val menuDeps = remember(graph) { GraphMenuDeps(graph) }
+
+    /** The menu as a sheet over [jobId]'s map, or over the job list (null); every way out of it closes it first. */
+    @Composable
+    fun Menu(jobId: String?, close: () -> Unit) {
+        MenuSheet(
+            jobId, menuDeps,
+            onOpen = { route ->
+                close()
+                navController.navigate(route)
+            },
+            onAllJobs = {
+                close()
+                toJobs()
+            },
+            onSignedOut = {
+                close()
+                navController.toLogin()
+            },
+            onDismiss = close,
+        )
+    }
+
     NavHost(navController, startDestination = start) {
         composable(Routes.LOGIN) {
             LoginScreen(graph.api, graph.vault, graph.server) { user ->
@@ -142,6 +198,15 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
                     navController.navigate(Routes.SHARE)
                 }
             }
+            val scope = rememberCoroutineScope()
+            LifecycleStartEffect(graph) {
+                // On start and once a day (spec §6.11): the checker asks the server at most once a day itself.
+                val check = scope.launch { graph.updates.checkQuietly() }
+                onStopOrDispose { check.cancel() }
+            }
+            val context = LocalContext.current
+            val installer = remember(graph, context) { UpdateInstaller(context, graph.api) }
+            var menu by rememberSaveable { mutableStateOf(false) }
             JobListScreen(
                 graph.jobList, graph.sync.status, graph.sync::savedUser,
                 onOpenJob = { navController.navigate(Routes.map(it)) },
@@ -150,7 +215,10 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
                 onJobInfo = { navController.navigate(Routes.jobInfo(it)) },
                 notice = jobsNotice,
                 onNoticeShown = { jobsNotice = null },
+                onMenu = { menu = true },
+                banner = { UpdateBanner(graph.updates.available, installer) },
             )
+            if (menu) Menu(null) { menu = false }
         }
         composable(Routes.SHARE) {
             if (intake == null) {
@@ -187,11 +255,12 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
             val controller = rememberMapLibreController(graph.compass.heading)
             val pointDeps = remember(graph) { GraphPointDeps(graph) }
             val gallery = rememberGalleryPick(cameraDeps)
+            var menu by rememberSaveable { mutableStateOf(false) }
             MapScreen(
                 entry.jobId(), remember(graph) { GraphMapDeps(graph) }, controller, mapView = { controller.View(it) },
                 onBack = back,
                 initialPointId = entry.arguments?.getString("select"),
-                onMenu = { navController.navigate(Routes.pointsAdded(entry.jobId())) }, // until Task 30's menu: its one entry
+                onMenu = { menu = true }, // R43: the ☰ opens the menu for this job
                 onJobGone = { message ->
                     jobsNotice = message
                     if (!navController.popBackStack(Routes.JOBS, inclusive = false)) {
@@ -208,6 +277,7 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
                     )
                 },
             )
+            if (menu) Menu(entry.jobId()) { menu = false }
         }
         composable(Routes.CAMERA, arguments = listOf(jobIdArg, pointIdArg)) { entry ->
             val camera = rememberCameraXCaptureController()
@@ -233,7 +303,42 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
                 onBack = back,
             )
         }
+        composable(Routes.SETTINGS) { SettingsScreen(graph.photoSettings, onBack = back) }
+
+        // ---- the admin screens (spec §6.9): the menu shows them to admins only ----
+        composable(Routes.USERS) { UsersScreen(graph.api, graph.sync::savedUser, onBack = back) }
+        composable(Routes.ADMIN_JOBS) {
+            AdminJobsScreen(
+                graph.api,
+                onOpenJob = { navController.navigate(Routes.map(it)) },
+                onActivity = { jobId, name -> navController.navigate(Routes.activity(jobId, name)) },
+                onBack = back,
+            )
+        }
+        composable(Routes.DELIVERY_HEALTH) { DeliveryHealthScreen(graph.api, onReport = graph.stuckPhotos::update, onBack = back) }
+        composable(Routes.ACTIVITY, arguments = listOf(optional("jobId"), optional("name"))) { entry ->
+            val jobId = entry.arguments?.getString("jobId")
+            val name = entry.arguments?.getString("name")
+            val title = when {
+                jobId == null -> "Activity · every job"
+                name != null -> "Activity · $name"
+                else -> "Activity"
+            }
+            ActivityScreen(graph.api, jobId, title, graph.sync::enqueue, onBack = back)
+        }
+        composable(Routes.ADMIN_SETTINGS) {
+            AdminSettingsScreen(graph.api, kept = graph::currentConfig, onSaved = graph::refreshConfig, onBack = back)
+        }
     }
+}
+
+/**
+ * To the login screen with nothing to go back to: after the session ended on the server, or on Menu → Sign out. The
+ * jobs screen is the root of every signed-in back stack, so popping it clears them all.
+ */
+private fun NavHostController.toLogin() = navigate(Routes.LOGIN) {
+    popUpTo(Routes.JOBS) { inclusive = true }
+    launchSingleTop = true
 }
 
 /**
