@@ -182,11 +182,10 @@ class ContentPickedMedia internal constructor(
     @SuppressLint("NewApi") // sdk is Build.VERSION.SDK_INT, as the public constructor gives it
     override fun open(uri: Uri): InputStream {
         if (sdk >= Build.VERSION_CODES.Q && hasPermission() && uri.scheme == "content" && uri.authority == MediaStore.AUTHORITY) {
+            // Refused with UnsupportedOperationException or SecurityException where the uri can't give it, or not found.
             try {
                 openStream(MediaStore.setRequireOriginal(uri))?.let { return it }
-            } catch (e: UnsupportedOperationException) {
-                Log.i(TAG, "No original for $uri", e)
-            } catch (e: SecurityException) {
+            } catch (e: RuntimeException) {
                 Log.i(TAG, "No original for $uri", e)
             } catch (e: FileNotFoundException) {
                 Log.i(TAG, "No original for $uri", e)

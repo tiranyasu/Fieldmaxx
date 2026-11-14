@@ -121,8 +121,8 @@ private enum class CameraAccess { ASKING, ALLOWED, REFUSED }
 /**
  * The built-in camera for one point (spec §6.6): [preview] (the CameraX preview, with flash and pinch zoom) under a live
  * overlay of exactly what will be stamped, and a shutter for several photos in a row, with a count of those taken here.
- * Each press saves the fix and compass reading of that moment ([cameraMeta]); a photo once pressed is saved even if the
- * screen goes, and Back waits for it.
+ * Each press saves the fix and compass reading of that moment ([cameraMeta]). Once the camera has written a photo it is
+ * saved even if the screen goes; Back waits for the photos being taken, and a photo that couldn't be taken says why.
  *
  * The camera permission is asked on entering (R53). Refused, the screen says so, with a way to the app's settings, and
  * still offers "Pick from gallery".

@@ -520,6 +520,16 @@ class CameraTest {
         assertEquals("39.700000, -119.800000", stampLines(meta.stampMeta(ZONE))[1], "never 0, 0 from zeroed values")
         assertNull(meta.headingDeg)
         assertEquals(NOW, meta.takenAt)
+
+        // Some apps write 0, 0 for "no position": that isn't where the photo was taken either.
+        val nullIsland = temp.newFile().apply { writeBytes(fixture("gps.jpg")) }
+        ExifInterface(nullIsland).apply {
+            setLatLong(0.0, 0.0)
+            saveAttributes()
+        }
+        media.add(PICKED, nullIsland.readBytes())
+        val zero = meta(assertNotNull(db.localPhotos().get(photos.saveFromGallery("j1", "p1", PICKED, "A05J9XE", "POLE 1", here))))
+        assertEquals("39.700000, -119.800000", stampLines(zero.stampMeta(ZONE))[1])
     }
 
     @Test fun mediaLocationAskedOnceBeforeTheFirstPick() { // R52
