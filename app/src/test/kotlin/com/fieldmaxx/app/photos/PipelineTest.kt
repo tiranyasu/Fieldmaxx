@@ -79,14 +79,19 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.job
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.After
 import org.junit.Before
@@ -367,10 +372,12 @@ class PipelineTest {
 
     @Test fun neverMoreThan3OneDriveUploads() {
         fake.uploadDelayMs = 15
+        server.backupDelayMs = 5
         val ids = (1..8).map { take() }
-        runUntil("all 8 in OneDrive") { ids.all { row(it)?.state == CONFIRMED } }
+        runUntil("all 8 in OneDrive and backed up") { ids.all(::done) }
         assertEquals(3, dest.maxInFlight.get(), "three at a time, never more")
         assertEquals(8, fake.files.size)
+        assertEquals(1, server.maxBackupsAtOnce.get(), "one backup stream (R59)")
     }
 
     @Test fun backupRunsWhenOneDriveFails() {
@@ -689,6 +696,23 @@ class PipelineTest {
         assertEquals(2, fake.files.size)
     }
 
+    /** R59: OneDrive goes first: while a OneDrive upload waits for one of its 3 streams, the backup holds its next chunk. */
+    @Test fun backupHoldsBackWhileOneDriveWaitsForAStream() = runBlocking {
+        val busy = CompletableDeferred<Unit>()
+        val streams = (1..3).map { launch(Dispatchers.Default) { UploadGate.withOneDrive { busy.await() } } }
+        await("3 OneDrive uploads") { UploadGate.oneDrive.availablePermits == 0 }
+        val fourth = launch(Dispatchers.Default) { UploadGate.withOneDrive {} } // ready, waiting for a stream
+        delay(50)
+        val backup = async(Dispatchers.Default) { UploadGate.oneDriveFirst() }
+        delay(200)
+        assertFalse(backup.isCompleted, "the backup waits while OneDrive has an upload waiting")
+        busy.complete(Unit) // a stream frees: the fourth upload takes it, and none waits any more
+        withTimeout(5_000) { backup.await() }
+        (streams + fourth).joinAll()
+        assertEquals(3, UploadGate.oneDrive.availablePermits)
+        UploadGate.oneDriveFirst() // nothing waiting: the backup goes at once
+    }
+
     /** R60: Android 9 needs the storage permission for a gallery copy; without it the copy is skipped, never asked for. */
     @Test fun androidNineWithoutPermissionSkipsTheGalleryCopy() {
         val gallery = Robolectric.setupContentProvider(Gallery::class.java, MediaStore.AUTHORITY)
@@ -890,6 +914,9 @@ private class PhotoServer : Api by notCalled() {
     @Volatile var snapshotDown = false
     @Volatile var afterRegister: (() -> Unit)? = null
     @Volatile var afterBackupChunk: (() -> Unit)? = null
+    @Volatile var backupDelayMs = 0L
+    private val backupsAtOnce = AtomicInteger()
+    val maxBackupsAtOnce = AtomicInteger()
 
     private fun name(r: PhotoRegistration): String {
         val p = snapshots.values.flatMap { it.points }.first { it.id == r.pointId }
@@ -916,6 +943,12 @@ private class PhotoServer : Api by notCalled() {
 
     override suspend fun backupChunk(id: String, offset: Long, bytes: ByteArray): Pair<Long, Boolean> {
         if (id in backupBlocked) throw IOException("Can't reach the server")
+        maxBackupsAtOnce.accumulateAndGet(backupsAtOnce.incrementAndGet(), ::maxOf)
+        try {
+            delay(backupDelayMs) // the chunk on its way
+        } finally {
+            backupsAtOnce.decrementAndGet()
+        }
         val reply = synchronized(lock) {
             val r = registrations[id] ?: throw ApiException(404, "Photo not found")
             val have = copies[id] ?: ByteArray(0)

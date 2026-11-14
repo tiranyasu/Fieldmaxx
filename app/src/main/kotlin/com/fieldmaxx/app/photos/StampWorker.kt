@@ -8,7 +8,15 @@ import androidx.work.WorkerParameters
 import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+
+/**
+ * One photo is stamped at a time: a 16 MP photo takes 64 MB as a bitmap, and photos taken in a row would otherwise all
+ * be decoded at once.
+ */
+private val stamping = Mutex()
 
 /** Step 2 of spec §6.6, "saved" → "stamped". It needs no network, so it runs at once. */
 class StampWorker internal constructor(context: Context, params: WorkerParameters, private val pipeline: PhotoPipeline) :
@@ -33,7 +41,7 @@ internal suspend fun PhotoPipeline.stamp(id: String) = runStep(Step.STAMP, id) {
     val meta = row.captureMeta()
     val quality = quality()
     try {
-        withContext(Dispatchers.IO) { Stamper.stamp(original, stamped, meta, zone(), quality) }
+        stamping.withLock { withContext(Dispatchers.IO) { Stamper.stamp(original, stamped, meta, zone(), quality) } }
     } catch (e: UnreadablePhotoException) {
         return@runStep Outcome.Stuck(e.message ?: "This photo can't be read")
     }

@@ -197,15 +197,11 @@ class PhotoPipeline(
      * settles deleted points and server takeovers, and lines up every unfinished photo's step from its persisted state,
      * keeping work WorkManager still has and any backoff still running (R55).
      */
-    fun resumeAll(): Job = scope.launch {
-        guarded("Resuming photos") {
-            watch()
-            resume()
-        }
-    }
+    fun resumeAll(): Job = scope.launch { guarded("Resuming photos") { resume() } }
 
     /** resumeAll's work, also the 6-hourly safety net. */
     internal suspend fun resume() {
+        watch()
         sweepOrphans()
         reconcile()
         for (row in photos.unfinished()) enqueueCurrent(row, ExistingWorkPolicy.KEEP, row.nextAttemptAt - now())
@@ -295,9 +291,12 @@ class PhotoPipeline(
     private fun watch() {
         if (!watching.compareAndSet(false, true)) return
         scope.launch {
-            db.invalidationTracker.createFlow("LocalPhotoEntity", "PointEntity", "JobEntity", "PhotoInfoEntity", "OutboxEntity")
-                .conflate()
-                .collect { guarded("Checking waiting photos") { reconcile() } }
+            guarded("Watching the photos") {
+                db.invalidationTracker.createFlow("LocalPhotoEntity", "PointEntity", "JobEntity", "PhotoInfoEntity", "OutboxEntity")
+                    .conflate()
+                    .collect { guarded("Checking the photos") { reconcile() } }
+            }
+            watching.set(false) // the next resume watches again
         }
     }
 
