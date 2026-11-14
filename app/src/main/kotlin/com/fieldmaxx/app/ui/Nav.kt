@@ -17,6 +17,10 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.fieldmaxx.app.AppGraph
 import com.fieldmaxx.app.auth.LoginScreen
+import com.fieldmaxx.app.camera.CameraScreen
+import com.fieldmaxx.app.camera.GraphCameraDeps
+import com.fieldmaxx.app.camera.rememberCameraXCaptureController
+import com.fieldmaxx.app.camera.rememberGalleryPick
 import com.fieldmaxx.app.jobs.JobInfoScreen
 import com.fieldmaxx.app.jobs.JobListScreen
 import com.fieldmaxx.app.jobs.NewJobScreen
@@ -50,12 +54,16 @@ object Routes {
     /** Menu → "Points I added" (Task 26); Task 30's menu links here. */
     const val POINTS_ADDED = "pointsAdded/{jobId}"
 
+    /** The built-in camera for one point (Task 27), from the point sheet's "Take photo". */
+    const val CAMERA = "camera/{jobId}/{pointId}"
+
     /** [files]: picked or shared files to read at once, instead of opening the picker. */
     fun newJob(files: List<Uri> = emptyList(), link: String? = null) = "newJob" + query("files" to filesArg(files), "link" to link)
     fun addFiles(jobId: String, files: List<Uri> = emptyList()) = "addFiles/${Uri.encode(jobId)}" + query("files" to filesArg(files))
     fun jobInfo(jobId: String, link: String? = null) = "jobInfo/${Uri.encode(jobId)}" + query("link" to link)
     fun map(jobId: String, select: String? = null) = "map/${Uri.encode(jobId)}" + query("select" to select)
     fun pointsAdded(jobId: String) = "pointsAdded/${Uri.encode(jobId)}"
+    fun camera(jobId: String, pointId: String) = "camera/${Uri.encode(jobId)}/${Uri.encode(pointId)}"
 
     private fun filesArg(files: List<Uri>) = files.joinToString("\n").ifEmpty { null }
 
@@ -65,11 +73,14 @@ object Routes {
 
 private fun NavBackStackEntry.jobId(): String = arguments?.getString("jobId").orEmpty()
 
+private fun NavBackStackEntry.pointId(): String = arguments?.getString("pointId").orEmpty()
+
 private fun NavBackStackEntry.files(): List<Uri> =
     arguments?.getString("files")?.split('\n')?.filter { it.isNotEmpty() }?.map(Uri::parse).orEmpty()
 
 private val optional = { name: String -> navArgument(name) { type = NavType.StringType; nullable = true; defaultValue = null } }
 private val jobIdArg = navArgument("jobId") { type = NavType.StringType }
+private val pointIdArg = navArgument("pointId") { type = NavType.StringType }
 
 /**
  * The app's screens. A stored session opens straight on the jobs; otherwise the login screen comes first. Syncing starts
@@ -100,6 +111,7 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
     var jobsNotice by rememberSaveable { mutableStateOf<String?>(null) } // e.g. the map's "This job was deleted" (R42)
     val toMap: (String) -> Unit = { jobId -> navController.navigate(Routes.map(jobId)) { popUpTo(Routes.JOBS) } }
     val back: () -> Unit = { navController.popBackStack() }
+    val cameraDeps = remember(graph) { GraphCameraDeps(graph) }
     NavHost(navController, startDestination = start) {
         composable(Routes.LOGIN) {
             LoginScreen(graph.api, graph.vault, graph.server) { user ->
@@ -159,6 +171,7 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
         composable(Routes.MAP, arguments = listOf(jobIdArg, optional("select"))) { entry ->
             val controller = rememberMapLibreController(graph.compass.heading)
             val pointDeps = remember(graph) { GraphPointDeps(graph) }
+            val gallery = rememberGalleryPick(cameraDeps)
             MapScreen(
                 entry.jobId(), remember(graph) { GraphMapDeps(graph) }, controller, mapView = { controller.View(it) },
                 onBack = back,
@@ -170,8 +183,18 @@ fun FieldmaxxNav(graph: AppGraph, navController: NavHostController = rememberNav
                         navController.navigate(Routes.JOBS) { popUpTo(Routes.MAP) { inclusive = true } }
                     }
                 },
-                pointSheet = { pointId, close -> PointSheet(entry.jobId(), pointId, pointDeps, controller, onClose = close) },
+                pointSheet = { pointId, close ->
+                    PointSheet(
+                        entry.jobId(), pointId, pointDeps, controller, onClose = close,
+                        onTakePhoto = { p -> navController.navigate(Routes.camera(p.jobId, p.id)) },
+                        onPickFromGallery = { p -> gallery.pick(p.jobId, p.id) },
+                    )
+                },
             )
+        }
+        composable(Routes.CAMERA, arguments = listOf(jobIdArg, pointIdArg)) { entry ->
+            val camera = rememberCameraXCaptureController()
+            CameraScreen(entry.jobId(), entry.pointId(), cameraDeps, camera, onBack = back, preview = { camera.Preview(it) })
         }
         composable(Routes.POINTS_ADDED, arguments = listOf(jobIdArg)) { entry ->
             val jobId = entry.jobId()

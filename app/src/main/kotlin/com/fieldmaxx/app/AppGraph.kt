@@ -17,6 +17,7 @@ import coil3.disk.DiskCache
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import coil3.request.CachePolicy
 import coil3.request.ImageRequest
+import com.fieldmaxx.app.camera.ContentPickedMedia
 import com.fieldmaxx.app.data.AppDatabase
 import com.fieldmaxx.app.jobs.JobList
 import com.fieldmaxx.app.map.DataStoreViewMemory
@@ -28,6 +29,8 @@ import com.fieldmaxx.app.net.ConfigStore
 import com.fieldmaxx.app.net.OkHttpApi
 import com.fieldmaxx.app.net.ServerAddress
 import com.fieldmaxx.app.net.TokenVault
+import com.fieldmaxx.app.photos.LocalPhotos
+import com.fieldmaxx.app.photos.PhotoPipelineStarter
 import com.fieldmaxx.app.platform.CompassSource
 import com.fieldmaxx.app.platform.ForegroundTracker
 import com.fieldmaxx.app.platform.FusedLocationSource
@@ -120,6 +123,12 @@ class AppGraph(context: Context, val vault: TokenVault = AndroidKeystoreTokenVau
 
     /** The map's view per user per job (spec §6.3). */
     val mapViews: ViewMemory by lazy { DataStoreViewMemory(dataStore("map_views")) }
+
+    /** Starts a saved photo on its way. A no-op until Task 28's pipeline replaces it: photos stay "saved" meanwhile (R54). */
+    val photoStarter: PhotoPipelineStarter = PhotoPipelineStarter { }
+
+    /** Photos taken or picked on this phone: each is written to app storage and recorded before anything else happens (§6.6). */
+    val localPhotos: LocalPhotos by lazy { LocalPhotos(db, app.filesDir, photoStarter, System::currentTimeMillis, ContentPickedMedia(app)) }
 
     /** One store per file and graph; it closes with the graph's scope. A damaged file starts empty again. */
     private fun dataStore(name: String): DataStore<Preferences> = PreferenceDataStoreFactory.create(

@@ -112,6 +112,11 @@ dependencies {
     implementation(libs.coil)
     implementation(libs.coil.compose) // the point sheet's reference images
     implementation(libs.coil.network.okhttp)
+    implementation(libs.androidx.camera.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
+    implementation(libs.androidx.exifinterface) // a gallery photo's own GPS and time
     debugImplementation(libs.androidx.compose.ui.test.manifest) // the empty activity createComposeRule() launches
 
     testImplementation(platform(libs.androidx.compose.bom))
