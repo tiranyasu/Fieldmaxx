@@ -183,7 +183,7 @@ class MockSharePoint : Closeable {
                 MockResponse().setResponseCode(302).setHeader(
                     "Location",
                     server.url(
-                        "/?id=184EC04AA3230F57%21sTOKEN&spopath=%2Fpersonal%2Fcid%2FDocuments%2FFieldmaxx" +
+                        "/?id=0000000000000000%21sTOKEN&spopath=%2Fpersonal%2Fcid%2FDocuments%2FFieldmaxx" +
                             "&listurl=https%3A%2F%2Fonedrive.live.com%2Fpersonal%2Fcid%2FDocuments",
                     ).toString(),
                 ),
