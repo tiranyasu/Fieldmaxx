@@ -6,6 +6,9 @@ import androidx.lifecycle.testing.TestLifecycleOwner
 import com.fieldmaxx.app.sync.LiveSocket
 import com.fieldmaxx.core.model.ClientMessage
 import com.fieldmaxx.core.model.ServerMessage
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -88,22 +91,53 @@ class PlatformTest {
     }
 
     // --- compass ---
+    // Each fixture is a physical pose: the device's x (right), y (top) and z (out of the screen) axes as world vectors
+    // (east, north, up). The expected heading comes from the pose: the camera faces -z, the screen's top is y (x in ROTATION_90).
+
+    private fun rotationVector(x: DoubleArray, y: DoubleArray, z: DoubleArray): FloatArray {
+        // Rows of the device-to-world matrix are the world axes in device coordinates.
+        val m = arrayOf(doubleArrayOf(x[0], y[0], z[0]), doubleArrayOf(x[1], y[1], z[1]), doubleArrayOf(x[2], y[2], z[2]))
+        val t = m[0][0] + m[1][1] + m[2][2]
+        val q = when {
+            t > 0 -> { val k = 2 * sqrt(t + 1); doubleArrayOf((m[2][1] - m[1][2]) / k, (m[0][2] - m[2][0]) / k, (m[1][0] - m[0][1]) / k, k / 4) }
+            m[0][0] >= m[1][1] && m[0][0] >= m[2][2] -> { val k = 2 * sqrt(1 + m[0][0] - m[1][1] - m[2][2]); doubleArrayOf(k / 4, (m[0][1] + m[1][0]) / k, (m[0][2] + m[2][0]) / k, (m[2][1] - m[1][2]) / k) }
+            m[1][1] >= m[2][2] -> { val k = 2 * sqrt(1 + m[1][1] - m[0][0] - m[2][2]); doubleArrayOf((m[0][1] + m[1][0]) / k, k / 4, (m[1][2] + m[2][1]) / k, (m[0][2] - m[2][0]) / k) }
+            else -> { val k = 2 * sqrt(1 + m[2][2] - m[0][0] - m[1][1]); doubleArrayOf((m[0][2] + m[2][0]) / k, (m[1][2] + m[2][1]) / k, k / 4, (m[1][0] - m[0][1]) / k) }
+        }
+        return floatArrayOf(q[0].toFloat(), q[1].toFloat(), q[2].toFloat(), q[3].toFloat())
+    }
+
+    private fun v(e: Double, n: Double, u: Double) = doubleArrayOf(e, n, u)
 
     @Test fun azimuthNorthPortrait() {
-        // Identity rotation: the phone lies flat with its top toward north.
-        assertEquals(0.0, azimuthFromRotationVector(floatArrayOf(0f, 0f, 0f, 1f), Surface.ROTATION_0), 0.01)
-        // Turned a quarter clockwise (seen from above), the top points east.
-        val s = Math.sin(Math.PI / 4).toFloat()
-        assertEquals(90.0, azimuthFromRotationVector(floatArrayOf(0f, 0f, -s, s), Surface.ROTATION_0), 0.01)
+        // Flat, screen to the sky, top pointing north.
+        assertEquals(0.0, azimuthFromRotationVector(rotationVector(v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), v(0.0, 0.0, 1.0)), Surface.ROTATION_0), 1.0)
+        // Flat, top pointing east (x then points south).
+        assertEquals(90.0, azimuthFromRotationVector(rotationVector(v(0.0, -1.0, 0.0), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0)), Surface.ROTATION_0), 1.0)
     }
 
     @Test fun azimuthRemappedForLandscape() {
-        // The same flat phone, top to north, east on its right side. ROTATION_90 is the phone turned counter-clockwise (top
-        // on the left), so the screen's up is the phone's right side: east. ROTATION_270 is the reverse: west. 180: south.
-        val north = floatArrayOf(0f, 0f, 0f, 1f)
-        assertEquals(90.0, azimuthFromRotationVector(north, Surface.ROTATION_90), 0.01)
-        assertEquals(270.0, azimuthFromRotationVector(north, Surface.ROTATION_270), 0.01)
-        assertEquals(180.0, azimuthFromRotationVector(north, Surface.ROTATION_180), 0.01)
+        // Flat in ROTATION_90: the screen's top is the device's +x axis, pointing north (y then points west).
+        assertEquals(0.0, azimuthFromRotationVector(rotationVector(v(0.0, 1.0, 0.0), v(-1.0, 0.0, 0.0), v(0.0, 0.0, 1.0)), Surface.ROTATION_90), 1.0)
+    }
+
+    @Test fun azimuthUprightPortraitFollowsTheCamera() {
+        // Upright, screen facing the user who stands north of it: the back camera faces south.
+        val pose = rotationVector(v(-1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), v(0.0, 1.0, 0.0))
+        assertEquals(180.0, azimuthFromRotationVector(pose, Surface.ROTATION_0), 1.0)
+    }
+
+    @Test fun azimuthUprightTippedPastVerticalStillFollowsTheCamera() {
+        // The same pose with the top tipped 10 degrees toward the user: the screen-up rule would now say north.
+        val tilt = Math.toRadians(10.0)
+        val pose = rotationVector(v(-1.0, 0.0, 0.0), v(0.0, sin(tilt), cos(tilt)), v(0.0, cos(tilt), -sin(tilt)))
+        assertEquals(180.0, azimuthFromRotationVector(pose, Surface.ROTATION_0), 1.0)
+    }
+
+    @Test fun azimuthUprightLandscapeFollowsTheCamera() {
+        // Upright landscape (ROTATION_90: the device's +x is up), screen facing east, so the camera faces west.
+        val pose = rotationVector(v(0.0, 0.0, 1.0), v(0.0, -1.0, 0.0), v(1.0, 0.0, 0.0))
+        assertEquals(270.0, azimuthFromRotationVector(pose, Surface.ROTATION_90), 1.0)
     }
 
     // --- lifecycle ---

@@ -7,6 +7,9 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.view.Surface
 import android.view.WindowManager
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -22,12 +25,16 @@ interface CompassSource {
 }
 
 /**
- * Azimuth in degrees (0..360) of the screen's up direction, from a TYPE_ROTATION_VECTOR reading. The axes are remapped
- * for [displayRotation] (a [Surface] ROTATION_* constant) so the heading follows the screen, not the phone's natural top.
+ * The direction the phone points, in degrees (0..360) clockwise from magnetic north, from a TYPE_ROTATION_VECTOR reading.
+ * Upright (the device Z axis within 45 degrees of horizontal) that is the back camera's axis, -Z, projected on the
+ * horizontal; it doesn't depend on [displayRotation]. Flat it is the top of the screen, with the axes remapped for
+ * [displayRotation] (a [Surface] ROTATION_* constant). The two rules agree near the switch.
  */
 fun azimuthFromRotationVector(rv: FloatArray, displayRotation: Int): Double {
     val r = FloatArray(9)
     SensorManager.getRotationMatrixFromVector(r, rv)
+    // Rows of r are east, north, up in device axes: r[8] is how far the device Z axis points up.
+    if (abs(r[8]) < UPRIGHT_MAX_Z_UP) return (Math.toDegrees(atan2(-r[2].toDouble(), -r[5].toDouble())) + 360.0) % 360.0
     val remapped = FloatArray(9)
     val (x, y) = when (displayRotation) {
         Surface.ROTATION_90 -> SensorManager.AXIS_Y to SensorManager.AXIS_MINUS_X
@@ -40,6 +47,8 @@ fun azimuthFromRotationVector(rv: FloatArray, displayRotation: Int): Double {
     SensorManager.getOrientation(remapped, orientation)
     return (Math.toDegrees(orientation[0].toDouble()) + 360.0) % 360.0
 }
+
+private val UPRIGHT_MAX_Z_UP = cos(Math.PI / 4)
 
 class SensorCompassSource(context: Context, private val now: () -> Long = System::currentTimeMillis) : CompassSource {
     private val app = context.applicationContext
