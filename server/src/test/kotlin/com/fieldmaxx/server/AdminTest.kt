@@ -10,6 +10,9 @@ import com.fieldmaxx.core.model.HealthReport
 import com.fieldmaxx.core.model.Op
 import com.fieldmaxx.core.model.PhotoStatus
 import com.fieldmaxx.core.model.Role
+import com.fieldmaxx.server.admin.DEFAULT_IMAGERY_URL
+import com.fieldmaxx.server.admin.DEFAULT_LABELS_URL
+import com.fieldmaxx.server.admin.KEYED_LABELS_URL
 import com.fieldmaxx.server.ops.OpsRequest
 import com.fieldmaxx.server.ops.OpsResponse
 import com.fieldmaxx.server.release.latestRelease
@@ -300,6 +303,27 @@ class AdminTest {
         assertEquals("https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}", c.labelsUrl)
         assertNull(c.imageryKey); assertEquals(85, c.photoQuality); assertEquals(3, c.backupDays)
         assertEquals(HttpStatusCode.Unauthorized, client.get("/api/config").status)
+    }
+
+    @Test fun configMovesToEsriLicensedServicesWithAKey() = TestApp().run { _ ->
+        val boss = tokenFor("boss", Role.admin)
+        suspend fun cfg() = FmxJson.decodeFromString(AppConfig.serializer(), getAs(tokenFor("ann"), "/api/config").bodyAsText())
+        putSettings(boss, """{"imageryKey":"k1"}""")
+        val keyed = cfg()
+        assertEquals("https://ibasemaps-api.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", keyed.imageryUrl)
+        assertEquals(
+            "https://static-map-tiles-api.arcgis.com/arcgis/rest/services/static-basemap-tiles-service/v1/arcgis/imagery/labels/static/tile/{z}/{y}/{x}",
+            keyed.labelsUrl,
+        )
+        assertEquals("k1", keyed.imageryKey)
+        // An address the admin typed in stays, key or not.
+        putSettings(boss, """{"imageryUrl":"https://tiles.example.com/{z}/{x}/{y}"}""")
+        assertEquals("https://tiles.example.com/{z}/{x}/{y}", cfg().imageryUrl)
+        assertEquals(KEYED_LABELS_URL, cfg().labelsUrl)
+        // Emptying the key goes back to the keyless addresses.
+        putSettings(boss, """{"imageryKey":"","imageryUrl":""}""")
+        assertEquals(DEFAULT_IMAGERY_URL, cfg().imageryUrl)
+        assertEquals(DEFAULT_LABELS_URL, cfg().labelsUrl)
     }
 
     /** A minimal valid ZIP whose single entry holds [bytes] (an APK is a ZIP). */

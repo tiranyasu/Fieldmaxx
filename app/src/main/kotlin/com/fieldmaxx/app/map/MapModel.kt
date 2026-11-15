@@ -182,6 +182,37 @@ fun tileUrl(template: String, key: String?): String {
     return template + (if ('?' in template) "&" else "?") + "token=" + URLEncoder.encode(k, "UTF-8")
 }
 
+const val ESRI_IMAGERY_CREDIT = "Esri, Maxar, Earthstar Geographics, and the GIS User Community"
+const val ESRI_LABELS_CREDIT =
+    "Powered by Esri | Sources: Esri, TomTom, Garmin, FAO, NOAA, USGS, © OpenStreetMap contributors, and the GIS User Community"
+const val ESRI_CREDIT = "Esri"
+private const val ESRI_STATIC_TILES = "/static-basemap-tiles-service/"
+
+private fun hostOf(url: String) =
+    Regex("^https?://([^/:?#]+)", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)?.lowercase().orEmpty()
+
+/** Esri's licensed services, which take an ArcGIS Location Platform key. */
+private fun isKeyedEsri(url: String) = hostOf(url).endsWith(".arcgis.com")
+
+/** Esri's hosts: the old keyless arcgisonline.com and the licensed *.arcgis.com services. */
+private fun isEsri(url: String) = hostOf(url).let { it == "arcgisonline.com" || it.endsWith(".arcgisonline.com") } || isKeyedEsri(url)
+
+/** The labels layer takes the key only on Esri's licensed services; a keyless or other provider's address stays as typed. */
+fun labelsTileUrl(template: String, key: String?): String = if (isKeyedEsri(template)) tileUrl(template, key) else template
+
+/** Esri's static basemap tiles are 512 px; every other source here is 256 px. */
+fun tileSizeOf(url: String): Int = if (ESRI_STATIC_TILES in url) 512 else 256
+
+/** The credit line Esri requires for its imagery; none for another provider's address, which the admin chose. */
+fun imageryCredit(url: String): String? = ESRI_IMAGERY_CREDIT.takeIf { isEsri(url) }
+
+/** The credit line Esri requires for its labels: the full one for the static imagery labels, the short one otherwise. */
+fun labelsCredit(url: String): String? = when {
+    !isEsri(url) -> null
+    ESRI_STATIC_TILES in url -> ESRI_LABELS_CREDIT
+    else -> ESRI_CREDIT
+}
+
 private val TYPE_COLORS = mapOf(
     "POLE" to "#f97316", "PED" to "#a855f7", "HH" to "#06b6d4", "MH" to "#ec4899",
     "BU" to "#facc15", "SAI" to "#84cc16", "PFP" to "#14b8a6", "MDU" to "#f43f5e",

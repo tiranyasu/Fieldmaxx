@@ -199,6 +199,36 @@ class MapModelTest {
         assertEquals("https://tiles.example.com/{z}/{x}/{y}?style=sat&token=k1", tileUrl("https://tiles.example.com/{z}/{x}/{y}?style=sat", "k1"))
     }
 
+    @Test fun esriKeyedServicesGetTheKeyTheirCreditAndTileSize() {
+        val keylessImagery = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        val keylessLabels = "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}"
+        val imagery = "https://ibasemaps-api.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        val labels = "https://static-map-tiles-api.arcgis.com/arcgis/rest/services/static-basemap-tiles-service/v1/arcgis/imagery/labels/static/tile/{z}/{y}/{x}"
+        val other = "https://tiles.example.com/{z}/{x}/{y}"
+        // The labels layer takes the key only on Esri's licensed hosts; other addresses stay as typed.
+        assertEquals("$labels?token=k1", labelsTileUrl(labels, "k1"))
+        assertEquals(labels, labelsTileUrl(labels, null))
+        assertEquals(keylessLabels, labelsTileUrl(keylessLabels, "k1"))
+        assertEquals(other, labelsTileUrl(other, "k1"))
+        // Esri's static basemap tiles are 512 px; everything else is 256 px.
+        assertEquals(512, tileSizeOf(labels))
+        assertEquals(256, tileSizeOf(imagery))
+        assertEquals(256, tileSizeOf(keylessLabels))
+        // Each Esri address carries its credit line, keyed or not. Another provider's gets none from us.
+        assertEquals("Esri, Maxar, Earthstar Geographics, and the GIS User Community", imageryCredit(imagery))
+        assertEquals("Esri, Maxar, Earthstar Geographics, and the GIS User Community", imageryCredit(keylessImagery))
+        assertNull(imageryCredit(other))
+        assertEquals(
+            "Powered by Esri | Sources: Esri, TomTom, Garmin, FAO, NOAA, USGS, © OpenStreetMap contributors, and the GIS User Community",
+            labelsCredit(labels),
+        )
+        assertEquals("Esri", labelsCredit(keylessLabels))
+        assertNull(labelsCredit(other))
+        // A look-alike host is not Esri's.
+        assertNull(imageryCredit("https://arcgis.com.example.net/{z}/{y}/{x}"))
+        assertEquals("https://evilarcgis.com/{z}/{y}/{x}", labelsTileUrl("https://evilarcgis.com/{z}/{y}/{x}", "k1"))
+    }
+
     // ---- CameraTracker: what MapController.camera reports (R38, R61) ----
 
     private val rest = CameraView(39.6400, -119.6900, 15.0)

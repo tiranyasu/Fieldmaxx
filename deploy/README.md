@@ -266,16 +266,29 @@ everything already in OneDrive (it was never on the server). What is lost, becau
   download fails. Publish a version again (section 3), with a version code higher than the last one, before anyone
   installs Fieldmaxx on a new phone.
 
-## 6. Adding an ArcGIS key later
+## 6. The satellite map key (Esri)
 
-The map imagery comes from Esri's ArcGIS servers and works without a key. Esri expects business users to have an
-ArcGIS account, and you can add your account's key at any time without updating the app:
+The map's satellite pictures and street names come from Esri. Without a key, the app uses Esri's public addresses,
+which Esri doesn't intend for business use. With a free ArcGIS Location Platform key, the app switches to Esri's licensed
+services instead. The pictures are the same, and the first 2 million map squares each month are free. You can add the key
+at any time without updating the app:
 
-1. In your ArcGIS account, create an API key that is allowed to use basemaps (imagery).
-2. In the app, signed in as an admin, open **Menu > Admin settings**.
-3. Under **Map**, paste the key into **Imagery key (optional)**, then tap **Save**.
+1. Make a free account at <https://location.arcgis.com/sign-up/>. An ArcGIS Online account, or a work account, can't make
+   keys.
+2. In that account, open **My portal > Content > My content > New item > Developer credentials > API key credentials**.
+   - Choose **Public application** and **No item access**.
+   - Under **Basemaps**, tick **Basemap styles service** and **Static basemap tiles**.
+   - Set the expiry date (at most a year), then copy the key. Esri shows it only once.
+3. In the app, signed in as an admin, open **Menu > Admin settings**.
+4. Under **Map**, paste the key into **Imagery key (optional)**, then tap **Save**.
 
-The phones use it the next time they load the map settings. To go back to no key, empty the field and tap Save.
+The phones switch over the next time they load the map settings, and both the pictures and the street names then come
+from Esri's licensed services. Leave the two map addresses as they are: an address you type in yourself always wins over
+the key's.
+
+The key stops working on its expiry date, and the map goes blank. Before that date, make a new key and paste it in the
+same place. To go back to no key, empty the field and tap **Save**. Esri shows how much of the free amount you've used
+under **My dashboard > Usage**.
 
 ## Everyday tasks
 

@@ -161,7 +161,6 @@ private val SHOT = FmxColors.ShotMarker.hex()
 private val SHOT_OPACITY = FmxColors.ShotMarker.alpha
 private const val CREW_COLOR = "#f8fafc"
 private const val LABELS_OPACITY = 0.9f
-private const val TILE_SIZE = 256
 private const val SOURCE_MAX_ZOOM = 19f // Esri's imagery stops around here; MapLibre over-zooms the last tiles beyond it
 private const val CLUSTER_MAX_ZOOM = 17
 private const val FIT_MAX_ZOOM = 18.0
@@ -175,8 +174,6 @@ private const val NO_ACCURACY_M = 2_000.0
 private const val EARTH_CIRCUMFERENCE_M = 40_075_016.686
 private const val TILE_WORLD_PX = 512.0 // MapLibre's world is 512 px wide at zoom 0
 private const val AMBIENT_CACHE_BYTES = 256L * 1024 * 1024
-private const val ESRI_IMAGERY_CREDIT = "Esri, Maxar, Earthstar Geographics, and the GIS User Community"
-private const val ESRI_CREDIT = "Esri"
 
 /** The plain style everything is added to: a dark background where no imagery has loaded (spec §6.8). */
 private const val BASE_STYLE =
@@ -550,10 +547,14 @@ class MapLibreController(context: Context) : MapController {
         s.removeLayer(L_IMAGERY)
         s.removeSource(SRC_LABELS)
         s.removeSource(SRC_IMAGERY)
-        // The key belongs to the imagery service; the street names are a public Esri layer unless the admin changes it.
-        val esri = { url: String, credit: String -> credit.takeIf { "arcgisonline.com" in url } }
-        s.addSource(RasterSource(SRC_IMAGERY, tiles(tileUrl(c.imageryUrl, c.imageryKey), esri(c.imageryUrl, ESRI_IMAGERY_CREDIT)), TILE_SIZE))
-        s.addSource(RasterSource(SRC_LABELS, tiles(c.labelsUrl, esri(c.labelsUrl, ESRI_CREDIT)), TILE_SIZE))
+        // The key always goes with the imagery. The labels get it only on Esri's licensed services (a server with a key
+        // switches both there); the keyless street names, or another provider's, stay as typed.
+        s.addSource(
+            RasterSource(SRC_IMAGERY, tiles(tileUrl(c.imageryUrl, c.imageryKey), imageryCredit(c.imageryUrl)), tileSizeOf(c.imageryUrl)),
+        )
+        s.addSource(
+            RasterSource(SRC_LABELS, tiles(labelsTileUrl(c.labelsUrl, c.imageryKey), labelsCredit(c.labelsUrl)), tileSizeOf(c.labelsUrl)),
+        )
         s.addLayerAbove(RasterLayer(L_IMAGERY, SRC_IMAGERY), L_BACKGROUND)
         s.addLayerAbove(
             RasterLayer(L_LABELS, SRC_LABELS).withProperties(

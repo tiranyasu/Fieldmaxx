@@ -32,6 +32,15 @@ import kotlinx.serialization.Serializable
 
 const val DEFAULT_IMAGERY_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 const val DEFAULT_LABELS_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}"
+
+/**
+ * With an ArcGIS Location Platform key set, the phones use Esri's licensed services instead: the same World Imagery, and
+ * the imagery labels from the static basemap tiles service (512 px tiles). The keyless World_Transportation layer has no
+ * keyed copy. Both take the key as `token`. Without a key the keyless addresses above stay.
+ */
+const val KEYED_IMAGERY_URL = "https://ibasemaps-api.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+const val KEYED_LABELS_URL =
+    "https://static-map-tiles-api.arcgis.com/arcgis/rest/services/static-basemap-tiles-service/v1/arcgis/imagery/labels/static/tile/{z}/{y}/{x}"
 const val DEFAULT_PHOTO_QUALITY = 85
 private const val DAY_MS = 24L * 3600 * 1000
 
@@ -52,14 +61,20 @@ private fun Ctx.setting(key: String): String? = db.read {
     }
 }
 
-/** What every phone needs: map tile sources and the photo/backups settings, with the defaults where nothing is set. */
-fun appConfig(ctx: Ctx) = AppConfig(
-    imageryUrl = ctx.setting("imageryUrl")?.ifBlank { null } ?: DEFAULT_IMAGERY_URL,
-    labelsUrl = ctx.setting("labelsUrl")?.ifBlank { null } ?: DEFAULT_LABELS_URL,
-    imageryKey = ctx.setting("imageryKey")?.ifBlank { null },
-    photoQuality = ctx.setting("photoQuality")?.toIntOrNull() ?: DEFAULT_PHOTO_QUALITY,
-    backupDays = backupDays(ctx),
-)
+/**
+ * What every phone needs: map tile sources and the photo/backups settings, with the defaults where nothing is set. An
+ * address the admin typed in always wins; otherwise a key selects Esri's keyed addresses.
+ */
+fun appConfig(ctx: Ctx): AppConfig {
+    val key = ctx.setting("imageryKey")?.ifBlank { null }
+    return AppConfig(
+        imageryUrl = ctx.setting("imageryUrl")?.ifBlank { null } ?: if (key != null) KEYED_IMAGERY_URL else DEFAULT_IMAGERY_URL,
+        labelsUrl = ctx.setting("labelsUrl")?.ifBlank { null } ?: if (key != null) KEYED_LABELS_URL else DEFAULT_LABELS_URL,
+        imageryKey = key,
+        photoQuality = ctx.setting("photoQuality")?.toIntOrNull() ?: DEFAULT_PHOTO_QUALITY,
+        backupDays = backupDays(ctx),
+    )
+}
 
 private fun median(values: List<Long>): Long? {
     if (values.isEmpty()) return null
