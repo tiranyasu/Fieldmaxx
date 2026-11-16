@@ -7,6 +7,7 @@ import com.fieldmaxx.core.model.Op
 import com.fieldmaxx.core.model.OpResult
 import com.fieldmaxx.core.model.PhotoInfo
 import com.fieldmaxx.core.model.Point
+import com.fieldmaxx.core.model.POLE_TAGS
 import com.fieldmaxx.core.model.PoleData
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
@@ -16,6 +17,8 @@ import com.fieldmaxx.server.jobs.toPoint
 import com.fieldmaxx.server.photos.applyPhotoOp
 import java.sql.Connection
 import java.sql.Types
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
@@ -136,6 +139,7 @@ private fun Connection.apply(ctx: Ctx, user: User, op: Op, now: Long): Applied {
         is Op.PointUpdate -> {
             livePoint(op.pointId)
             val sets = buildList<Pair<String, Any?>> {
+                op.pole?.let { growTags(it.tags) }
                 op.pole?.let { add("pole_json" to FmxJson.encodeToString(PoleData.serializer(), it)) }
                 op.comment?.let { add("comment" to it) }
             }
@@ -189,12 +193,43 @@ private fun Connection.apply(ctx: Ctx, user: User, op: Op, now: Long): Applied {
             exec("UPDATE points SET deleted_at = NULL, deleted_by = NULL WHERE id = ?", op.pointId)
             touch(op.pointId, user, now, "point.restore")
         }
+        is Op.PointRename -> {
+            val p = livePoint(op.pointId)
+            val type = op.type.trim().uppercase()
+            val num = op.num.trim()
+            if (type.isEmpty() || num.isEmpty()) throw OpFail("needs_text")
+            touch(
+                op.pointId, user, now, "point.rename", "type" to type, "num" to num, "label" to pointLabel(p.layer, type, num),
+                "folder_path" to null, "folder_candidates_json" to null,
+            )
+        }
         is Op.PointSetFolder -> {
             livePoint(op.pointId)
             touch(op.pointId, user, now, "point.setFolder", "folder_path" to op.folderPath, "folder_candidates_json" to null)
         }
         is Op.PhotoReuse, is Op.PhotoRemove, is Op.PhotoConfirmed, is Op.PhotoFailed -> applyPhotoOp(ctx, user, op, now)
     }
+}
+
+/** The shared tag list: the `tags` settings row (a JSON array), or [POLE_TAGS] when it was never written. */
+internal fun Connection.readTags(): List<String> =
+    prepareStatement("SELECT value FROM settings WHERE key = 'tags'").use { ps ->
+        ps.executeQuery().use { if (it.next()) FmxJson.decodeFromString(ListSerializer(String.serializer()), it.getString(1)) else POLE_TAGS }
+    }
+
+internal fun Connection.writeTags(tags: List<String>) {
+    exec(
+        "INSERT INTO settings(key, value) VALUES ('tags', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        FmxJson.encodeToString(ListSerializer(String.serializer()), tags),
+    )
+}
+
+/** Appends tags not yet listed (compared case-insensitively), keeping the spelling first seen. */
+private fun Connection.growTags(used: List<String>) {
+    val list = readTags()
+    val known = list.mapTo(HashSet()) { it.lowercase() }
+    val added = used.map { it.trim() }.filter { it.isNotEmpty() && known.add(it.lowercase()) }
+    if (added.isNotEmpty()) writeTags(list + added)
 }
 
 private fun Connection.hasConfirmedPhoto(pointId: String): Boolean =

@@ -4,7 +4,14 @@ import com.fieldmaxx.core.model.ACTIVITY_LIMIT
 import com.fieldmaxx.core.model.ActivityItem
 import com.fieldmaxx.core.model.AdminSettings
 import com.fieldmaxx.core.model.AppConfig
+import com.fieldmaxx.core.FmxJson
+import com.fieldmaxx.core.model.Change
 import com.fieldmaxx.core.model.HealthReport
+import com.fieldmaxx.core.model.PoleData
+import com.fieldmaxx.core.model.TagRename
+import com.fieldmaxx.core.model.User
+import com.fieldmaxx.server.ops.readTags
+import com.fieldmaxx.server.ops.writeTags
 import com.fieldmaxx.core.model.PhotoInfo
 import com.fieldmaxx.server.Ctx
 import com.fieldmaxx.server.HttpError
@@ -15,6 +22,7 @@ import com.fieldmaxx.server.delivery.backupDays
 import com.fieldmaxx.server.delivery.diskUsedPct
 import com.fieldmaxx.server.delivery.retryPhoto
 import com.fieldmaxx.server.jobs.toPhoto
+import com.fieldmaxx.server.jobs.toPoint
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
 import io.ktor.server.application.createRouteScopedPlugin
@@ -73,6 +81,7 @@ fun appConfig(ctx: Ctx): AppConfig {
         imageryKey = key,
         photoQuality = ctx.setting("photoQuality")?.toIntOrNull() ?: DEFAULT_PHOTO_QUALITY,
         backupDays = backupDays(ctx),
+        tags = ctx.db.read { readTags() },
     )
 }
 
@@ -168,6 +177,47 @@ fun updateSettings(ctx: Ctx, s: AdminSettings) {
     }
 }
 
+/** Replaces the tag list: trimmed, blanks and case-insensitive duplicates dropped. Points keep tags no longer listed. */
+fun replaceTags(ctx: Ctx, tags: List<String>) {
+    val seen = HashSet<String>()
+    val clean = tags.map { it.trim() }.filter { it.isNotEmpty() && seen.add(it.lowercase()) }
+    ctx.db.tx { writeTags(clean) }
+}
+
+/** Renames a tag in the list and on every point of a live job that has it; each changed point goes through the change log. */
+fun renameTag(ctx: Ctx, user: User, r: TagRename) {
+    val to = r.to.trim()
+    if (to.isEmpty()) throw HttpError(HttpStatusCode.BadRequest, "The new tag name is empty")
+    val changes = ctx.db.tx {
+        val list = readTags()
+        val idx = list.indexOfFirst { it.equals(r.from.trim(), ignoreCase = true) }
+        if (idx < 0) throw HttpError(HttpStatusCode.NotFound, "No such tag")
+        if (list.any { it.equals(to, ignoreCase = true) }) throw HttpError(HttpStatusCode.BadRequest, "That tag already exists")
+        val from = list[idx]
+        writeTags(list.toMutableList().also { it[idx] = to })
+        val now = ctx.clock.millis()
+        val points = prepareStatement(
+            "SELECT p.* FROM points p JOIN jobs j ON j.id = p.job_id WHERE j.deleted_at IS NULL AND p.deleted_at IS NULL",
+        ).use { ps -> ps.executeQuery().use { rs -> buildList { while (rs.next()) add(rs.toPoint()) } } }
+        val out = mutableListOf<Change>()
+        for (p in points) {
+            val old = p.pole ?: continue
+            if (old.tags.none { it == from }) continue
+            val pole = old.copy(tags = old.tags.map { if (it == from) to else it })
+            prepareStatement("UPDATE points SET pole_json = ?, updated_at = ?, updated_by = ? WHERE id = ?").use {
+                it.setString(1, FmxJson.encodeToString(PoleData.serializer(), pole)); it.setLong(2, now); it.setString(3, user.id)
+                it.setString(4, p.id); it.executeUpdate()
+            }
+            val updated = prepareStatement("SELECT * FROM points WHERE id = ?").use { ps ->
+                ps.setString(1, p.id); ps.executeQuery().use { rs -> rs.next(); rs.toPoint() }
+            }
+            out += ctx.changes.recordInTx(this, updated.jobId, "point", updated.id, point = updated)
+        }
+        out
+    }
+    changes.forEach(ctx.changes::publish)
+}
+
 /** Route-scoped check: every call under the route it is installed on must come from an admin. */
 private val AdminOnly = createRouteScopedPlugin("AdminOnly") {
     // After authentication, so the principal exists; a 401 challenge has already ended the call before this runs.
@@ -190,6 +240,14 @@ fun Route.adminRoutes(ctx: Ctx) {
                 // ?kinds=point.delete,point.restore: only those (one list's own); none or empty: every kind but deliveries
                 val kinds = query["kinds"]?.split(',')?.map { it.trim() }?.filter { it.isNotEmpty() }?.toSet()?.ifEmpty { null }
                 call.respond(activity(ctx, query["jobId"]?.ifBlank { null }, kinds))
+            }
+            put("/tags") {
+                replaceTags(ctx, call.receive<List<String>>())
+                call.respond(appConfig(ctx))
+            }
+            post("/tags/rename") {
+                renameTag(ctx, call.requireAdmin(), call.receive<TagRename>())
+                call.respond(appConfig(ctx))
             }
             put("/settings") {
                 updateSettings(ctx, call.receive<AdminSettings>())

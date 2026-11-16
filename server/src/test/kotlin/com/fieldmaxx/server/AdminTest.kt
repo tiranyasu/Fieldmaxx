@@ -462,4 +462,59 @@ class AdminTest {
         assertTrue(html.contains("Open the downloaded file"))
         assertTrue(html.contains("sign in", ignoreCase = true))
     }
+
+    private suspend fun ApplicationTestBuilder.tagsReq(token: String, json: String) = client.put("/api/admin/tags") {
+        bearerAuth(token); contentType(ContentType.Application.Json); setBody(json)
+    }
+
+    private suspend fun ApplicationTestBuilder.renameReq(token: String, from: String, to: String) = client.post("/api/admin/tags/rename") {
+        bearerAuth(token); contentType(ContentType.Application.Json); setBody("""{"from":"$from","to":"$to"}""")
+    }
+
+    private fun tagged(app: TestApp, id: String, tags: String) = app.ctx.db.tx {
+        createStatement().use {
+            it.execute(
+                "INSERT INTO points(id, job_id, layer, type, num, label, lat, lon, description, status, pole_json, created_at, updated_at) " +
+                    "VALUES ('$id','job-1','POLE','POLE','$id','POLE $id',39.6,-119.7,'','open','{\"tags\":$tags}',0,0)",
+            )
+        }
+    }
+
+    private fun changeCount(app: TestApp) = app.ctx.db.read {
+        createStatement().use { st -> st.executeQuery("SELECT COUNT(*) FROM changes").use { it.next(); it.getInt(1) } }
+    }
+
+    @Test fun tagsDefaultToPoleTags() = TestApp().run { app ->
+        val c = FmxJson.decodeFromString(AppConfig.serializer(), getAs(tokenFor("ann"), "/api/config").bodyAsText())
+        assertEquals(com.fieldmaxx.core.model.POLE_TAGS, c.tags)
+    }
+
+    @Test fun putTagsReplacesListAdminOnly() = TestApp().run { app ->
+        assertEquals(HttpStatusCode.Forbidden, tagsReq(tokenFor("ann"), """["A"]""").status)
+        val r = tagsReq(tokenFor("boss", Role.admin), """[" A ","","a","B"]""")
+        assertEquals(HttpStatusCode.OK, r.status)
+        assertEquals(listOf("A", "B"), FmxJson.decodeFromString(AppConfig.serializer(), r.bodyAsText()).tags)
+    }
+
+    @Test fun renameRetagsPoints() = TestApp().run { app ->
+        seed(app)
+        tagged(app, "t1", """["No fiber","Grounding"]"""); tagged(app, "t2", """["No fiber"]"""); tagged(app, "t3", """["Grounding"]""")
+        val before = changeCount(app)
+        val r = renameReq(tokenFor("boss", Role.admin), "No fiber", "No FO")
+        assertEquals(HttpStatusCode.OK, r.status, r.bodyAsText())
+        assertEquals(before + 2, changeCount(app))
+        fun tags(id: String) = app.ctx.db.read {
+            prepareStatement("SELECT json_extract(pole_json, '\$.tags') FROM points WHERE id = ?").use { ps -> ps.setString(1, id); ps.executeQuery().use { it.next(); it.getString(1) } }
+        }
+        assertEquals("""["No FO","Grounding"]""", tags("t1")); assertEquals("""["No FO"]""", tags("t2")); assertEquals("""["Grounding"]""", tags("t3"))
+        assertTrue(FmxJson.decodeFromString(AppConfig.serializer(), r.bodyAsText()).tags.contains("No FO"))
+    }
+
+    @Test fun renameToExistingRefused() = TestApp().run { app ->
+        assertEquals(HttpStatusCode.BadRequest, renameReq(tokenFor("boss", Role.admin), "No fiber", "grounding").status)
+    }
+
+    @Test fun renameUnknownRefused() = TestApp().run { app ->
+        assertEquals(HttpStatusCode.NotFound, renameReq(tokenFor("boss", Role.admin), "Nope", "X").status)
+    }
 }

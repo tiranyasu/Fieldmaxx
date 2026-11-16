@@ -288,4 +288,35 @@ class OpsTest {
         // Every snapshot in the feed is at least as complete as the one before it (nothing goes backwards).
         assertTrue(mine.mapNotNull { it.point }.zipWithNext().all { (x, y) -> !(x.pole != null && y.pole == null) })
     }
+
+    @Test fun renameSetsTypeNumLabelAndClearsFolder() = TestApp().run { app ->
+        seed(app)
+        app.ctx.db.tx { createStatement().use { it.execute("UPDATE points SET folder_path = 'POLE/POLE_7' WHERE id = '$pt'") } }
+        val before = count(app, "changes")
+        assertTrue(send(tokenFor("ann"), Op.PointRename("r1", pt, " pole ", " 14B ")).single().ok)
+        val p = point(app)
+        assertEquals("POLE", p.type); assertEquals("14B", p.num)
+        assertEquals(com.fieldmaxx.core.naming.pointLabel(p.layer, "POLE", "14B"), p.label)
+        assertNull(p.folderPath); assertNull(p.folderCandidates)
+        assertEquals(before + 1, count(app, "changes"))
+    }
+
+    @Test fun renameBlankRefused() = TestApp().run { app ->
+        seed(app)
+        assertEquals("needs_text", send(tokenFor("ann"), Op.PointRename("r1", pt, "POLE", "  ")).single().error)
+        assertEquals("needs_text", send(tokenFor("ann"), Op.PointRename("r2", pt, " ", "3")).single().error)
+    }
+
+    @Test fun renameDeletedPointRefused() = TestApp().run { app ->
+        seed(app)
+        val t = tokenFor("ann")
+        send(t, Op.PointDelete("d1", pt))
+        assertEquals("point_deleted", send(t, Op.PointRename("r1", pt, "POLE", "9")).single().error)
+    }
+
+    @Test fun unknownTagInUpdateJoinsList() = TestApp().run { app ->
+        seed(app)
+        send(tokenFor("ann"), Op.PointUpdate("u1", pt, pole = PoleData(tags = listOf("grounding", "Rotten"))))
+        assertEquals(com.fieldmaxx.core.model.POLE_TAGS + "Rotten", com.fieldmaxx.server.admin.appConfig(app.ctx).tags)
+    }
 }
