@@ -1,5 +1,6 @@
 package com.fieldmaxx.app.photos
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -285,6 +286,8 @@ fun ReusePicker(jobId: String, pointId: String, deps: ReuseDeps, onDone: () -> U
     var tab by rememberSaveable { mutableStateOf(ReuseTab.NEARBY) }
     var query by rememberSaveable { mutableStateOf("") }
     var openNearby by rememberSaveable { mutableStateOf<String?>(null) } // the Nearby point whose photos are listed
+    // Back from a point's photos returns to the point list, the photos picked kept (I-M2).
+    BackHandler(enabled = tab == ReuseTab.NEARBY && openNearby != null) { openNearby = null }
     val picked = remember { mutableStateListOf<ReuseCandidate>() }
     var attempt by remember { mutableIntStateOf(0) }
     var saving by remember { mutableStateOf(false) }

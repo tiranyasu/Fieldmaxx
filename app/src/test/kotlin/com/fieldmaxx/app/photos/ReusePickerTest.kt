@@ -117,4 +117,28 @@ class ReusePickerTest {
         compose.waitUntil(5_000) { deps.ops.size == 2 }
         assertEquals(setOf("b1", "a2"), deps.ops.filterIsInstance<Op.PhotoReuse>().map { it.fromPhotoId }.toSet())
     }
+
+    /** I-M2: system Back from a Nearby point's photos returns to the point list, the photos picked kept. */
+    @Test fun backFromNearbyPhotosReturnsToPoints() {
+        val deps = ListReuseDeps(
+            context, listOf(point("q43")),
+            listOf(cand("a1", "pa", "POLE 5", 40.0, 100), cand("b1", "pb", "POLE 6", 10.0, 50)),
+        )
+        compose.setContent { FieldmaxxTheme { ReusePicker("j1", "q43", deps, onDone = {}) } }
+
+        waitForTag(ReuseTags.nearbyPoint("pb"))
+        press(ReuseTags.nearbyPoint("pb"))
+        waitForTag(ReuseTags.candidate("b1"))
+        press(ReuseTags.candidate("b1"))
+        compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
+        waitForTag(ReuseTags.nearbyPoint("pa"))
+        assertFalse(exists(ReuseTags.candidate("b1")), "back on the point list")
+
+        press(ReuseTags.nearbyPoint("pa"))
+        waitForTag(ReuseTags.candidate("a1"))
+        press(ReuseTags.candidate("a1"))
+        press(ReuseTags.USE)
+        compose.waitUntil(5_000) { deps.ops.size == 2 }
+        assertEquals(setOf("b1", "a1"), deps.ops.filterIsInstance<Op.PhotoReuse>().map { it.fromPhotoId }.toSet())
+    }
 }
