@@ -148,3 +148,37 @@ None of these can be answered from the code or from tests; only a pilot on real 
 - SharePoint's upload-session lifetime is unknown, and so is whether a new StartUpload ends another open session. Checklist step 25 (started in the evening, finished the next morning) is the only device check of the expired-session recovery.
 - Esri imagery licensing: whether the map's Esri imagery may be used this way is an open item in spec section 9 (docs/superpowers/specs/2026-11-13-fieldmaxx-design.md) for the owner to settle.
 - Device-only behaviour covered by docs/acceptance-checklist.md: MapLibre rendering (clusters, the badge, crew labels, the blue dot, offline tiles), touches during a fling, double-tap +, pinch while a job loads, the move bar passing map touches through, CameraX, the compass and the photo picker are compile-verified only, not run on a device.
+
+## Batch 1 (quick wins, 2026-11-15)
+
+Left for later after batch 1's final review. None loses data.
+
+### Renaming
+- **Re-casing an imported type.** `canonicalType` (core naming) checks the add-point categories before the point's own type. A number-only rename can therefore re-case an imported type that differs from a category only in case. Fix: check the point's current type first.
+- **Old app builds.** Phones still on a build from before batch 1 send folder choices without a label, so a stale choice could still apply after a rename. This closes once every phone updates.
+- **Rename warning.** It doesn't count photos that were delivered and later hidden in the app.
+- **Type chip highlight.** It compares case-sensitively.
+
+### Deleting
+- **Delete dialog.** It doesn't re-check delivery while it is open.
+
+### Tags
+- **Refresh can hide a new tag.** A settings refresh that arrives before the server has applied a new tag hides that tag's chip until the next refresh. The tag stays on the point.
+- **Failed tag actions.** Admin tag actions don't re-read the list when the action itself fails.
+- **Malformed list.** `readTags` (server) throws if the stored tag list is malformed JSON.
+- **Extra change rows.** A tag rename's de-duplication also touches points that hold another tag twice in different cases. Those points get an unneeded change row; the result is correct.
+
+### Stamp
+- **Wrapping.** It can split an emoji (a surrogate pair), and wrapping at " · " isn't tested.
+- **Preview first line.** It reads " · POLE 18" until the job name has loaded.
+- **Off-screen messages.** Tag messages in Admin settings show in the message line above the Tags section, so they can be off screen.
+
+### Map
+- **Overlapping markers.** With clustering gone, a tap on overlapping markers at low zoom picks the top one. Zoom in to reach the others.
+
+### Camera
+- **Rapid taps.** Tapping Take photo very fast can trigger the camera twice.
+
+### Windows development
+- **Five test classes fail on Windows.** JobsScreensTest, MapModelTest, MenuAdminUpdateTest, PhotoUiTest and PipelineTest assume Linux file paths and file deletion: FileProvider temp roots and locked files. They pass on Linux. PipelineTest's failure count also varies from run to run.
+- **DataStore file.** On Windows, DataStore can't replace its file after the first write, so ConfigStoreTest uses an in-memory store. Android is not affected.
