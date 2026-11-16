@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -14,7 +15,10 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -43,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import coil3.ImageLoader
 import com.fieldmaxx.app.AppGraph
 import com.fieldmaxx.app.map.MapController
+import com.fieldmaxx.app.photos.PhotoUiStatus
 import com.fieldmaxx.app.photos.PhotoView
 import com.fieldmaxx.app.photos.hiddenDeliveredFor
 import com.fieldmaxx.app.photos.photoViewsFor
@@ -88,6 +93,11 @@ object PointTags {
     const val TITLE = "point.title"
     const val CLOSE = "point.close"
     const val NAVIGATE = "point.navigate"
+    const val MENU = "point.menu"
+    const val RENAME = "point.rename"
+    const val RENAME_TYPE = "point.rename.type"
+    const val RENAME_NUM = "point.rename.num"
+    const val RENAME_SAVE = "point.rename.save"
     const val MOVE = "point.move"
     const val MOVE_CONFIRM = "point.move.confirm"
     const val MOVE_CANCEL = "point.move.cancel"
@@ -228,9 +238,9 @@ private class Loaded(val point: Point?)
 
 /**
  * The point screen (spec §6.4): a bottom sheet over the map for the point a marker tap selected. Top to bottom: the name
- * with Navigate, Move point and close; what to photograph and the point's description from the file; the GPS accuracy;
+ * with a ⋮ menu (Edit / Rename, Move point, Directions, Delete point) and close; what to photograph and the point's description from the file; the GPS accuracy;
  * pole data (poles); the client query's reference images (query points); the comment; the folder its photos go to;
- * Done, Can't shoot or Reopen; and Delete where the user may (§6.5a). [onClose] runs once the point is gone too
+ * Done, Can't shoot or Reopen. Delete is in the menu where the user may (§6.5a). [onClose] runs once the point is gone too
  * (deleted here or by the crew).
  *
  * Every edit saves as you go ([PointEditor]): it shows at once, is queued for the crew, and waits on the phone while
@@ -289,6 +299,11 @@ private fun OpenSheet(
     val fix by deps.fixes.collectAsState(main)
     val user by produceState<User?>(null, deps) { value = deps.user() }
     val context = LocalContext.current
+    val jobTypes by remember(deps, point.jobId) {
+        deps.points(point.jobId).map { ps -> ps.map { it.layer }.distinct() }.distinctUntilChanged()
+    }.collectAsState(emptyList(), main)
+    var renaming by remember { mutableStateOf(false) }
+    var deleting by remember { mutableStateOf(false) }
     var problem by remember { mutableStateOf<String?>(null) }
 
     // The fields as edited here. The stored values, the crew's edits among them, show whenever nothing here waits to be saved.
@@ -324,8 +339,12 @@ private fun OpenSheet(
             Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(start = 16.dp, end = 16.dp, bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            val me = user
             Header(
                 point,
+                canDelete = me != null && canDeletePoint(me, photos, hiddenDelivered),
+                onRename = { renaming = true },
+                onDelete = { deleting = true },
                 onNavigate = { problem = navigate(context, point) },
                 onMove = { hideThen(move::start) },
                 onClose = { hideThen(onClose) },
@@ -395,9 +414,19 @@ private fun OpenSheet(
                 onReopen = { editor.send(Op.PointReopen(newOpId(), point.id)) },
             )
 
-            val me = user
-            if (me != null && canDeletePoint(me, photos, hiddenDelivered)) {
-                DeletePoint(point.label, onPhone) {
+            if (renaming) {
+                RenamePointDialog(
+                    point, jobTypes, delivered = photos.count { it.status == PhotoUiStatus.IN_ONEDRIVE },
+                    onDismiss = { renaming = false },
+                    onSave = { type, num ->
+                        renaming = false
+                        editor.send(Op.PointRename(newOpId(), point.id, type, num))
+                    },
+                )
+            }
+            if (deleting) {
+                DeletePointDialog(point.label, onPhone, onDismiss = { deleting = false }) {
+                    deleting = false
                     // R67: only the delete is queued; its photos stay on the phone until the server accepts it.
                     editor.send(Op.PointDelete(newOpId(), point.id))
                     hideThen(onClose)
@@ -408,14 +437,39 @@ private fun OpenSheet(
 }
 
 @Composable
-private fun Header(point: Point, onNavigate: () -> Unit, onMove: () -> Unit, onClose: () -> Unit) {
+private fun Header(
+    point: Point,
+    canDelete: Boolean,
+    onRename: () -> Unit,
+    onDelete: () -> Unit,
+    onNavigate: () -> Unit,
+    onMove: () -> Unit,
+    onClose: () -> Unit,
+) {
+    var open by remember { mutableStateOf(false) }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text(point.label, style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f).testTag(PointTags.TITLE))
+        Box {
+            IconButton(onClick = { open = true }, modifier = Modifier.testTag(PointTags.MENU)) {
+                Icon(Icons.Default.MoreVert, contentDescription = "More")
+            }
+            DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                @Composable
+                fun Item(text: String, tag: String, action: () -> Unit) = DropdownMenuItem(
+                    text = { Text(text) },
+                    onClick = {
+                        open = false
+                        action()
+                    },
+                    modifier = Modifier.testTag(tag),
+                )
+                Item("Edit / Rename", PointTags.RENAME, onRename)
+                Item("Move point", PointTags.MOVE, onMove)
+                Item("Directions", PointTags.NAVIGATE, onNavigate)
+                if (canDelete) Item("Delete point", PointTags.DELETE, onDelete)
+            }
+        }
         IconButton(onClick = onClose, modifier = Modifier.testTag(PointTags.CLOSE)) { Icon(Icons.Default.Close, contentDescription = "Close") }
-    }
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(onClick = onNavigate, modifier = Modifier.testTag(PointTags.NAVIGATE)) { Text("Navigate") }
-        OutlinedButton(onClick = onMove, modifier = Modifier.testTag(PointTags.MOVE)) { Text("Move point") }
     }
 }
 

@@ -221,6 +221,16 @@ class OpApplier(private val db: AppDatabase, private val clock: () -> Long = Sys
             is Op.PointDelete -> editPoint(op.pointId, allowDeleted = true) { if (it.deletedAt != null) null else it.copy(deletedAt = now).touched() }
             is Op.PointRestore -> editPoint(op.pointId, allowDeleted = true) { if (it.deletedAt == null) null else it.copy(deletedAt = null).touched() }
             is Op.PointSetFolder -> editPoint(op.pointId) { it.copy(folderPath = op.folderPath, folderCandidates = null).touched() }
+            // As the server: blank text is refused; the label follows the layer; the folder is searched again for the new name.
+            is Op.PointRename -> {
+                val type = op.type.trim().uppercase() // as the server stores it
+                val num = op.num.trim()
+                if (type.isNotEmpty() && num.isNotEmpty()) {
+                    editPoint(op.pointId) {
+                        it.copy(type = type, num = num, label = pointLabel(it.layer, type, num), folderPath = null, folderCandidates = null).touched()
+                    }
+                }
+            }
             is Op.PhotoReuse -> reusePhoto(op, userId)
             is Op.PhotoRemove -> editPhoto(op.photoId) { if (it.status == PhotoStatus.removed) null else it.copy(status = PhotoStatus.removed) }
             is Op.PhotoConfirmed -> editPhoto(op.photoId) {
@@ -294,6 +304,7 @@ internal val Op.targetPoint: String?
         is Op.PointDelete -> pointId
         is Op.PointRestore -> pointId
         is Op.PointSetFolder -> pointId
+        is Op.PointRename -> pointId
         is Op.PhotoReuse, is Op.PhotoRemove, is Op.PhotoConfirmed, is Op.PhotoFailed -> null
     }
 

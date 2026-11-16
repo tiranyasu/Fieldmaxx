@@ -813,6 +813,8 @@ class PhotoUiTest {
         deps.hiddenDeliveredFlow.value = true
         compose.setContent { FieldmaxxTheme { PointSheet("j1", "p18", deps, DragMap(), onClose = {}) } }
         waitForTag(PointTags.TITLE)
+        compose.onNodeWithTag(PointTags.MENU).performClick() // Delete point is in the ⋮ menu
+        waitForTag(PointTags.RENAME)
         assertFalse(exists(PointTags.DELETE), "the server would refuse Alice's delete (ops/Ops.kt)")
         deps.hiddenDeliveredFlow.value = false
         waitForTag(PointTags.DELETE)

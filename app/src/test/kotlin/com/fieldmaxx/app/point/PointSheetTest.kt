@@ -197,6 +197,13 @@ class PointSheetTest {
         compose.onNodeWithTag(tag).performScrollTo().performClick()
     }
 
+    /** An item of the ⋮ menu. */
+    private fun menu(tag: String) {
+        press(PointTags.MENU)
+        waitForTag(tag)
+        press(tag)
+    }
+
     /** A control in a dialog or the move bar. */
     private fun press(tag: String) {
         compose.onNodeWithTag(tag).performClick()
@@ -287,7 +294,7 @@ class PointSheetTest {
         )
 
         show()
-        tap(PointTags.NAVIGATE)
+        menu(PointTags.NAVIGATE)
 
         val app = shadowOf(context as Application)
         waitFor { app.peekNextStartedActivity() != null }
@@ -299,7 +306,7 @@ class PointSheetTest {
 
     @Test fun moveConfirmEnqueuesMoveUndoWithin10sRestores() {
         show()
-        tap(PointTags.MOVE)
+        menu(PointTags.MOVE)
         waitFor { map.dragging == "p18" }
         compose.onAllNodesWithTag(PointTags.TITLE).assertCountEquals(0) // the sheet steps aside for the drag
         compose.onNodeWithTag(PointTags.MOVE_CONFIRM).assertIsNotEnabled() // nothing dragged yet
@@ -322,7 +329,7 @@ class PointSheetTest {
         waitFor { !exists(PointTags.UNDO_MOVE) }
 
         // Moved again, "Undo move" goes after 10 s.
-        tap(PointTags.MOVE)
+        menu(PointTags.MOVE)
         waitFor { map.dragging == "p18" }
         map.dragTo(there)
         waitFor { enabled(PointTags.MOVE_CONFIRM) }
@@ -337,7 +344,61 @@ class PointSheetTest {
         assertEquals(emptyList(), map.fits)
     }
 
-    @Test fun deleteHiddenAfterOneDriveForTech() {
+    @Test fun menuHasRenameMoveDirectionsDelete() {
+        show()
+        for (tag in listOf(PointTags.RENAME, PointTags.MOVE, PointTags.NAVIGATE, PointTags.DELETE)) compose.onAllNodesWithTag(tag).assertCountEquals(0)
+        press(PointTags.MENU)
+        waitForTag(PointTags.RENAME)
+        for (text in listOf("Edit / Rename", "Move point", "Directions", "Delete point")) compose.onNodeWithText(text).assertExists()
+        for (tag in listOf(PointTags.MOVE, PointTags.NAVIGATE, PointTags.DELETE)) assertTrue(exists(tag), tag)
+    }
+
+    @Test fun renameSendsOp() {
+        show()
+        menu(PointTags.RENAME)
+        waitForTag(PointTags.RENAME_SAVE)
+        assertEquals("POLE", textOf(PointTags.RENAME_TYPE), "prefilled")
+        assertEquals("18", textOf(PointTags.RENAME_NUM))
+        compose.onNodeWithText("PED").performClick() // a chip
+        compose.onNodeWithTag(PointTags.RENAME_NUM).performTextReplacement("7")
+        press(PointTags.RENAME_SAVE)
+
+        waitFor { deps.ops.isNotEmpty() }
+        assertEquals(Op.PointRename(deps.ops.single().opId, "p18", "PED", "7"), deps.ops.single())
+        waitFor { !exists(PointTags.RENAME_SAVE) }
+    }
+
+    @Test fun renameWarnsWhenDelivered() {
+        deps.photosFlow.value = listOf(photoView("a", PhotoUiStatus.IN_ONEDRIVE), photoView("b", PhotoUiStatus.IN_ONEDRIVE), photoView("c"))
+        show()
+        menu(PointTags.RENAME)
+        waitForText(
+            "2 photos of this point are already in OneDrive in POLE/POLE_18. " +
+                "New photos will go to the new name's folder; those stay where they are.",
+        )
+    }
+
+    @Test fun renameWithoutDeliveredPhotosHasNoWarning() {
+        show()
+        menu(PointTags.RENAME)
+        waitForTag(PointTags.RENAME_SAVE)
+        assertEquals(0, compose.onAllNodesWithText("already in OneDrive", substring = true).fetchSemanticsNodes().size)
+    }
+
+    @Test fun renameBlankDisabled() {
+        show()
+        menu(PointTags.RENAME)
+        waitForTag(PointTags.RENAME_SAVE)
+        compose.onNodeWithTag(PointTags.RENAME_SAVE).assertIsEnabled()
+        compose.onNodeWithTag(PointTags.RENAME_NUM).performTextReplacement("  ")
+        compose.onNodeWithTag(PointTags.RENAME_SAVE).assertIsNotEnabled()
+        compose.onNodeWithTag(PointTags.RENAME_NUM).performTextReplacement("7")
+        compose.onNodeWithTag(PointTags.RENAME_TYPE).performTextReplacement("")
+        compose.onNodeWithTag(PointTags.RENAME_SAVE).assertIsNotEnabled()
+        assertEquals(emptyList(), deps.ops)
+    }
+
+    @Test fun deleteHiddenForTechWhenDelivered() {
         assertTrue(canDeletePoint(ALICE, emptyList()))
         assertTrue(canDeletePoint(ALICE, listOf(photoView("a"), photoView("b", PhotoUiStatus.UPLOADING), photoView("c", PhotoUiStatus.STUCK))))
         assertFalse(canDeletePoint(ALICE, listOf(photoView("a"), photoView("b", PhotoUiStatus.IN_ONEDRIVE))))
@@ -345,6 +406,7 @@ class PointSheetTest {
 
         deps.photosFlow.value = listOf(photoView("a", PhotoUiStatus.UPLOADING))
         show()
+        press(PointTags.MENU)
         waitForTag(PointTags.DELETE) // nothing reached OneDrive yet: the tech may delete it
 
         deps.photosFlow.value = listOf(photoView("a", PhotoUiStatus.IN_ONEDRIVE))
@@ -357,7 +419,7 @@ class PointSheetTest {
 
         deps.onPhoneFlow.value = 2
         show()
-        tap(PointTags.DELETE)
+        menu(PointTags.DELETE)
         waitForText("2 photos on this phone will be discarded")
         press(PointTags.DELETE_CONFIRM)
 
@@ -441,7 +503,7 @@ class PointSheetTest {
             val roomDeps = FakePointDeps(context, db)
 
             show(sheetDeps = roomDeps)
-            tap(PointTags.DELETE)
+            menu(PointTags.DELETE)
             waitForText("2 photos on this phone will be discarded") // counted from the phone's own photos
             press(PointTags.DELETE_CONFIRM)
 
@@ -460,7 +522,7 @@ class PointSheetTest {
 
     @Test fun moveCancelEnqueuesNothingAndTheMarkerReturns() { // R47
         show()
-        tap(PointTags.MOVE)
+        menu(PointTags.MOVE)
         waitFor { map.dragging == "p18" }
         map.dragTo(LatLon(39.70, -119.70))
         waitFor { enabled(PointTags.MOVE_CONFIRM) }
@@ -472,7 +534,7 @@ class PointSheetTest {
         compose.onAllNodesWithTag(PointTags.UNDO_MOVE).assertCountEquals(0)
 
         // Back during a drag cancels it too.
-        tap(PointTags.MOVE)
+        menu(PointTags.MOVE)
         waitFor { map.dragging == "p18" }
         map.dragTo(LatLon(39.71, -119.71))
         compose.runOnUiThread { compose.activity.onBackPressedDispatcher.onBackPressed() }
@@ -490,7 +552,7 @@ class PointSheetTest {
     @Test fun moveOfAPointTheMapDoesNotShowSaysSo() {
         show()
         map.markers.clear() // filtered out by a type chip, say
-        tap(PointTags.MOVE)
+        menu(PointTags.MOVE)
         waitForText(NOT_ON_MAP)
         assertEquals(emptyList(), deps.ops)
     }

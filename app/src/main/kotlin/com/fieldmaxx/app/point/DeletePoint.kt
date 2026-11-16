@@ -2,19 +2,12 @@ package com.fieldmaxx.app.point
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
@@ -38,46 +31,34 @@ internal fun discardWarning(onPhone: Int): String? = when {
     else -> "$onPhone photos on this phone will be discarded"
 }
 
+
 /**
- * "Delete point" with its warning (spec §6.5a): the point goes for the whole crew (soft: an admin can restore it), and
- * the [onPhone] photos still on this phone are discarded with it. The caller shows it only where [canDeletePoint].
+ * The "Delete point" confirmation with its warning (spec §6.5a): the point goes for the whole crew (soft: an admin can
+ * restore it), and the [onPhone] photos still on this phone are discarded with it. The caller opens it from the menu's
+ * Delete point, shown only where [canDeletePoint].
  *
  * Confirming only queues the delete (R67). The photos stay on the phone until the server accepts it: the server may
  * still refuse, since a photo of the point from another phone can have reached OneDrive, and then the point comes back
  * with them. The photo pipeline holds them meanwhile and discards them once the delete is settled (Task 28).
  */
 @Composable
-internal fun DeletePoint(label: String, onPhone: Int, onConfirm: () -> Unit) {
-    var asking by remember { mutableStateOf(false) }
-    TextButton(
-        onClick = { asking = true },
-        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
-        modifier = Modifier.testTag(PointTags.DELETE),
-    ) {
-        Icon(Icons.Default.Delete, contentDescription = null)
-        Text("Delete point")
-    }
-    if (asking) {
-        AlertDialog(
-            onDismissRequest = { asking = false },
-            title = { Text("Delete $label?") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("It goes for the whole crew. An admin can restore it.")
-                    discardWarning(onPhone)?.let { Text(it, color = FmxColors.Warning) }
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        asking = false
-                        onConfirm()
-                    },
-                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
-                    modifier = Modifier.testTag(PointTags.DELETE_CONFIRM),
-                ) { Text("Delete") }
-            },
-            dismissButton = { TextButton(onClick = { asking = false }) { Text("Cancel") } },
-        )
-    }
+internal fun DeletePointDialog(label: String, onPhone: Int, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Delete $label?") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("It goes for the whole crew. An admin can restore it.")
+                discardWarning(onPhone)?.let { Text(it, color = FmxColors.Warning) }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = onConfirm,
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                modifier = Modifier.testTag(PointTags.DELETE_CONFIRM),
+            ) { Text("Delete") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
