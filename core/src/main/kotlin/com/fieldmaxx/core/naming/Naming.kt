@@ -21,6 +21,15 @@ fun pointLabel(layer: String, type: String, num: String): String {
     return if (q != null) "Query $q-$num" else "$type $num"
 }
 
+/**
+ * The type a rename stores (R10): the [ADD_CATEGORIES] entry, or else [currentType], that equals the trimmed text
+ * ignoring case; otherwise the trimmed text as typed. So v1's mixed-case categories ("Street images") keep their spelling.
+ */
+fun canonicalType(typed: String, currentType: String): String {
+    val t = typed.trim()
+    return (ADD_CATEGORIES + currentType).firstOrNull { it.equals(t, ignoreCase = true) } ?: t
+}
+
 fun defaultFolderName(label: String): String = label.trim().replace(WHITESPACE_RUN, "_")
 
 fun normalizeFolderName(name: String): String =

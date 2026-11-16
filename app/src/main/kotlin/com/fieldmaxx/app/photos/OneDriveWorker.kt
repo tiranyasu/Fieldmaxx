@@ -234,10 +234,10 @@ private suspend fun PhotoPipeline.folderOf(point: Point, dest: PhotoDestination)
     return folderSearch(point.jobId).withLock {
         val fresh = db.points().get(point.id)?.toPoint() ?: return@withLock null
         fresh.folderPath ?: when (val found = io { FolderResolver(dest).resolve(PointKey(fresh.layer, fresh.type, fresh.num, fresh.label)) }) {
-            is FolderResolution.Found -> found.path.also { sync.enqueue(Op.PointSetFolder(UUID.randomUUID().toString(), fresh.id, it)) }
-            is FolderResolution.Created -> found.path.also { sync.enqueue(Op.PointSetFolder(UUID.randomUUID().toString(), fresh.id, it)) }
+            is FolderResolution.Found -> found.path.also { sync.enqueue(Op.PointSetFolder(UUID.randomUUID().toString(), fresh.id, it, fresh.label)) }
+            is FolderResolution.Created -> found.path.also { sync.enqueue(Op.PointSetFolder(UUID.randomUUID().toString(), fresh.id, it, fresh.label)) }
             is FolderResolution.Ambiguous -> {
-                offerFolders(fresh.id, found.candidates)
+                offerFolders(fresh.id, fresh.label, found.candidates)
                 null
             }
         }
@@ -248,10 +248,11 @@ private suspend fun PhotoPipeline.folderOf(point: Point, dest: PhotoDestination)
  * The candidates go on this phone's copy of the point, for its sheet to ask (spec §6.6.1 "Two candidates → the point
  * screen asks once"); in one transaction, so a newer server state of the point can't be written over.
  */
-private suspend fun PhotoPipeline.offerFolders(pointId: String, candidates: List<String>) = db.withTransaction {
+private suspend fun PhotoPipeline.offerFolders(pointId: String, label: String, candidates: List<String>) = db.withTransaction {
     val row = db.points().get(pointId) ?: return@withTransaction
     val point = row.toPoint()
-    if (point.folderPath == null && point.folderCandidates != candidates) db.points().upsert(row.with(point.copy(folderCandidates = candidates)))
+    // Not on a point renamed meanwhile (I2): its new name is searched for next time.
+    if (point.folderPath == null && point.label == label && point.folderCandidates != candidates) db.points().upsert(row.with(point.copy(folderCandidates = candidates)))
 }
 
 /** OneDrive's calls block: off the coroutine's thread, and interrupted if the worker is stopped. */

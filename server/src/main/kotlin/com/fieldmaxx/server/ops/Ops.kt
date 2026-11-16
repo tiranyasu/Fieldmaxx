@@ -11,6 +11,7 @@ import com.fieldmaxx.core.model.POLE_TAGS
 import com.fieldmaxx.core.model.PoleData
 import com.fieldmaxx.core.model.Role
 import com.fieldmaxx.core.model.User
+import com.fieldmaxx.core.naming.canonicalType
 import com.fieldmaxx.core.naming.pointLabel
 import com.fieldmaxx.server.Ctx
 import com.fieldmaxx.server.jobs.toPoint
@@ -199,7 +200,7 @@ private fun Connection.apply(ctx: Ctx, user: User, op: Op, now: Long): Applied {
         }
         is Op.PointRename -> {
             val p = livePoint(op.pointId)
-            val type = op.type.trim().uppercase()
+            val type = canonicalType(op.type, p.type)
             val num = op.num.trim()
             if (type.isEmpty() || num.isEmpty()) throw OpFail("needs_text")
             touch(
@@ -208,7 +209,9 @@ private fun Connection.apply(ctx: Ctx, user: User, op: Op, now: Long): Applied {
             )
         }
         is Op.PointSetFolder -> {
-            livePoint(op.pointId)
+            val p = livePoint(op.pointId)
+            // Resolved for a name the point no longer has (I2): the new name's folder is searched for instead.
+            if (op.label != null && op.label != p.label) return Applied(null, "point.setFolder")
             touch(op.pointId, user, now, "point.setFolder", "folder_path" to op.folderPath, "folder_candidates_json" to null)
         }
         is Op.PhotoReuse, is Op.PhotoRemove, is Op.PhotoConfirmed, is Op.PhotoFailed -> applyPhotoOp(ctx, user, op, now)

@@ -209,8 +209,12 @@ sealed interface Op {
     @Serializable @SerialName("point.rename")
     data class PointRename(override val opId: String, val pointId: String, val type: String, val num: String) : Op
 
+    /**
+     * [label] is the point's label the folder was resolved for: when set and the point has been renamed since, the op
+     * changes nothing (I2). null (ops from before it existed) always applies.
+     */
     @Serializable @SerialName("point.setFolder")
-    data class PointSetFolder(override val opId: String, val pointId: String, val folderPath: String) : Op
+    data class PointSetFolder(override val opId: String, val pointId: String, val folderPath: String, val label: String? = null) : Op
 
     @Serializable @SerialName("photo.reuse")
     data class PhotoReuse(override val opId: String, val photoId: String, val fromPhotoId: String, val pointId: String) : Op

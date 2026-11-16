@@ -284,10 +284,10 @@ class DeliveryWorker internal constructor(
         synchronized(resolver) {
             ctx.db.read { pointFolder(t.pointId) }?.let { return it }
             return when (val r = resolver.resolve(t.key)) {
-                is FolderResolution.Found -> storeFolder(t.pointId, r.path)
-                is FolderResolution.Created -> storeFolder(t.pointId, r.path)
+                is FolderResolution.Found -> storeFolder(t.pointId, t.key.label, r.path)
+                is FolderResolution.Created -> storeFolder(t.pointId, t.key.label, r.path)
                 is FolderResolution.Ambiguous -> {
-                    storeCandidates(t.pointId, r.candidates)
+                    storeCandidates(t.pointId, t.key.label, r.candidates)
                     null
                 }
             }
@@ -306,12 +306,17 @@ class DeliveryWorker internal constructor(
         return ctx.changes.recordInTx(this, p.jobId, "point", p.id, point = p)
     }
 
-    /** Stores [path] unless the point got a folder meanwhile; returns the point's folder either way. */
-    private fun storeFolder(pointId: String, path: String): String {
+    /**
+     * Stores [path] unless the point got a folder meanwhile, or was renamed from [label] meanwhile (I2: its new name's
+     * folder is searched for next time); returns the point's folder, else [path].
+     */
+    private fun storeFolder(pointId: String, label: String, path: String): String {
         var change: Change? = null
         val stored = ctx.db.tx {
-            val n = prepareStatement("UPDATE points SET folder_path = ?, folder_candidates_json = NULL, updated_at = ? WHERE id = ? AND folder_path IS NULL").use {
-                it.setString(1, path); it.setLong(2, ctx.clock.millis()); it.setString(3, pointId); it.executeUpdate()
+            val n = prepareStatement(
+                "UPDATE points SET folder_path = ?, folder_candidates_json = NULL, updated_at = ? WHERE id = ? AND folder_path IS NULL AND label = ?",
+            ).use {
+                it.setString(1, path); it.setLong(2, ctx.clock.millis()); it.setString(3, pointId); it.setString(4, label); it.executeUpdate()
             }
             if (n > 0) change = recordPoint(pointId)
             pointFolder(pointId) ?: path
@@ -320,15 +325,17 @@ class DeliveryWorker internal constructor(
         return stored
     }
 
-    private fun storeCandidates(pointId: String, candidates: List<String>) {
+    /** Offers [candidates] on the point, unless it got a folder or was renamed from [label] meanwhile (I2). */
+    private fun storeCandidates(pointId: String, label: String, candidates: List<String>) {
         val json = encodeStrings(candidates)
         var change: Change? = null
         ctx.db.tx {
             val n = prepareStatement(
-                "UPDATE points SET folder_candidates_json = ?, updated_at = ? WHERE id = ? AND folder_path IS NULL " +
+                "UPDATE points SET folder_candidates_json = ?, updated_at = ? WHERE id = ? AND folder_path IS NULL AND label = ? " +
                     "AND (folder_candidates_json IS NULL OR folder_candidates_json != ?)",
             ).use {
-                it.setString(1, json); it.setLong(2, ctx.clock.millis()); it.setString(3, pointId); it.setString(4, json); it.executeUpdate()
+                it.setString(1, json); it.setLong(2, ctx.clock.millis()); it.setString(3, pointId); it.setString(4, label); it.setString(5, json)
+                it.executeUpdate()
             }
             if (n > 0) change = recordPoint(pointId)
         }

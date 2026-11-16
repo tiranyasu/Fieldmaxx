@@ -221,6 +221,20 @@ class OpsTest {
         assertNull(p.folderCandidates)
     }
 
+    /** I2: a folder resolved for the point's old name, arriving after a rename, leaves the point alone. */
+    @Test fun setFolderForOldLabelIgnoredAfterRename() = TestApp().run { app ->
+        seed(app)
+        val t = tokenFor("ann")
+        val old = point(app).label
+        assertTrue(send(t, Op.PointRename("r1", pt, "POLE", "99")).single().ok)
+        val before = count(app, "changes")
+        assertTrue(send(t, Op.PointSetFolder("f1", pt, "POLE/POLE_7", label = old)).single().ok)
+        assertNull(point(app).folderPath)
+        assertEquals(before, count(app, "changes"), "no change recorded")
+        assertTrue(send(t, Op.PointSetFolder("f2", pt, "POLE/POLE_99", label = point(app).label)).single().ok)
+        assertEquals("POLE/POLE_99", point(app).folderPath, "the current label's folder is kept")
+    }
+
     @Test fun opsOnDeletedJob() = TestApp().run { app ->
         seed(app, deletedJob = true)
         val t = tokenFor("ann")
@@ -299,6 +313,15 @@ class OpsTest {
         assertEquals(com.fieldmaxx.core.naming.pointLabel(p.layer, "POLE", "14B"), p.label)
         assertNull(p.folderPath); assertNull(p.folderCandidates)
         assertEquals(before + 1, count(app, "changes"))
+    }
+
+    /** R10: a rename keeps a v1 category's own casing instead of upper-casing it. */
+    @Test fun renameKeepsCategoryCasing() = TestApp().run { app ->
+        seed(app)
+        assertTrue(send(tokenFor("ann"), Op.PointRename("r1", pt, " street images ", "4")).single().ok)
+        val p = point(app)
+        assertEquals("Street images", p.type)
+        assertEquals(com.fieldmaxx.core.naming.pointLabel(p.layer, "Street images", "4"), p.label)
     }
 
     @Test fun renameBlankRefused() = TestApp().run { app ->

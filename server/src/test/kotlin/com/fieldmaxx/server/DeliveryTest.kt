@@ -69,6 +69,12 @@ private class Spy(val inner: FakeDestination) : PhotoDestination by inner {
     private val active = AtomicInteger()
 
     @Volatile var beforeUpload: ((String) -> Unit)? = null
+    @Volatile var onListFolders: ((String) -> Unit)? = null
+
+    override fun listFolders(relPath: String): List<String> {
+        onListFolders?.invoke(relPath)
+        return inner.listFolders(relPath)
+    }
     @Volatile var afterUpload: ((String) -> Unit)? = null
 
     override fun uploadChunked(relPath: String, file: File, chunkBytes: Int, resume: ChunkSession?, onProgress: (ChunkSession) -> Unit) {
@@ -700,6 +706,31 @@ class DeliveryTest {
             assertEquals(1, w.runOnce())
         }
         assertEquals("POLE/1/$name", photo(app, "ph-1").destPath)
+    }
+
+    /** I2: the point is renamed while its folder is searched for: the old name's folder isn't kept on it. */
+    @Test fun folderFoundForOldNameIsNotKeptAfterRename() = withApp(spy = true) { app, _, spy ->
+        backedUp(app, "ph-1", jpeg())
+        app.clock.nowMs += TAKEOVER
+        var renamed = false
+        spy.onListFolders = { if (!renamed) { renamed = true; op(app, Op.PointRename("r1", "pt-1", "POLE", "9")) } }
+        app.worker { w -> w.runOnce() }
+        assertTrue(renamed)
+        assertEquals("POLE 9", point(app, "pt-1").label)
+        assertNull(point(app, "pt-1").folderPath, "the new name's folder is searched for next time")
+    }
+
+    /** I2: likewise, candidates found for the old name aren't offered on the renamed point. */
+    @Test fun candidatesForOldNameAreNotKeptAfterRename() = withApp(spy = true) { app, fake, spy ->
+        fake.ensureFolder("POLE/1")
+        fake.ensureFolder("POLE/POLE_1")
+        backedUp(app, "ph-1", jpeg())
+        app.clock.nowMs += TAKEOVER
+        var renamed = false
+        spy.onListFolders = { if (!renamed) { renamed = true; op(app, Op.PointRename("r1", "pt-1", "POLE", "9")) } }
+        app.worker { w -> assertEquals(0, w.runOnce()) }
+        assertTrue(renamed)
+        assertNull(point(app, "pt-1").folderCandidates)
     }
 
     @Test fun forbiddenDestinationSetsJobDeliveryProblem() = withApp { app, fake, _ ->

@@ -43,6 +43,25 @@ class OpApplierTest {
         assertEquals(500, p.updatedAt)
     }
 
+    /** R10: as the server, a rename keeps a category's own casing. */
+    @Test fun renameKeepsCategoryCasing() {
+        seed(point("p1"))
+        runBlocking { applier.applyLocally(Op.PointRename("o1", "p1", "street images", "4"), "u1", 500) }
+        assertEquals("Street images", stored("p1").type)
+        assertEquals("Street images 4", stored("p1").label)
+    }
+
+    /** I2: as the server, a folder resolved for an old label doesn't land on the renamed point. */
+    @Test fun setFolderForOldLabelIgnored() {
+        seed(point("p1"))
+        runBlocking { applier.applyLocally(Op.PointRename("o1", "p1", "POLE", "9"), "u1", 500) }
+        runBlocking { applier.applyLocally(Op.PointSetFolder("o2", "p1", "POLE/POLE_1", label = "POLE 1"), "u1", 600) }
+        assertNull(stored("p1").folderPath)
+        assertEquals(500, stored("p1").updatedAt)
+        runBlocking { applier.applyLocally(Op.PointSetFolder("o3", "p1", "POLE/POLE_9", label = "POLE 9"), "u1", 700) }
+        assertEquals("POLE/POLE_9", stored("p1").folderPath)
+    }
+
     @Test fun renameKeepsQueryLabelAndRefusesBlank() {
         seed(point("q1").copy(layer = "QUERY 1", type = "QUERY 1", label = "Query 1-1"))
         runBlocking { applier.applyLocally(Op.PointRename("o1", "q1", "QUERY 1", "43"), "u1", 500) }

@@ -462,7 +462,7 @@ class PointSheetTest {
 
         tap(PointTags.folderChoice("Poles/18"))
         waitFor { deps.ops.isNotEmpty() }
-        assertEquals(Op.PointSetFolder(deps.ops.single().opId, "p18", "Poles/18"), deps.ops.single())
+        assertEquals(Op.PointSetFolder(deps.ops.single().opId, "p18", "Poles/18", label = pole18.label), deps.ops.single())
 
         deps.pointsFlow.value = listOf(pole18.copy(folderPath = "Poles/18")) // the choice, stored and shared
         waitForTag(PointTags.FOLDER)

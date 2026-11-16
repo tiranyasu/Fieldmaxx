@@ -218,6 +218,7 @@ class PipelineTest {
         assertEquals(listOf("photo.confirmed:$id"), confirmed.map { it.opId })
         assertEquals("$FOLDER/$name", confirmed.single().destPath)
         assertEquals(listOf(FOLDER), ops().filterIsInstance<Op.PointSetFolder>().map { it.folderPath }, "the folder is kept on the point")
+        assertEquals(listOf(localPoint("p1").label), ops().filterIsInstance<Op.PointSetFolder>().map { it.label }, "for the label it was found for")
         assertEquals(FOLDER, localPoint("p1").folderPath)
         assertEquals(listOf(LINK), linksAsked.distinct(), "through the job's Field Notes link")
         assertNull(row.oneDriveUploadId)

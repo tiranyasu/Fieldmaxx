@@ -18,5 +18,12 @@ class NamingTest {
     @Test fun fileName() = assertEquals("POLE_1_39.636130_-119.691104_6018.jpg", photoFileName("POLE_1", 39.63613, -119.691104, 6018))
     @Test fun codes() { assertEquals("P", markerCode("POLE")); assertEquals("MH", markerCode("MH")); assertEquals("Q", markerCode("QUERY 1")); assertEquals("ST", markerCode("Street images")) }
     @Test fun addedPoles() { assertEquals("14B", suggestAddedPoleNum(listOf("14"), "14")); assertEquals("14C", suggestAddedPoleNum(listOf("14", "14B"), "14")); assertEquals("14C", suggestAddedPoleNum(listOf("14", "14b"), "14")) }
+    @Test fun canonicalTypes() {
+        assertEquals("Street images", canonicalType(" street images ", "POLE"), "the category's own spelling")
+        assertEquals("POLE", canonicalType("pole", "PED"))
+        assertEquals("Custom Thing", canonicalType("custom thing ", "Custom Thing"), "the point's current spelling")
+        assertEquals("new kind", canonicalType(" new kind ", "POLE"), "otherwise as typed, trimmed")
+        assertEquals("", canonicalType("  ", "POLE"))
+    }
     @Test fun nextNumber() { assertEquals("11", nextNum(listOf("1", "2", "10"))); assertEquals("1", nextNum(emptyList())) }
 }

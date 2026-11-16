@@ -19,6 +19,7 @@ import com.fieldmaxx.core.model.PhotoStatus
 import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.model.PointStatus
 import com.fieldmaxx.core.model.User
+import com.fieldmaxx.core.naming.canonicalType
 import com.fieldmaxx.core.naming.pointLabel
 
 /** Keys of the sync engine's [MetaEntity] rows. */
@@ -220,13 +221,16 @@ class OpApplier(private val db: AppDatabase, private val clock: () -> Long = Sys
             is Op.PointAdd -> addPoint(op, userId, now)
             is Op.PointDelete -> editPoint(op.pointId, allowDeleted = true) { if (it.deletedAt != null) null else it.copy(deletedAt = now).touched() }
             is Op.PointRestore -> editPoint(op.pointId, allowDeleted = true) { if (it.deletedAt == null) null else it.copy(deletedAt = null).touched() }
-            is Op.PointSetFolder -> editPoint(op.pointId) { it.copy(folderPath = op.folderPath, folderCandidates = null).touched() }
+            // As the server: a folder resolved for a label the point no longer has changes nothing (I2).
+            is Op.PointSetFolder -> editPoint(op.pointId) {
+                if (op.label != null && op.label != it.label) null else it.copy(folderPath = op.folderPath, folderCandidates = null).touched()
+            }
             // As the server: blank text is refused; the label follows the layer; the folder is searched again for the new name.
             is Op.PointRename -> {
-                val type = op.type.trim().uppercase() // as the server stores it
                 val num = op.num.trim()
-                if (type.isNotEmpty() && num.isNotEmpty()) {
+                if (op.type.isNotBlank() && num.isNotEmpty()) {
                     editPoint(op.pointId) {
+                        val type = canonicalType(op.type, it.type) // as the server stores it
                         it.copy(type = type, num = num, label = pointLabel(it.layer, type, num), folderPath = null, folderCandidates = null).touched()
                     }
                 }

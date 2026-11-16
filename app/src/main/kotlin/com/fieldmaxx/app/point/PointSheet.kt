@@ -478,7 +478,7 @@ private fun OpenSheet(
             }
             photoStrip(point, photos)
 
-            FolderLine(point, onPick = { editor.send(Op.PointSetFolder(newOpId(), point.id, it)) })
+            FolderLine(point, onPick = { editor.send(Op.PointSetFolder(newOpId(), point.id, it, point.label)) })
             CloseControls(
                 point,
                 hasPhotos = photos.isNotEmpty(),
