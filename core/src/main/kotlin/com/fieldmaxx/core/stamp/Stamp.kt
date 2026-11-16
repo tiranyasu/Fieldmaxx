@@ -1,6 +1,7 @@
 package com.fieldmaxx.core.stamp
 
 import com.fieldmaxx.core.geo.metersToFeet
+import com.fieldmaxx.core.model.PoleData
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -21,6 +22,7 @@ data class StampMeta(
     val zone: ZoneId,
     val gpsStale: Boolean,
     val fromGallery: Boolean,
+    val extra: String? = null,
 )
 
 data class StampLayout(
@@ -70,7 +72,65 @@ fun stampLines(m: StampMeta): List<String> {
 
     val time = formatStampTime(m.takenAtMs, m.zone)
     lines += if (m.fromGallery) "$time (from gallery)" else time
+    if (!m.extra.isNullOrBlank()) lines += wrapStampExtra(m.extra)
     return lines
+}
+
+const val STAMP_LINE_MAX = 48
+
+/** Tags, then height above ground (poles only), then the comment, joined with " · "; null when empty. */
+fun stampExtraLine(type: String, pole: PoleData?, comment: String): String? {
+    val parts = mutableListOf<String>()
+    if (pole != null) parts += pole.tags
+    if (type == "POLE" && pole?.lineHeightFt != null) {
+        val h = pole.lineHeightFt
+        val text = if (h == Math.floor(h)) h.toLong().toString() else h.toString()
+        parts += "HOA $text"
+    }
+    if (comment.isNotBlank()) parts += comment.trim()
+    return if (parts.isEmpty()) null else parts.joinToString(" · ")
+}
+
+private fun wrapStampExtra(extra: String): List<String> {
+    val out = mutableListOf<String>()
+    var cur = ""
+    for (seg in extra.split(" · ")) {
+        if (seg.length > STAMP_LINE_MAX) {
+            if (cur.isNotEmpty()) out += cur
+            val pieces = wrapWords(seg)
+            out += pieces.dropLast(1)
+            cur = pieces.last()
+        } else if (cur.isEmpty()) {
+            cur = seg
+        } else if (cur.length + 3 + seg.length <= STAMP_LINE_MAX) {
+            cur += " · $seg"
+        } else {
+            out += cur
+            cur = seg
+        }
+    }
+    if (cur.isNotEmpty()) out += cur
+    return out
+}
+
+private fun wrapWords(text: String): List<String> {
+    val out = mutableListOf<String>()
+    var cur = ""
+    for (word in text.split(" ").filter { it.isNotEmpty() }) {
+        var w = word
+        while (w.length > STAMP_LINE_MAX) {
+            if (cur.isNotEmpty()) { out += cur; cur = "" }
+            out += w.take(STAMP_LINE_MAX)
+            w = w.drop(STAMP_LINE_MAX)
+        }
+        cur = when {
+            cur.isEmpty() -> w
+            cur.length + 1 + w.length <= STAMP_LINE_MAX -> "$cur $w"
+            else -> { out += cur; w }
+        }
+    }
+    if (cur.isNotEmpty()) out += cur
+    return if (out.isEmpty()) listOf("") else out
 }
 
 fun stampLayout(width: Int, height: Int, lineCount: Int): StampLayout {

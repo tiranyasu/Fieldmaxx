@@ -206,6 +206,9 @@ sealed interface Op {
     @Serializable @SerialName("point.restore")
     data class PointRestore(override val opId: String, val pointId: String) : Op
 
+    @Serializable @SerialName("point.rename")
+    data class PointRename(override val opId: String, val pointId: String, val type: String, val num: String) : Op
+
     @Serializable @SerialName("point.setFolder")
     data class PointSetFolder(override val opId: String, val pointId: String, val folderPath: String) : Op
 
@@ -290,7 +293,10 @@ data class FinishResult(val finished: Boolean, val pointsLeft: Int = 0, val phot
 
 /** [photoQuality] is 85 or 95. */
 @Serializable
-data class AppConfig(val imageryUrl: String, val labelsUrl: String, val imageryKey: String?, val photoQuality: Int, val backupDays: Int)
+data class AppConfig(val imageryUrl: String, val labelsUrl: String, val imageryKey: String?, val photoQuality: Int, val backupDays: Int, val tags: List<String> = POLE_TAGS)
+
+@Serializable
+data class TagRename(val from: String, val to: String)
 
 @Serializable
 data class AdminSettings(
