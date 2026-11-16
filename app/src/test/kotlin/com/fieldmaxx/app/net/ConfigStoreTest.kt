@@ -3,6 +3,7 @@ package com.fieldmaxx.app.net
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.emptyPreferences
 import com.fieldmaxx.app.sync.SyncStatus
 import com.fieldmaxx.app.sync.awaitTrue
 import com.fieldmaxx.core.model.AppConfig
@@ -27,6 +28,8 @@ import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.job
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 private class ConfigApi : Api by unusedApi() {
     val calls = AtomicInteger()
@@ -50,6 +53,16 @@ private class FlakyStore(private val real: DataStore<Preferences>, private val f
     }
 
     override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences = real.updateData(transform)
+}
+
+/** A DataStore in memory, for tests that write more than once. */
+private class MemoryStore : DataStore<Preferences> {
+    private val state = MutableStateFlow(emptyPreferences())
+    private val lock = Mutex()
+    override val data: Flow<Preferences> = state
+
+    override suspend fun updateData(transform: suspend (t: Preferences) -> Preferences): Preferences =
+        lock.withLock { transform(state.value).also { state.value = it } }
 }
 
 private fun unusedApi(): Api = Proxy.newProxyInstance(Api::class.java.classLoader, arrayOf(Api::class.java)) { _, method, _ ->
@@ -95,6 +108,21 @@ class ConfigStoreTest {
         first.coroutineContext.job.cancelAndJoin()
         val again = ConfigStore(api, PreferenceDataStoreFactory.create(scope = scope) { file }, scope)
         awaitTrue("the kept settings") { again.config.value == admin }
+    }
+
+    /** I3: a tag a tech adds is offered on the phone's next point at once, before the server's list comes back. */
+    @Test fun rememberedTagJoinsKeptList() = runBlocking {
+        // In memory: on Windows the file-backed store can't replace its file, so a second write there fails (R6).
+        val store = ConfigStore(api, MemoryStore(), scope)
+        api.reply = { admin.copy(tags = listOf("Grounding", "No fiber")) }
+        store.refresh()
+        store.rememberTag("Rotten")
+        assertEquals(listOf("Grounding", "No fiber", "Rotten"), store.current().tags)
+        awaitTrue("the screens see it") { store.config.value.tags == listOf("Grounding", "No fiber", "Rotten") }
+        store.rememberTag("rotten") // already listed, in another case
+        store.rememberTag("NO FIBER")
+        assertEquals(listOf("Grounding", "No fiber", "Rotten"), store.current().tags)
+        assertEquals(admin.photoQuality, store.current().photoQuality, "the rest of the settings stay")
     }
 
     @Test fun currentWaitsForTheKeptSettings() = runBlocking {

@@ -140,6 +140,11 @@ class AppGraph(context: Context, val vault: TokenVault = AndroidKeystoreTokenVau
         scope.launch { configStore.refresh() }
     }
 
+    /** Offers [tag] in the tag chips at once, before the server's list comes back with it (I3). */
+    fun rememberTag(tag: String) {
+        scope.launch { configStore.rememberTag(tag) }
+    }
+
     /** The map's view per user per job (spec §6.3). */
     val mapViews: ViewMemory by lazy { DataStoreViewMemory(dataStore("map_views")) }
 

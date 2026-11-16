@@ -82,6 +82,25 @@ class ConfigStore(private val api: Api, private val store: DataStore<Preferences
     }
 
     /**
+     * Adds [tag] to the kept settings' tag list unless it is listed already (ignoring case), so a tag a tech just added
+     * is offered on the next point at once (I3); the server's list replaces it at the next [refresh].
+     */
+    suspend fun rememberTag(tag: String) {
+        val t = tag.trim()
+        if (t.isEmpty()) return
+        try {
+            store.edit { prefs ->
+                val kept = configOf(prefs)
+                if (kept.tags.none { it.equals(t, ignoreCase = true) }) {
+                    prefs[CONFIG] = FmxJson.encodeToString(AppConfig.serializer(), kept.copy(tags = kept.tags + t))
+                }
+            }
+        } catch (e: IOException) {
+            // Not kept: the chip shows on this point anyway, and the server's list brings it with the next refresh.
+        }
+    }
+
+    /**
      * Refreshes each time [status] turns ONLINE after being OFFLINE. Busy spells (SYNCING) within one connection don't
      * count: they come and go with every op sent.
      */

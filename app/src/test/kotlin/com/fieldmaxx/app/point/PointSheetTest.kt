@@ -91,6 +91,8 @@ class FakePointDeps(context: Context, private val db: AppDatabase? = null) : Poi
     override val config = MutableStateFlow<AppConfig>(DEFAULT_CONFIG)
     @Volatile var me: User? = ALICE
     val ops = CopyOnWriteArrayList<Op>()
+    val remembered = CopyOnWriteArrayList<String>()
+    val refreshes = AtomicInteger()
 
     /** The images Coil was asked for. */
     val requested = CopyOnWriteArrayList<Any?>()
@@ -120,6 +122,14 @@ class FakePointDeps(context: Context, private val db: AppDatabase? = null) : Poi
 
     override suspend fun enqueue(op: Op) {
         ops += op
+    }
+
+    override fun rememberTag(tag: String) {
+        remembered += tag
+    }
+
+    override fun refreshConfig() {
+        refreshes.incrementAndGet()
     }
 }
 
@@ -537,11 +547,18 @@ class PointSheetTest {
         compose.onNodeWithTag(PointTags.NEW_TAG_FIELD).performTextReplacement("grounding")
         press(PointTags.NEW_TAG_SAVE)
         waitFor { deps.updates().lastOrNull()?.pole?.tags == listOf("Grounding", "Rotten") }
+        assertEquals(listOf("Rotten"), deps.remembered, "I3: only the tag the list lacked is kept for the next point")
 
         // A blank name can't be saved.
         tap(PointTags.NEW_TAG)
         waitForTag(PointTags.NEW_TAG_SAVE)
         compose.onNodeWithTag(PointTags.NEW_TAG_SAVE).assertIsNotEnabled()
+    }
+
+    /** I3: opening a point fetches the crew's settings again, so tags added on other phones arrive. */
+    @Test fun openingSheetRefreshesConfig() {
+        show()
+        waitFor { deps.refreshes.get() == 1 }
     }
 
     @Test fun pointKeepsTagMissingFromList() {

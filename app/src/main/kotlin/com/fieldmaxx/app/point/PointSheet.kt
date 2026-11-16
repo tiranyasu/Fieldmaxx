@@ -183,6 +183,12 @@ interface PointDeps {
 
     /** Shows [op] on the phone at once and queues it for the server; it waits there while there is no signal. */
     suspend fun enqueue(op: Op)
+
+    /** Keeps a tag the crew's list lacks in the phone's [config], so the next point offers it (I3). */
+    fun rememberTag(tag: String)
+
+    /** Fetches the server's settings again in the background, the crew's tags among them; quiet without signal. */
+    fun refreshConfig()
 }
 
 /** [PointDeps] from the app's graph. */
@@ -199,6 +205,8 @@ class GraphPointDeps(private val graph: AppGraph) : PointDeps {
     override fun server(): String = graph.server.get()
     override suspend fun user(): User? = graph.sync.savedUser()
     override suspend fun enqueue(op: Op) = graph.sync.enqueue(op)
+    override fun rememberTag(tag: String) = graph.rememberTag(tag)
+    override fun refreshConfig() = graph.refreshConfig()
 }
 
 /**
@@ -346,6 +354,8 @@ private fun OpenSheet(
     val jobTypes by remember(deps, point.jobId) {
         deps.points(point.jobId).map { ps -> ps.map { it.layer }.distinct() }.distinctUntilChanged()
     }.collectAsState(emptyList(), main)
+    // Tags added on other phones since the settings were last fetched (I3).
+    LaunchedEffect(deps, point.id) { deps.refreshConfig() }
     var renaming by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
     var problem by remember { mutableStateOf<String?>(null) }
@@ -432,6 +442,8 @@ private fun OpenSheet(
                 onNew = { typed ->
                     val tags = addTag(pole.tags, typed, config.tags)
                     if (tags != pole.tags) {
+                        // Not listed yet: offered on the next point at once, in this spelling (I3).
+                        tags.filter { t -> t !in pole.tags && config.tags.none { it.equals(t, ignoreCase = true) } }.forEach(deps::rememberTag)
                         pole = pole.copy(tags = tags)
                         editor.editPole(pole)
                     }
