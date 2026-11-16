@@ -514,6 +514,28 @@ class AdminTest {
         assertEquals(HttpStatusCode.BadRequest, renameReq(tokenFor("boss", Role.admin), "No fiber", "grounding").status)
     }
 
+    /** I-M3: a rename that only changes the case is the admin's cleanup, not a duplicate. */
+    @Test fun renameCaseOnlyAllowed() = TestApp().run { app ->
+        val r = renameReq(tokenFor("boss", Role.admin), "No fiber", "No Fiber")
+        assertEquals(HttpStatusCode.OK, r.status, r.bodyAsText())
+        val tags = FmxJson.decodeFromString(AppConfig.serializer(), r.bodyAsText()).tags
+        assertTrue("No Fiber" in tags); assertTrue("No fiber" !in tags)
+    }
+
+    /** I-M4: points carrying the tag in another case are renamed too, and a point that had both keeps the name once. */
+    @Test fun renameIgnoresCaseOnPointsAndDedupes() = TestApp().run { app ->
+        seed(app)
+        tagged(app, "t1", """["no fiber","Grounding","No FO"]"""); tagged(app, "t2", """["NO FIBER"]"""); tagged(app, "t3", """["Grounding"]""")
+        val before = changeCount(app)
+        val r = renameReq(tokenFor("boss", Role.admin), "No fiber", "No FO")
+        assertEquals(HttpStatusCode.OK, r.status, r.bodyAsText())
+        fun tags(id: String) = app.ctx.db.read {
+            prepareStatement("SELECT json_extract(pole_json, '\$.tags') FROM points WHERE id = ?").use { ps -> ps.setString(1, id); ps.executeQuery().use { it.next(); it.getString(1) } }
+        }
+        assertEquals("""["No FO","Grounding"]""", tags("t1")); assertEquals("""["No FO"]""", tags("t2")); assertEquals("""["Grounding"]""", tags("t3"))
+        assertEquals(before + 2, changeCount(app))
+    }
+
     @Test fun renameUnknownRefused() = TestApp().run { app ->
         assertEquals(HttpStatusCode.NotFound, renameReq(tokenFor("boss", Role.admin), "Nope", "X").status)
     }

@@ -192,7 +192,8 @@ fun renameTag(ctx: Ctx, user: User, r: TagRename) {
         val list = readTags()
         val idx = list.indexOfFirst { it.equals(r.from.trim(), ignoreCase = true) }
         if (idx < 0) throw HttpError(HttpStatusCode.NotFound, "No such tag")
-        if (list.any { it.equals(to, ignoreCase = true) }) throw HttpError(HttpStatusCode.BadRequest, "That tag already exists")
+        // The tag itself doesn't count: a change of case only is the admin's cleanup (I-M3).
+        if (list.withIndex().any { (i, t) -> i != idx && t.equals(to, ignoreCase = true) }) throw HttpError(HttpStatusCode.BadRequest, "That tag already exists")
         val from = list[idx]
         writeTags(list.toMutableList().also { it[idx] = to })
         val now = ctx.clock.millis()
@@ -202,8 +203,10 @@ fun renameTag(ctx: Ctx, user: User, r: TagRename) {
         val out = mutableListOf<Change>()
         for (p in points) {
             val old = p.pole ?: continue
-            if (old.tags.none { it == from }) continue
-            val pole = old.copy(tags = old.tags.map { if (it == from) to else it })
+            // In any case it was typed, and once on the point, though it carried the new name already (I-M4).
+            val renamed = old.tags.map { if (it.equals(from, ignoreCase = true)) to else it }.distinctBy { it.lowercase() }
+            if (renamed == old.tags) continue
+            val pole = old.copy(tags = renamed)
             prepareStatement("UPDATE points SET pole_json = ?, updated_at = ?, updated_by = ? WHERE id = ?").use {
                 it.setString(1, FmxJson.encodeToString(PoleData.serializer(), pole)); it.setLong(2, now); it.setString(3, user.id)
                 it.setString(4, p.id); it.executeUpdate()
