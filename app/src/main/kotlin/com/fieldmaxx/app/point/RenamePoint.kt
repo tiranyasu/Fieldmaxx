@@ -35,9 +35,13 @@ internal fun renameWarning(delivered: Int, folder: String): String? = when {
         "$delivered photos of this point are already in OneDrive in $folder. New photos will go to the new name's folder; those stay where they are."
 }
 
+/** Whether [type] and [num] rename [point]: not when they are its own, spaces and the type's case aside (I-M1). */
+internal fun renameChanges(point: Point, type: String, num: String): Boolean =
+    !type.trim().equals(point.type, ignoreCase = true) || num.trim() != point.num
+
 /**
  * Edit / Rename: the point's type and number. Saving sends one [com.fieldmaxx.core.model.Op.PointRename]; the label and
- * the photo folder follow from the new name. Save needs both fields filled.
+ * the photo folder follow from the new name. Save needs both fields filled and a change.
  */
 @Composable
 internal fun RenamePointDialog(
@@ -49,7 +53,7 @@ internal fun RenamePointDialog(
 ) {
     var type by remember { mutableStateOf(point.type) }
     var num by remember { mutableStateOf(point.num) }
-    val ok = type.isNotBlank() && num.isNotBlank()
+    val ok = type.isNotBlank() && num.isNotBlank() && renameChanges(point, type, num)
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Rename ${point.label}") },

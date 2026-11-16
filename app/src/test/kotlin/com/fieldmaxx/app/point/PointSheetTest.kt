@@ -411,12 +411,32 @@ class PointSheetTest {
         show()
         menu(PointTags.RENAME)
         waitForTag(PointTags.RENAME_SAVE)
+        compose.onNodeWithTag(PointTags.RENAME_NUM).performTextReplacement("7")
         compose.onNodeWithTag(PointTags.RENAME_SAVE).assertIsEnabled()
         compose.onNodeWithTag(PointTags.RENAME_NUM).performTextReplacement("  ")
         compose.onNodeWithTag(PointTags.RENAME_SAVE).assertIsNotEnabled()
         compose.onNodeWithTag(PointTags.RENAME_NUM).performTextReplacement("7")
         compose.onNodeWithTag(PointTags.RENAME_TYPE).performTextReplacement("")
         compose.onNodeWithTag(PointTags.RENAME_SAVE).assertIsNotEnabled()
+        assertEquals(emptyList(), deps.ops)
+    }
+
+    /** I-M1: Save with nothing changed (case and spaces aside) sends no rename, which would clear a picked folder. */
+    @Test fun renameUnchangedSendsNothing() {
+        val p = pole18.copy(type = "Street images", label = "Street images 18")
+        assertFalse(renameChanges(p, " street IMAGES ", "18 "))
+        assertTrue(renameChanges(p, "Street images", "18B"))
+        assertTrue(renameChanges(p, "PED", "18"))
+
+        show()
+        menu(PointTags.RENAME)
+        waitForTag(PointTags.RENAME_SAVE)
+        compose.onNodeWithTag(PointTags.RENAME_SAVE).assertIsNotEnabled() // as prefilled
+        compose.onNodeWithTag(PointTags.RENAME_TYPE).performTextReplacement(" pole ")
+        compose.onNodeWithTag(PointTags.RENAME_NUM).performTextReplacement("18 ")
+        compose.onNodeWithTag(PointTags.RENAME_SAVE).assertIsNotEnabled()
+        compose.onNodeWithTag(PointTags.RENAME_SAVE).performClick()
+        compose.waitForIdle()
         assertEquals(emptyList(), deps.ops)
     }
 

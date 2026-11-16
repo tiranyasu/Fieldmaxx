@@ -505,7 +505,8 @@ private fun OpenSheet(
                     onDismiss = { renaming = false },
                     onSave = { type, num ->
                         renaming = false
-                        editor.send(Op.PointRename(newOpId(), point.id, type, num))
+                        // I-M1: nothing changed sends nothing, so a picked folder isn't cleared.
+                        if (renameChanges(point, type, num)) editor.send(Op.PointRename(newOpId(), point.id, type, num))
                     },
                 )
             }
