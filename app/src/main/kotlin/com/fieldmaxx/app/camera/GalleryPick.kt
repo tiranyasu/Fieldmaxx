@@ -142,7 +142,7 @@ private suspend fun addPicked(context: Context, deps: CameraDeps, jobId: String,
     var added = 0
     for (uri in uris) {
         try {
-            deps.photos.saveFromGallery(jobId, pointId, uri, target.jobName, target.pointLabel, deps.fixes.value, tech)
+            deps.photos.saveFromGallery(jobId, pointId, uri, target.jobName, target.pointLabel, deps.fixes.value, tech, target.extra)
             added++
         } catch (e: Exception) {
             Log.w(TAG, "A picked photo couldn't be added to ${target.pointLabel}", e)

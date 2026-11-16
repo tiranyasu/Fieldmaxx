@@ -85,7 +85,8 @@ class LocalPhotos(
     /**
      * Copies the photo at [uri] into app storage and saves it with its own EXIF position and time where it has them
      * (R52a: whatever the platform hands over), else [fallback] (the phone's fix now) and the time now; its stamp's time
-     * line ends "(from gallery)". [techId] is the signed-in tech (R78). Returns its id.
+     * line ends "(from gallery)". [techId] is the signed-in tech (R78); [extra] the stamp's last line for the point
+     * ([pointStampExtra]). Returns its id.
      */
     suspend fun saveFromGallery(
         jobId: String,
@@ -95,6 +96,7 @@ class LocalPhotos(
         pointLabel: String,
         fallback: Fix?,
         techId: String? = null,
+        extra: String? = null,
     ): String {
         val id = newId()
         val original = writeOriginal(id) { file ->
@@ -102,7 +104,7 @@ class LocalPhotos(
         }
         withContext(NonCancellable) {
             val meta = try {
-                withContext(Dispatchers.IO) { galleryMeta(readExif(original), jobName, pointLabel, fallback, now(), zone(), techId) }
+                withContext(Dispatchers.IO) { galleryMeta(readExif(original), jobName, pointLabel, fallback, now(), zone(), techId, extra) }
             } catch (e: Throwable) {
                 discard(id)
                 throw e

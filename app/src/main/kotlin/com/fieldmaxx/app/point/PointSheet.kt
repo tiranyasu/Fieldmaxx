@@ -26,6 +26,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -41,19 +42,26 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import coil3.ImageLoader
 import com.fieldmaxx.app.AppGraph
 import com.fieldmaxx.app.map.MapController
 import com.fieldmaxx.app.photos.PhotoUiStatus
 import com.fieldmaxx.app.photos.PhotoView
+import com.fieldmaxx.app.photos.cameraMeta
 import com.fieldmaxx.app.photos.hiddenDeliveredFor
 import com.fieldmaxx.app.photos.photoViewsFor
+import com.fieldmaxx.app.photos.pointStampExtra
+import com.fieldmaxx.app.photos.stampMeta
 import com.fieldmaxx.app.platform.Fix
+import com.fieldmaxx.app.platform.Heading
 import com.fieldmaxx.app.sync.refImageUrl
 import com.fieldmaxx.app.ui.FmxColors
+import com.fieldmaxx.core.model.AppConfig
 import com.fieldmaxx.core.model.Attachment
 import com.fieldmaxx.core.model.CantShootReason
 import com.fieldmaxx.core.model.Op
@@ -61,6 +69,8 @@ import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.model.PoleData
 import com.fieldmaxx.core.model.User
 import com.fieldmaxx.core.naming.isQueryLayer
+import com.fieldmaxx.core.stamp.stampLines
+import java.time.ZoneId
 import java.util.Locale
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
@@ -70,6 +80,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -77,6 +88,9 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 /** Comment and pole data edits are saved once they have been quiet this long. */
 internal const val EDIT_QUIET_MS = 500L
+
+/** The stamp preview is worked out again this often: its clock line shows the seconds. */
+internal const val PREVIEW_REFRESH_MS = 1_000L
 
 private const val NO_MAPS_APP = "No app on this phone can show directions."
 
@@ -107,6 +121,10 @@ object PointTags {
     const val ANCHOR = "point.anchor"
     fun attachment(a: Attachment) = "point.attachment:${a.name}"
     fun tag(t: String) = "point.tag:$t"
+    const val NEW_TAG = "point.newTag"
+    const val NEW_TAG_FIELD = "point.newTag.field"
+    const val NEW_TAG_SAVE = "point.newTag.save"
+    const val STAMP_PREVIEW = "point.stampPreview"
     const val REFERENCE = "point.reference"
     fun refImage(refId: String) = "point.ref:$refId"
     const val USE_EXISTING = "point.useExisting"
@@ -144,6 +162,15 @@ interface PointDeps {
 
     val fixes: StateFlow<Fix?>
 
+    /** Where the back camera points, as the camera stamps it: for the stamp preview. */
+    val heading: StateFlow<Heading?>
+
+    /** The server's settings kept on the phone; [AppConfig.tags] is the crew's tag list. */
+    val config: StateFlow<AppConfig>
+
+    /** The job's name as the stamp prints it; nothing while the job isn't stored on the phone. */
+    fun jobName(jobId: String): Flow<String>
+
     /** The app's Coil loader: the signed-in client, and the disk cache that keeps reference images for work without signal. */
     val imageLoader: ImageLoader
 
@@ -163,6 +190,9 @@ class GraphPointDeps(private val graph: AppGraph) : PointDeps {
     override fun photosOnPhone(pointId: String): Flow<Int> = graph.db.localPhotos().observeOnPhoneCount(pointId)
     override fun hiddenDelivered(pointId: String): Flow<Boolean> = hiddenDeliveredFor(pointId, graph.db)
     override val fixes: StateFlow<Fix?> get() = graph.location.fixes
+    override val heading: StateFlow<Heading?> get() = graph.compass.cameraHeading
+    override val config: StateFlow<AppConfig> get() = graph.config
+    override fun jobName(jobId: String): Flow<String> = graph.sync.job(jobId).map { it?.name }.filterNotNull().distinctUntilChanged()
     override val imageLoader: ImageLoader get() = graph.imageLoader
     override fun server(): String = graph.server.get()
     override suspend fun user(): User? = graph.sync.savedUser()
@@ -239,9 +269,9 @@ private class Loaded(val point: Point?)
 /**
  * The point screen (spec §6.4): a bottom sheet over the map for the point a marker tap selected. Top to bottom: the name
  * with a ⋮ menu (Edit / Rename, Move point, Directions, Delete point) and close; what to photograph and the point's description from the file; the GPS accuracy;
- * pole data (poles); the client query's reference images (query points); the comment; the folder its photos go to;
- * Done, Can't shoot or Reopen. Delete is in the menu where the user may (§6.5a). [onClose] runs once the point is gone too
- * (deleted here or by the crew).
+ * pole data (poles); the tags (every type: the crew's list, and "+ New tag"); the client query's reference images (query
+ * points); the comment; the live stamp preview, above Take photo; the folder its photos go to; Done, Can't shoot or Reopen.
+ * Delete is in the menu where the user may (§6.5a). [onClose] runs once the point is gone too (deleted here or by the crew).
  *
  * Every edit saves as you go ([PointEditor]): it shows at once, is queued for the crew, and waits on the phone while
  * there is no signal. The sheet never moves the camera (R38); Move point drags the marker through [controller].
@@ -297,6 +327,9 @@ private fun OpenSheet(
     val onPhone by remember(deps, point.id) { deps.photosOnPhone(point.id) }.collectAsState(0, main)
     val hiddenDelivered by remember(deps, point.id) { deps.hiddenDelivered(point.id) }.collectAsState(false, main)
     val fix by deps.fixes.collectAsState(main)
+    val heading by deps.heading.collectAsState(main)
+    val config by deps.config.collectAsState(main)
+    val jobName by remember(deps, point.jobId) { deps.jobName(point.jobId) }.collectAsState("", main)
     val user by produceState<User?>(null, deps) { value = deps.user() }
     val context = LocalContext.current
     val jobTypes by remember(deps, point.jobId) {
@@ -376,6 +409,23 @@ private fun OpenSheet(
                     },
                 )
             }
+            // Tags go with the pole data, which is saved whole; a point of another type keeps only its tags there.
+            val choices = tagChoices(config.tags, pole.tags)
+            TagChips(
+                choices,
+                selected = pole.tags,
+                onToggle = { t ->
+                    pole = pole.copy(tags = toggleTag(pole.tags, t, choices))
+                    editor.editPole(pole)
+                },
+                onNew = { typed ->
+                    val tags = addTag(pole.tags, typed, config.tags)
+                    if (tags != pole.tags) {
+                        pole = pole.copy(tags = tags)
+                        editor.editPole(pole)
+                    }
+                },
+            )
             if (isQueryLayer(point.layer)) {
                 val server = deps.server()
                 QueryReference(point.refImageIds.map { RefImage(it, refImageUrl(server, point.jobId, it)) }, deps.imageLoader)
@@ -395,6 +445,7 @@ private fun OpenSheet(
                 modifier = Modifier.fillMaxWidth().testTag(PointTags.COMMENT),
             )
 
+            StampPreview(jobName, point.label, fix, heading, pointStampExtra(point.type, pole, comment))
             if (onTakePhoto != null || onPickFromGallery != null) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     onTakePhoto?.let { take -> Button(onClick = { take(point) }, modifier = Modifier.testTag(PointTags.TAKE_PHOTO)) { Text("Take photo") } }
@@ -470,6 +521,33 @@ private fun Header(
             }
         }
         IconButton(onClick = onClose, modifier = Modifier.testTag(PointTags.CLOSE)) { Icon(Icons.Default.Close, contentDescription = "Close") }
+    }
+}
+
+/**
+ * Exactly the lines a photo taken now would be stamped with ([cameraMeta], as the camera's overlay shows them), the
+ * point's tags, HOA and comment ([extra]) last; worked out again every [PREVIEW_REFRESH_MS].
+ */
+@Composable
+private fun StampPreview(jobName: String, label: String, fix: Fix?, heading: Heading?, extra: String?) {
+    val now by produceState(System.currentTimeMillis()) {
+        while (true) {
+            delay(PREVIEW_REFRESH_MS)
+            value = System.currentTimeMillis()
+        }
+    }
+    val lines = stampLines(cameraMeta(jobName, label, fix, heading, now, extra).stampMeta(ZoneId.systemDefault()))
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("Stamp", style = MaterialTheme.typography.labelLarge)
+        Surface(color = Color.Black.copy(alpha = 0.8f), shape = MaterialTheme.shapes.small, modifier = Modifier.fillMaxWidth()) {
+            Text(
+                lines.joinToString("\n"),
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(8.dp).testTag(PointTags.STAMP_PREVIEW),
+            )
+        }
     }
 }
 

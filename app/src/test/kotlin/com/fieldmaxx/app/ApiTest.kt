@@ -132,6 +132,23 @@ class ApiTest {
         assertEquals("/api/admin/activity", server.takeRequest().path)
     }
 
+    /** The tag list's admin routes, with the bodies the server reads (a list of strings; a TagRename). */
+    @Test fun tagRoutesSendTheirBodies() = runTest {
+        server.enqueue(json("{}"))
+        server.enqueue(json("{}"))
+        server.enqueue(json("""{"error":"That tag already exists"}""", code = 400))
+
+        api.putTags(listOf("N/A", "Riser"))
+        val put = server.takeRequest()
+        assertEquals("PUT /api/admin/tags", "${put.method} ${put.path}")
+        assertEquals("""["N/A","Riser"]""", put.body.readUtf8())
+        api.renameTag("Grounding", "Ground wire")
+        val rename = server.takeRequest()
+        assertEquals("POST /api/admin/tags/rename", "${rename.method} ${rename.path}")
+        assertEquals("""{"from":"Grounding","to":"Ground wire"}""", rename.body.readUtf8())
+        assertEquals("That tag already exists", assertFailsWith<ApiException> { api.renameTag("Riser", "N/A") }.message)
+    }
+
     @Test fun noPublishedReleaseIsNull() = runTest {
         server.enqueue(json("null"))
 

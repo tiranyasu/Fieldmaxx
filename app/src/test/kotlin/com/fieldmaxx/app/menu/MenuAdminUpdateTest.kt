@@ -291,6 +291,22 @@ private class AdminFakeApi : Api by notUsed() {
         settingsPut += s
     }
 
+    val tagsPut = CopyOnWriteArrayList<List<String>>()
+    val tagRenames = CopyOnWriteArrayList<Pair<String, String>>()
+    @Volatile var tagError: Exception? = null
+
+    override suspend fun putTags(tags: List<String>) {
+        tagError?.let { throw it }
+        tagsPut += tags
+        serverConfig = serverConfig.copy(tags = tags)
+    }
+
+    override suspend fun renameTag(from: String, to: String) {
+        tagError?.let { throw it }
+        tagRenames += from to to
+        serverConfig = serverConfig.copy(tags = serverConfig.tags.map { if (it == from) to else it })
+    }
+
     override suspend fun latestRelease(): AppRelease? {
         latestCalls.incrementAndGet()
         latestError?.let { throw it }
@@ -721,6 +737,49 @@ class MenuAdminUpdateTest {
         tap(AdminSettingsTags.SAVE)
         waitFor { api.settingsPut.size == 2 }
         assertEquals(AdminSettings(photoQuality = 95), api.settingsPut.last())
+    }
+
+    @Test fun renameTagCallsApi() {
+        api.serverConfig = DEFAULT_CONFIG.copy(tags = listOf("N/A", "Grounding", "No fiber", "Riser"))
+        val saved = AtomicInteger()
+        compose.setContent { Host { AdminSettingsScreen(api, kept = { DEFAULT_CONFIG }, onSaved = { saved.incrementAndGet() }, onBack = {}) } }
+        waitForTag(AdminSettingsTags.tag("Riser")) // the server's list, not the one kept on the phone
+
+        // Rename: the server renames it on the points too.
+        tap(AdminSettingsTags.tagRename("Grounding"))
+        waitForTag(AdminSettingsTags.TAG_NAME)
+        assertEquals("Grounding", textOf(AdminSettingsTags.TAG_NAME))
+        compose.onNodeWithTag(AdminSettingsTags.TAG_NAME).performTextReplacement(" Ground wire ")
+        tap(AdminSettingsTags.TAG_SAVE)
+        waitFor { api.tagRenames.toList() == listOf("Grounding" to "Ground wire") }
+        waitForTag(AdminSettingsTags.tag("Ground wire"))
+        assertFalse(exists(AdminSettingsTags.tag("Grounding")))
+        waitFor { saved.get() == 1 } // the phone's settings follow
+        assertTrue(api.tagsPut.isEmpty(), "a rename isn't a replace")
+
+        // Reorder and delete replace the list.
+        tap(AdminSettingsTags.tagUp("Riser"))
+        waitFor { api.tagsPut.size == 1 }
+        assertEquals(listOf("N/A", "Ground wire", "Riser", "No fiber"), api.tagsPut.last())
+        tap(AdminSettingsTags.tagDown("N/A"))
+        waitFor { api.tagsPut.size == 2 }
+        assertEquals(listOf("Ground wire", "N/A", "Riser", "No fiber"), api.tagsPut.last())
+        tap(AdminSettingsTags.tagDelete("No fiber"))
+        waitForTag(AdminSettingsTags.TAG_DELETE_CONFIRM)
+        tap(AdminSettingsTags.TAG_DELETE_CONFIRM)
+        waitFor { api.tagsPut.size == 3 }
+        assertEquals(listOf("Ground wire", "N/A", "Riser"), api.tagsPut.last())
+        waitFor { !exists(AdminSettingsTags.tag("No fiber")) }
+
+        // The server's refusal is shown, and the list stays as it was.
+        api.tagError = ApiException(400, "That tag already exists")
+        tap(AdminSettingsTags.tagRename("Riser"))
+        waitForTag(AdminSettingsTags.TAG_NAME)
+        compose.onNodeWithTag(AdminSettingsTags.TAG_NAME).performTextReplacement("N/A")
+        tap(AdminSettingsTags.TAG_SAVE)
+        waitFor { exists(AdminSettingsTags.MESSAGE) && textOf(AdminSettingsTags.MESSAGE) == "That tag already exists" }
+        assertTrue(exists(AdminSettingsTags.tag("Riser")))
+        assertEquals(1, api.tagRenames.size)
     }
 
     @Test fun exportPoleDataSavesOrShares() {

@@ -51,12 +51,16 @@ import com.fieldmaxx.app.photos.ContentPickedMedia
 import com.fieldmaxx.app.photos.LocalPhotos
 import com.fieldmaxx.app.photos.PickedMedia
 import com.fieldmaxx.app.photos.cameraMeta
+import com.fieldmaxx.app.photos.pointStampExtra
 import com.fieldmaxx.app.photos.rowFromMeta
 import com.fieldmaxx.app.photos.stampMeta
 import com.fieldmaxx.app.platform.Fix
 import com.fieldmaxx.app.platform.Heading
 import com.fieldmaxx.app.ui.FieldmaxxTheme
 import com.fieldmaxx.core.FmxJson
+import com.fieldmaxx.core.model.PoleData
+import com.fieldmaxx.core.stamp.STAMP_LINE_MAX
+import com.fieldmaxx.core.stamp.stampLayout
 import com.fieldmaxx.core.stamp.stampLines
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -912,6 +916,77 @@ class CameraTest {
         val deps = GraphCameraDeps(graph)
         assertSame(graph.compass.cameraHeading, deps.heading)
         assertNotSame(graph.compass.heading, deps.heading, "not the map's screen-top heading")
+    }
+
+    @Test fun shutterRecordsExtra() {
+        grant(Manifest.permission.CAMERA, Manifest.permission.ACCESS_MEDIA_LOCATION)
+        media.add(PICKED, fixture("plain.jpg"))
+        deps.targetFlow.value = CameraTarget("A05J9XE", "POLE 1", "Grounding · HOA 23.5 · lean")
+        capture.gate = CompletableDeferred()
+        compose.setContent {
+            Host {
+                Box(Modifier.fillMaxSize()) {
+                    CameraScreen("j1", "p1", deps, capture, onBack = {})
+                    val gallery = rememberGalleryPick(deps)
+                    Button(onClick = { gallery.pick("j1", "p1") }, modifier = Modifier.align(Alignment.Center)) { Text("Pick from gallery") }
+                }
+            }
+        }
+        waitForText("Grounding · HOA 23.5 · lean") // the overlay prints it, last
+        waitFor { enabled(CameraTags.SHUTTER) }
+        press(CameraTags.SHUTTER)
+        waitFor { capture.started.get() == 1 }
+
+        // The point's line as it was at the press: an edit while the camera writes the photo is the next photo's.
+        deps.targetFlow.value = CameraTarget("A05J9XE", "POLE 1", "Grounding · HOA 24 · lean")
+        capture.gate!!.complete(Unit)
+        waitFor { started.size == 1 }
+        val shot = meta(rows().single())
+        assertEquals("Grounding · HOA 23.5 · lean", shot.extra)
+        assertEquals(SPEC_STAMP + "Grounding · HOA 23.5 · lean", stampLines(shot.stampMeta(ZONE)))
+
+        // A picked photo carries the point's line too.
+        waitForText("Grounding · HOA 24 · lean")
+        compose.onNodeWithText("Pick from gallery").performClick()
+        waitFor { registry.launches.size == 1 }
+        compose.runOnUiThread { registry.answer(listOf(PICKED)) }
+        waitFor { started.size == 2 }
+        val picked = meta(rows().single { it.id != started.first() })
+        assertEquals("gallery", picked.source)
+        assertEquals("Grounding · HOA 24 · lean", picked.extra)
+        assertEquals("Grounding · HOA 24 · lean", stampLines(picked.stampMeta(ZONE)).last())
+    }
+
+    @Test fun extraLineSurvivesMetaRoundTrip() {
+        val meta = cameraMeta("A05J9XE", "POLE 1", FIX, HEADING, NOW, "Grounding · HOA 23.5 · lean")
+        val json = FmxJson.encodeToString(CaptureMeta.serializer(), meta)
+        assertEquals(meta, FmxJson.decodeFromString(CaptureMeta.serializer(), json))
+
+        // A photo saved before the line existed: its meta.json has no "extra", and it prints the five lines it always did.
+        val before = """{"jobName":"A05J9XE","pointLabel":"POLE 1","source":"camera","lat":39.63613,"lon":-119.691104,""" +
+            """"accuracyM":4.877,"altitudeM":1350.26,"headingDeg":47.0,"takenAt":$NOW,"gpsStale":false,"headingTrueNorth":true,"techId":"u1"}"""
+        val old = FmxJson.decodeFromString(CaptureMeta.serializer(), before)
+        assertNull(old.extra)
+        assertEquals(SPEC_STAMP, stampLines(old.stampMeta(ZONE)))
+
+        // A long line wraps into several, and the stamp's layout still fits them all on the photo.
+        val long = cameraMeta("A05J9XE", "POLE 1", FIX, HEADING, NOW, "Carrier label · Grounding · Damaged cable · HOA 23.5 · " + "lean ".repeat(20).trim())
+        val lines = stampLines(long.stampMeta(ZONE))
+        assertTrue(lines.size >= 8, "$lines")
+        assertTrue(lines.all { it.length <= STAMP_LINE_MAX }, "$lines")
+        val layout = stampLayout(800, 600, lines.size)
+        assertTrue(layout.firstBaselineY - layout.fontPx >= 0, "the first line is on the photo: $layout")
+    }
+
+    @Test fun extraLineIsNormalizedOnce() { // R3: one logical line, wrapped only by stampLines
+        assertEquals(
+            "Grounding · No fiber · HOA 23.5 · lean to the road",
+            pointStampExtra("POLE", PoleData(lineHeightFt = 23.5, tags = listOf(" Grounding ", "", "  ", "No fiber")), "lean\r\n  to the\nroad"),
+        )
+        assertEquals("No fiber", pointStampExtra("PED", PoleData(lineHeightFt = 20.0, tags = listOf("No fiber")), "\n"), "HOA is for poles only")
+        assertEquals("HOA 25", pointStampExtra("POLE", PoleData(lineHeightFt = 25.0), ""))
+        assertNull(pointStampExtra("POLE", PoleData(tags = listOf(" ")), " \n "))
+        assertNull(pointStampExtra("PED", null, ""))
     }
 
     @Test fun backWaitsForThePhotoBeingSaved() {

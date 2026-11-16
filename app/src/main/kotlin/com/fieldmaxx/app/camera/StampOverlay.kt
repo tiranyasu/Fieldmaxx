@@ -34,10 +34,11 @@ private const val CALIBRATE = "Compass: calibrate"
 
 /**
  * Exactly what a shutter press at [now] would stamp (spec §6.6): the stamp's lines for the photo [cameraMeta] would
- * record, so "(GPS stale)" once the fix is older than 10 s, "No GPS" without one.
+ * record, so "(GPS stale)" once the fix is older than 10 s, "No GPS" without one; [extra], the point's tags, HOA and
+ * comment line, last.
  */
-fun overlayLines(jobName: String, pointLabel: String, fix: Fix?, heading: Heading?, now: Long, zone: ZoneId): List<String> =
-    stampLines(cameraMeta(jobName, pointLabel, fix, heading, now).stampMeta(zone))
+fun overlayLines(jobName: String, pointLabel: String, fix: Fix?, heading: Heading?, now: Long, zone: ZoneId, extra: String? = null): List<String> =
+    stampLines(cameraMeta(jobName, pointLabel, fix, heading, now, extra).stampMeta(zone))
 
 /** "Compass: calibrate" while the compass reports low accuracy (spec §6.6); not part of the stamp. */
 fun calibrationHint(heading: Heading?): String? = if (heading != null && !heading.reliable) CALIBRATE else null
@@ -59,7 +60,8 @@ private val StampText = TextStyle(
 internal fun StampOverlay(target: CameraTarget, deps: CameraDeps, modifier: Modifier = Modifier) {
     fun current(): Shown {
         val heading = deps.heading.value
-        return Shown(overlayLines(target.jobName, target.pointLabel, deps.fixes.value, heading, deps.now(), deps.zone()), calibrationHint(heading))
+        val lines = overlayLines(target.jobName, target.pointLabel, deps.fixes.value, heading, deps.now(), deps.zone(), target.extra)
+        return Shown(lines, calibrationHint(heading))
     }
     var shown by remember(target, deps) { mutableStateOf(current()) }
     LaunchedEffect(target, deps) {

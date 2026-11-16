@@ -11,6 +11,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsNotSelected
+import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -33,7 +35,9 @@ import com.fieldmaxx.app.map.FakeMapController
 import com.fieldmaxx.app.map.MapController
 import com.fieldmaxx.app.photos.PhotoUiStatus
 import com.fieldmaxx.app.photos.PhotoView
+import com.fieldmaxx.app.net.DEFAULT_CONFIG
 import com.fieldmaxx.app.platform.Fix
+import com.fieldmaxx.app.platform.Heading
 import com.fieldmaxx.app.sync.ALICE
 import com.fieldmaxx.app.sync.localPhoto
 import com.fieldmaxx.app.sync.point
@@ -42,7 +46,9 @@ import com.fieldmaxx.app.ui.FieldmaxxTheme
 import com.fieldmaxx.core.geo.LatLon
 import com.fieldmaxx.core.model.Attachment
 import com.fieldmaxx.core.model.CantShootReason
+import com.fieldmaxx.core.model.AppConfig
 import com.fieldmaxx.core.model.Op
+import com.fieldmaxx.core.model.POLE_TAGS
 import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.model.PointStatus
 import com.fieldmaxx.core.model.PoleData
@@ -63,6 +69,7 @@ import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
 import org.junit.Rule
 import org.junit.runner.RunWith
@@ -80,6 +87,8 @@ class FakePointDeps(context: Context, private val db: AppDatabase? = null) : Poi
     val onPhoneFlow = MutableStateFlow(0)
     val hiddenDeliveredFlow = MutableStateFlow(false)
     override val fixes = MutableStateFlow<Fix?>(null)
+    override val heading = MutableStateFlow<Heading?>(null)
+    override val config = MutableStateFlow<AppConfig>(DEFAULT_CONFIG)
     @Volatile var me: User? = ALICE
     val ops = CopyOnWriteArrayList<Op>()
 
@@ -106,6 +115,7 @@ class FakePointDeps(context: Context, private val db: AppDatabase? = null) : Poi
     override fun photosOnPhone(pointId: String): Flow<Int> = db?.localPhotos()?.observeOnPhoneCount(pointId) ?: onPhoneFlow
     override fun hiddenDelivered(pointId: String): Flow<Boolean> = hiddenDeliveredFlow
     override fun server(): String = SERVER
+    override fun jobName(jobId: String): Flow<String> = flowOf("A05J9XE")
     override suspend fun user(): User? = me
 
     override suspend fun enqueue(op: Op) {
@@ -191,6 +201,8 @@ class PointSheetTest {
     private fun waitForText(text: String) = waitFor { compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty() }
     private fun enabled(tag: String) = compose.onAllNodesWithTag(tag).fetchSemanticsNodes().singleOrNull()?.config?.contains(SemanticsProperties.Disabled) == false
     private fun textOf(tag: String) = compose.onNodeWithTag(tag).fetchSemanticsNode().config[SemanticsProperties.EditableText].text
+    private fun previewLines() =
+        compose.onNodeWithTag(PointTags.STAMP_PREVIEW).fetchSemanticsNode().config[SemanticsProperties.Text].joinToString("").split("\n")
 
     /** A control in the sheet, which scrolls. */
     private fun tap(tag: String) {
@@ -486,6 +498,80 @@ class PointSheetTest {
         // The crew's edit shows while nothing waits to be saved here.
         deps.pointsFlow.value = listOf(pole18.copy(comment = "Bob: ladder in truck 2"))
         waitFor { textOf(PointTags.COMMENT) == "Bob: ladder in truck 2" }
+    }
+
+    @Test fun tagsOnPedPoint() {
+        deps.config.value = DEFAULT_CONFIG.copy(tags = listOf("Grounding", "Riser", "No fiber"))
+        val ped = point("e7").copy(layer = "PED", type = "PED", label = "PED 7")
+        show(ped)
+        waitForTag(PointTags.tag("Riser"))
+        for (t in listOf("Grounding", "Riser", "No fiber")) compose.onNodeWithTag(PointTags.tag(t)).performScrollTo().assertIsNotSelected()
+        compose.onAllNodesWithTag(PointTags.tag("Carrier label")).assertCountEquals(0) // the crew's list, not the old fixed one
+        compose.onNodeWithTag(PointTags.NEW_TAG).assertExists()
+        compose.onAllNodesWithTag(PointTags.LINE_HEIGHT).assertCountEquals(0)
+        compose.onAllNodesWithTag(PointTags.ANCHOR).assertCountEquals(0)
+
+        tap(PointTags.tag("No fiber"))
+        tap(PointTags.tag("Grounding"))
+        waitFor { deps.updates().lastOrNull()?.pole == PoleData(tags = listOf("Grounding", "No fiber")) } // in the list's order
+        assertTrue(deps.updates().all { it.pointId == "e7" && it.comment == null }, "${deps.updates()}")
+        compose.onNodeWithTag(PointTags.tag("Grounding")).assertIsSelected()
+    }
+
+    @Test fun newTagAddsToPoint() {
+        show()
+        tap(PointTags.NEW_TAG)
+        waitForTag(PointTags.NEW_TAG_FIELD)
+        compose.onNodeWithTag(PointTags.NEW_TAG_FIELD).performTextInput("  Rotten ")
+        press(PointTags.NEW_TAG_SAVE)
+        waitFor { deps.updates().lastOrNull()?.pole?.tags == listOf("Rotten") }
+        waitForTag(PointTags.tag("Rotten")) // at once, before the server lists it
+        compose.onNodeWithTag(PointTags.tag("Rotten")).performScrollTo().assertIsSelected()
+        assertFalse(exists(PointTags.NEW_TAG_FIELD), "the dialog closed")
+
+        // A listed tag typed in another case is the listed one, not a second spelling; the field holds 40 characters.
+        tap(PointTags.NEW_TAG)
+        waitForTag(PointTags.NEW_TAG_FIELD)
+        compose.onNodeWithTag(PointTags.NEW_TAG_FIELD).performTextInput("x".repeat(50))
+        assertEquals(40, textOf(PointTags.NEW_TAG_FIELD).length)
+        compose.onNodeWithTag(PointTags.NEW_TAG_FIELD).performTextReplacement("grounding")
+        press(PointTags.NEW_TAG_SAVE)
+        waitFor { deps.updates().lastOrNull()?.pole?.tags == listOf("Grounding", "Rotten") }
+
+        // A blank name can't be saved.
+        tap(PointTags.NEW_TAG)
+        waitForTag(PointTags.NEW_TAG_SAVE)
+        compose.onNodeWithTag(PointTags.NEW_TAG_SAVE).assertIsNotEnabled()
+    }
+
+    @Test fun pointKeepsTagMissingFromList() {
+        assertEquals(POLE_TAGS + "Old name", tagChoices(POLE_TAGS, listOf("Grounding", "Old name", "Old name")))
+        assertEquals(listOf("A", "B"), tagChoices(listOf("A", "B"), emptyList()))
+
+        show(pole18.copy(pole = PoleData(tags = listOf("Old name"))))
+        waitForTag(PointTags.tag("Old name"))
+        compose.onNodeWithTag(PointTags.tag("Old name")).performScrollTo().assertIsSelected()
+        tap(PointTags.tag("Grounding"))
+        waitFor { deps.updates().lastOrNull()?.pole?.tags == listOf("Grounding", "Old name") }
+        tap(PointTags.tag("Old name")) // and it can be taken off
+        waitFor { deps.updates().lastOrNull()?.pole?.tags == listOf("Grounding") }
+    }
+
+    @Test fun previewShowsExtraLine() {
+        show(pole18.copy(pole = PoleData(lineHeightFt = 23.5, tags = listOf("Grounding")), comment = "lean"))
+        waitForTag(PointTags.STAMP_PREVIEW)
+        val lines = previewLines()
+        assertEquals("A05J9XE · POLE 18", lines.first())
+        assertEquals("No GPS", lines[1])
+        assertEquals("Grounding · HOA 23.5 · lean", lines.last())
+
+        // It follows the edits as they're typed, and the position as it comes.
+        compose.onNodeWithTag(PointTags.COMMENT).performScrollTo().performTextReplacement("lean\nto road")
+        waitFor { previewLines().last() == "Grounding · HOA 23.5 · lean to road" }
+        deps.fixes.value = fixWithin(3.0).copy(at = System.currentTimeMillis())
+        waitFor { previewLines()[1] == "39.636000, -119.691000" }
+        deps.heading.value = Heading(47.0, System.currentTimeMillis(), reliable = true, trueNorth = true)
+        waitFor { "NE 47°" in previewLines() }
     }
 
     // ---- focused tests for the rulings ----

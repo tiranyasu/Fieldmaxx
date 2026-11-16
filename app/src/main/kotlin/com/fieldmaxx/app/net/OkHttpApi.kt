@@ -23,6 +23,7 @@ import com.fieldmaxx.core.model.Point
 import com.fieldmaxx.core.model.RegisteredPhoto
 import com.fieldmaxx.core.model.ReuseCandidate
 import com.fieldmaxx.core.model.Role
+import com.fieldmaxx.core.model.TagRename
 import com.fieldmaxx.core.model.User
 import java.io.File
 import java.io.IOException
@@ -158,6 +159,11 @@ class OkHttpApi(private val client: OkHttpClient, private val baseUrl: () -> Str
     )
 
     override suspend fun putSettings(s: AdminSettings) = callUnit("PUT", endpoint("api", "admin", "settings"), json(s))
+
+    override suspend fun putTags(tags: List<String>) = callUnit("PUT", endpoint("api", "admin", "tags"), json(tags))
+
+    override suspend fun renameTag(from: String, to: String) =
+        callUnit("POST", endpoint("api", "admin", "tags", "rename"), json(TagRename(from, to)))
 
     override suspend fun latestRelease(): AppRelease? = call("GET", endpoint("api", "app", "latest"))
 

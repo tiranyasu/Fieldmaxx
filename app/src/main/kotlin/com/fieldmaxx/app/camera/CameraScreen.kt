@@ -56,6 +56,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.fieldmaxx.app.AppGraph
 import com.fieldmaxx.app.photos.LocalPhotos
 import com.fieldmaxx.app.photos.cameraMeta
+import com.fieldmaxx.app.photos.pointStampExtra
 import com.fieldmaxx.app.platform.Fix
 import com.fieldmaxx.app.platform.Heading
 import com.fieldmaxx.app.ui.FmxColors
@@ -67,8 +68,11 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 
-/** The job and point as the stamp names them: "A05J9XE · POLE 1". */
-data class CameraTarget(val jobName: String, val pointLabel: String)
+/**
+ * The job and point as the stamp names them: "A05J9XE · POLE 1"; [extra] is the stamp's last line for the point as it is
+ * now ([pointStampExtra]: its tags, HOA, comment), null when it has none.
+ */
+data class CameraTarget(val jobName: String, val pointLabel: String, val extra: String? = null)
 
 /** What the camera and the gallery pick read and save through; [GraphCameraDeps] in the app, a fake in tests. */
 interface CameraDeps {
@@ -92,7 +96,7 @@ class GraphCameraDeps(private val graph: AppGraph) : CameraDeps {
     override fun target(jobId: String, pointId: String): Flow<CameraTarget?> =
         combine(graph.sync.job(jobId), graph.sync.points(jobId)) { job, points ->
             val point = points.firstOrNull { it.id == pointId }
-            if (job != null && point != null) CameraTarget(job.name, point.label) else null
+            if (job != null && point != null) CameraTarget(job.name, point.label, pointStampExtra(point.type, point.pole, point.comment)) else null
         }.distinctUntilChanged()
 
     override val fixes: StateFlow<Fix?> get() = graph.location.fixes
@@ -202,7 +206,8 @@ fun CameraScreen(
                         onPress = target?.let { t ->
                             {
                                 // The reading of this moment, before the camera starts writing.
-                                shutter.press(jobId, pointId, cameraMeta(t.jobName, t.pointLabel, deps.fixes.value, deps.heading.value, deps.now()), controller)
+                                val meta = cameraMeta(t.jobName, t.pointLabel, deps.fixes.value, deps.heading.value, deps.now(), t.extra)
+                                shutter.press(jobId, pointId, meta, controller)
                             }
                         },
                     )

@@ -10,11 +10,20 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -30,6 +39,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.fieldmaxx.app.net.Api
 import com.fieldmaxx.app.net.ApiException
+import com.fieldmaxx.app.point.NEW_TAG_MAX
 import com.fieldmaxx.app.ui.FmxColors
 import com.fieldmaxx.core.model.AdminSettings
 import com.fieldmaxx.core.model.AppConfig
@@ -56,7 +66,18 @@ object AdminSettingsTags {
     const val KEY = "adminSettings.key"
     const val SAVE = "adminSettings.save"
     const val MESSAGE = "adminSettings.message"
+    fun tag(t: String) = "adminSettings.tag:$t"
+    fun tagUp(t: String) = "adminSettings.tag.up:$t"
+    fun tagDown(t: String) = "adminSettings.tag.down:$t"
+    fun tagRename(t: String) = "adminSettings.tag.rename:$t"
+    fun tagDelete(t: String) = "adminSettings.tag.delete:$t"
+    const val TAG_NAME = "adminSettings.tag.name"
+    const val TAG_SAVE = "adminSettings.tag.save"
+    const val TAG_DELETE_CONFIRM = "adminSettings.tag.deleteConfirm"
 }
+
+/** [list] with the item at [from] moved to [to]. */
+private fun <T> moved(list: List<T>, from: Int, to: Int): List<T> = list.toMutableList().apply { add(to, removeAt(from)) }
 
 /** The form as typed: what [changes] compares with the settings it started from. */
 private data class Form(val quality: Int, val days: String, val imagery: String, val labels: String, val key: String) {
@@ -84,6 +105,9 @@ private fun changes(form: Form, base: Form): Pair<AdminSettings?, String?> {
  * (at least 3 days, global constraints) and the map's imagery (address, street names, optional key, R39). It starts from
  * the settings kept on the phone ([kept]) and the server's latest. Saved, [onSaved] fetches the phone's settings again,
  * so the map and the photo quality follow at once.
+ *
+ * Tags: the crew's one tag list, which every point screen shows. Rename ([Api.renameTag]: the server renames it on the
+ * points too), delete and reorder ([Api.putTags]: points keep a deleted tag) are each saved at once, then [onSaved].
  */
 @Composable
 fun AdminSettingsScreen(api: Api, kept: suspend () -> AppConfig, onSaved: () -> Unit, onBack: () -> Unit) {
@@ -92,17 +116,25 @@ fun AdminSettingsScreen(api: Api, kept: suspend () -> AppConfig, onSaved: () -> 
     var message by remember { mutableStateOf<String?>(null) }
     var warning by remember { mutableStateOf(false) }
     var saving by remember { mutableStateOf(false) }
+    var tags by remember { mutableStateOf<List<String>>(emptyList()) }
+    var tagBusy by remember { mutableStateOf(false) }
+    var renamingTag by remember { mutableStateOf<String?>(null) }
+    var deletingTag by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(Unit) {
         withContext(Dispatchers.Main.immediate) {
-            val local = Form(kept())
+            val keptConfig = kept()
+            val local = Form(keptConfig)
             base = local
             form = local
+            tags = keptConfig.tags
             try {
-                val latest = Form(api.config())
+                val latestConfig = api.config()
+                val latest = Form(latestConfig)
                 if (form == base) form = latest // not edited meanwhile
                 base = latest
+                tags = latestConfig.tags
             } catch (e: IOException) {
                 message = "$ADMIN_NEEDS_SIGNAL Showing the settings this phone has."
                 warning = true
@@ -116,6 +148,25 @@ fun AdminSettingsScreen(api: Api, kept: suspend () -> AppConfig, onSaved: () -> 
     fun say(text: String?, isWarning: Boolean) {
         message = text
         warning = isWarning
+    }
+
+    /** Sends [call]; once the server has it, the list shows [after] and the phone's settings follow. */
+    fun changeTags(after: List<String>, done: String, call: suspend () -> Unit) {
+        tagBusy = true
+        scope.launch(Dispatchers.Main.immediate) {
+            try {
+                call()
+                tags = after
+                onSaved()
+                say(done, isWarning = false)
+            } catch (e: IOException) {
+                say(ADMIN_NEEDS_SIGNAL, isWarning = true)
+            } catch (e: ApiException) {
+                say(e.message, isWarning = true)
+            } finally {
+                tagBusy = false
+            }
+        }
     }
 
     AdminScaffold("Admin settings", onBack) { padding ->
@@ -189,8 +240,109 @@ fun AdminSettingsScreen(api: Api, kept: suspend () -> AppConfig, onSaved: () -> 
                 modifier = Modifier.fillMaxWidth().testTag(AdminSettingsTags.SAVE),
             ) { Text("Save") }
             message?.let { Text(it, color = if (warning) FmxColors.Warning else MaterialTheme.colorScheme.onSurface, modifier = Modifier.testTag(AdminSettingsTags.MESSAGE)) }
+
+            Text("Tags", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "The crew's tag list, in the order the point screen shows it. Changes here are saved at once; points keep a deleted tag.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            tags.forEachIndexed { i, t ->
+                TagRow(
+                    t,
+                    canUp = i > 0,
+                    canDown = i < tags.lastIndex,
+                    enabled = !tagBusy,
+                    onUp = { moved(tags, i, i - 1).let { after -> changeTags(after, "Tags saved") { api.putTags(after) } } },
+                    onDown = { moved(tags, i, i + 1).let { after -> changeTags(after, "Tags saved") { api.putTags(after) } } },
+                    onRename = { renamingTag = t },
+                    onDelete = { deletingTag = t },
+                )
+            }
         }
     }
+
+    renamingTag?.let { from ->
+        RenameTagDialog(
+            from,
+            onDismiss = { renamingTag = null },
+            onSave = { to ->
+                renamingTag = null
+                changeTags(tags.map { if (it == from) to else it }, "Renamed \u201c$from\u201d to \u201c$to\u201d") { api.renameTag(from, to) }
+            },
+        )
+    }
+    deletingTag?.let { t ->
+        AlertDialog(
+            onDismissRequest = { deletingTag = null },
+            text = { Text("Delete the tag \u201c$t\u201d? Points that have it keep it.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        deletingTag = null
+                        val after = tags - t
+                        changeTags(after, "Deleted \u201c$t\u201d") { api.putTags(after) }
+                    },
+                    modifier = Modifier.testTag(AdminSettingsTags.TAG_DELETE_CONFIRM),
+                ) { Text("Delete") }
+            },
+            dismissButton = { TextButton(onClick = { deletingTag = null }) { Text("Cancel") } },
+        )
+    }
+}
+
+@Composable
+private fun TagRow(
+    tag: String,
+    canUp: Boolean,
+    canDown: Boolean,
+    enabled: Boolean,
+    onUp: () -> Unit,
+    onDown: () -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(tag, modifier = Modifier.weight(1f).testTag(AdminSettingsTags.tag(tag)))
+        IconButton(onClick = onUp, enabled = enabled && canUp, modifier = Modifier.testTag(AdminSettingsTags.tagUp(tag))) {
+            Icon(Icons.Default.KeyboardArrowUp, contentDescription = "Move $tag up")
+        }
+        IconButton(onClick = onDown, enabled = enabled && canDown, modifier = Modifier.testTag(AdminSettingsTags.tagDown(tag))) {
+            Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Move $tag down")
+        }
+        IconButton(onClick = onRename, enabled = enabled, modifier = Modifier.testTag(AdminSettingsTags.tagRename(tag))) {
+            Icon(Icons.Default.Edit, contentDescription = "Rename $tag")
+        }
+        IconButton(onClick = onDelete, enabled = enabled, modifier = Modifier.testTag(AdminSettingsTags.tagDelete(tag))) {
+            Icon(Icons.Default.Delete, contentDescription = "Delete $tag")
+        }
+    }
+}
+
+/** The new name, trimmed; the server refuses one already listed. */
+@Composable
+private fun RenameTagDialog(from: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    var name by remember(from) { mutableStateOf(from) }
+    val to = name.trim()
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Rename tag") },
+        text = {
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it.replace('\n', ' ').take(NEW_TAG_MAX) }, // as long as one typed on a point
+                label = { Text("Tag") },
+                supportingText = { Text("Every point that has it is renamed too.") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth().testTag(AdminSettingsTags.TAG_NAME),
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(to) }, enabled = to.isNotEmpty() && to != from, modifier = Modifier.testTag(AdminSettingsTags.TAG_SAVE)) {
+                Text("Rename")
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
 }
 
 @Composable

@@ -3,7 +3,9 @@ package com.fieldmaxx.app.photos
 import androidx.exifinterface.media.ExifInterface
 import com.fieldmaxx.app.platform.Fix
 import com.fieldmaxx.app.platform.Heading
+import com.fieldmaxx.core.model.PoleData
 import com.fieldmaxx.core.stamp.StampMeta
+import com.fieldmaxx.core.stamp.stampExtraLine
 import java.time.DateTimeException
 import java.time.LocalDateTime
 import java.time.ZoneId
@@ -27,7 +29,9 @@ const val GPS_STALE_MS = 10_000L
  * What the phone records about a photo as it is saved (spec §6.6 step 1), and what Task 28 makes its stamp and EXIF from.
  * [takenAt] is epoch ms: the shutter press, or a gallery photo's own EXIF time when it has one. [gpsStale]: the fix was
  * older than [GPS_STALE_MS] at the shutter. [headingTrueNorth] (R51): [headingDeg] is from true north, so EXIF gets
- * GPSImgDirectionRef "T"; false means magnetic ("M"). [techId] (R78): the signed-in tech who took or picked it.
+ * GPSImgDirectionRef "T"; false means magnetic ("M"). [techId] (R78): the signed-in tech who took or picked it. [extra]: the
+ * stamp's last line (the point's tags, HOA, comment: [pointStampExtra]) as the point was when the photo was taken or picked;
+ * null when the point had none, as for every photo saved before the line existed.
  */
 @Serializable
 data class CaptureMeta(
@@ -43,7 +47,20 @@ data class CaptureMeta(
     val gpsStale: Boolean,
     val headingTrueNorth: Boolean = false,
     val techId: String? = null,
+    val extra: String? = null,
 )
+
+private val LINE_BREAKS = Regex("""\s*[\r\n]+\s*""")
+
+/**
+ * The stamp's last line for a point with [type], [pole] and [comment] (null when there is nothing to print). R3, the one
+ * place it is made, for the point sheet's preview, the camera and the gallery alike: tags trimmed and blank ones dropped,
+ * the comment's line breaks turned into spaces, so it stays one logical line that only the stamp's own wrapping breaks.
+ */
+fun pointStampExtra(type: String, pole: PoleData?, comment: String): String? {
+    val tags = pole?.tags.orEmpty().map { it.trim() }.filter { it.isNotEmpty() }
+    return stampExtraLine(type, pole?.copy(tags = tags), comment.replace(LINE_BREAKS, " "))
+}
 
 /** The stamp's input (Task 3) for this photo, its time shown in [zone]. */
 fun CaptureMeta.stampMeta(zone: ZoneId) = StampMeta(
@@ -58,14 +75,15 @@ fun CaptureMeta.stampMeta(zone: ZoneId) = StampMeta(
     zone = zone,
     gpsStale = gpsStale,
     fromGallery = source == SOURCE_GALLERY,
+    extra = extra,
 )
 
 /**
  * What a shutter press at [now] records: the fix and the compass reading of that moment (spec §6.6: "the heading stamped
  * is the reading at the moment the shutter is pressed"). An unreliable reading is still recorded; the overlay asks for a
- * calibration meanwhile.
+ * calibration meanwhile. [extra] is the point's [pointStampExtra] at the press.
  */
-fun cameraMeta(jobName: String, pointLabel: String, fix: Fix?, heading: Heading?, now: Long) = CaptureMeta(
+fun cameraMeta(jobName: String, pointLabel: String, fix: Fix?, heading: Heading?, now: Long, extra: String? = null) = CaptureMeta(
     jobName = jobName,
     pointLabel = pointLabel,
     source = SOURCE_CAMERA,
@@ -77,6 +95,7 @@ fun cameraMeta(jobName: String, pointLabel: String, fix: Fix?, heading: Heading?
     takenAt = now,
     gpsStale = fix != null && isStale(fix, now),
     headingTrueNorth = heading?.trueNorth ?: false,
+    extra = extra,
 )
 
 /**
@@ -86,7 +105,7 @@ fun cameraMeta(jobName: String, pointLabel: String, fix: Fix?, heading: Heading?
  * damaged or 0, 0 position counts as none. Then [fallback], the phone's fix when the photo was picked, stands in, marked
  * "(GPS stale)" as on the camera when older than 10 s at [now]. Its time is the EXIF DateTimeOriginal (or
  * DateTimeDigitized), at its EXIF offset or else in [zone]; [now] without one. A picked photo has no compass reading of
- * its own beyond the EXIF direction.
+ * its own beyond the EXIF direction. [extra] is the point's [pointStampExtra] when it was picked.
  */
 internal fun galleryMeta(
     exif: ExifInterface?,
@@ -96,18 +115,20 @@ internal fun galleryMeta(
     now: Long,
     zone: ZoneId,
     techId: String?,
+    extra: String? = null,
 ): CaptureMeta {
     val takenAt = exif?.let { takenAt(it, zone) } ?: now
     val own = exif?.let(::ownPosition)
     return if (own != null) {
         CaptureMeta(
             jobName, pointLabel, SOURCE_GALLERY, own.lat, own.lon, own.accuracyM, own.altitudeM, own.headingDeg, takenAt,
-            gpsStale = false, headingTrueNorth = own.trueNorth, techId = techId,
+            gpsStale = false, headingTrueNorth = own.trueNorth, techId = techId, extra = extra,
         )
     } else {
         CaptureMeta(
             jobName, pointLabel, SOURCE_GALLERY, fallback?.lat, fallback?.lon, fallback?.knownAccuracy(), fallback?.altitudeM,
             headingDeg = null, takenAt = takenAt, gpsStale = fallback != null && isStale(fallback, now), techId = techId,
+            extra = extra,
         )
     }
 }

@@ -114,6 +114,15 @@ interface Api {
     suspend fun activity(jobId: String?, kinds: Set<String>? = null): List<ActivityItem>
     suspend fun putSettings(s: AdminSettings)
 
+    /** Replaces the crew's tag list with [tags], in this order (deletes and reordering); points keep tags no longer listed. */
+    suspend fun putTags(tags: List<String>)
+
+    /**
+     * Renames the listed tag [from] to [to], on every point of a live job too. 400 when [to] is already listed, 404 when
+     * [from] isn't.
+     */
+    suspend fun renameTag(from: String, to: String)
+
     /** The newest published APK, or null when none is published. */
     suspend fun latestRelease(): AppRelease?
 
