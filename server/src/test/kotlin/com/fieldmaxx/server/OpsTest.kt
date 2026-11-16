@@ -319,4 +319,21 @@ class OpsTest {
         send(tokenFor("ann"), Op.PointUpdate("u1", pt, pole = PoleData(tags = listOf("grounding", "Rotten"))))
         assertEquals(com.fieldmaxx.core.model.POLE_TAGS + "Rotten", com.fieldmaxx.server.admin.appConfig(app.ctx).tags)
     }
+
+    @Test fun deletedTagNotRegrownByOldPoint() = TestApp().run { app ->
+        seed(app)
+        val t = tokenFor("ann")
+        send(t, Op.PointUpdate("u1", pt, pole = PoleData(tags = listOf("Rotten"))))
+        app.ctx.db.tx { createStatement().use { it.execute("DELETE FROM settings WHERE key = 'tags'") } }
+        send(t, Op.PointUpdate("u2", pt, pole = PoleData(tags = listOf("Rotten")), comment = "again"))
+        assertEquals(com.fieldmaxx.core.model.POLE_TAGS, com.fieldmaxx.server.admin.appConfig(app.ctx).tags)
+    }
+
+    @Test fun newTagOnPointStillJoins() = TestApp().run { app ->
+        seed(app)
+        val t = tokenFor("ann")
+        send(t, Op.PointUpdate("u1", pt, pole = PoleData(tags = listOf("Rotten"))))
+        send(t, Op.PointUpdate("u2", pt, pole = PoleData(tags = listOf("Rotten", "Cracked"))))
+        assertEquals(com.fieldmaxx.core.model.POLE_TAGS + "Rotten" + "Cracked", com.fieldmaxx.server.admin.appConfig(app.ctx).tags)
+    }
 }

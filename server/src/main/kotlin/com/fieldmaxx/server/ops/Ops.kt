@@ -137,9 +137,13 @@ private fun Connection.touch(pointId: String, user: User, now: Long, kind: Strin
 private fun Connection.apply(ctx: Ctx, user: User, op: Op, now: Long): Applied {
     return when (op) {
         is Op.PointUpdate -> {
-            livePoint(op.pointId)
+            val current = livePoint(op.pointId)
             val sets = buildList<Pair<String, Any?>> {
-                op.pole?.let { growTags(it.tags) }
+                // Only tags new on this point may grow the list, so an admin's delete or rename isn't undone by an old point.
+                op.pole?.let { pole ->
+                    val had = current.pole?.tags.orEmpty().mapTo(HashSet()) { it.trim().lowercase() }
+                    growTags(pole.tags.filter { it.trim().lowercase() !in had })
+                }
                 op.pole?.let { add("pole_json" to FmxJson.encodeToString(PoleData.serializer(), it)) }
                 op.comment?.let { add("comment" to it) }
             }
