@@ -574,6 +574,31 @@ class PointSheetTest {
         waitFor { "NE 47°" in previewLines() }
     }
 
+    @Test fun takePhotoFlushesPendingTag() { // R9: the photo's point already has the edit the preview showed
+        val seen = CopyOnWriteArrayList<List<Op>>()
+        deps.pointsFlow.value = listOf(pole18)
+        compose.setContent {
+            FieldmaxxTheme {
+                PointSheet(
+                    "j1", "p18", deps, map, onClose = {},
+                    onTakePhoto = { seen += deps.ops.toList() },
+                    onPickFromGallery = { seen += deps.ops.toList() },
+                )
+            }
+        }
+        waitForTag(PointTags.TITLE)
+
+        tap(PointTags.tag("Grounding"))
+        tap(PointTags.TAKE_PHOTO) // well inside the 500 ms the edit would otherwise wait
+        waitFor { seen.size == 1 }
+        assertEquals(listOf("Grounding"), seen[0].filterIsInstance<Op.PointUpdate>().singleOrNull()?.pole?.tags, "${seen[0]}")
+
+        compose.onNodeWithTag(PointTags.COMMENT).performScrollTo().performTextInput("lean")
+        tap(PointTags.PICK_GALLERY)
+        waitFor { seen.size == 2 }
+        assertEquals("lean", seen[1].filterIsInstance<Op.PointUpdate>().lastOrNull()?.comment, "${seen[1]}")
+    }
+
     // ---- focused tests for the rulings ----
 
     @Test fun confirmedDeleteLeavesPhonePhotosUntilTheServerAcceptsIt() { // R67

@@ -782,6 +782,43 @@ class MenuAdminUpdateTest {
         assertEquals(1, api.tagRenames.size)
     }
 
+    @Test fun deleteKeepsTagAddedMeanwhile() { // R8: the change is made to the server's list as it is now
+        api.serverConfig = DEFAULT_CONFIG.copy(tags = listOf("A", "B"))
+        compose.setContent { Host { AdminSettingsScreen(api, kept = { DEFAULT_CONFIG }, onSaved = {}, onBack = {}) } }
+        waitForTag(AdminSettingsTags.tag("B"))
+        api.serverConfig = api.serverConfig.copy(tags = listOf("A", "B", "C")) // a tech in the field added C
+
+        tap(AdminSettingsTags.tagDelete("A"))
+        waitForTag(AdminSettingsTags.TAG_DELETE_CONFIRM)
+        tap(AdminSettingsTags.TAG_DELETE_CONFIRM)
+        waitFor { api.tagsPut.size == 1 }
+        assertEquals(listOf("B", "C"), api.tagsPut.single())
+        waitForTag(AdminSettingsTags.tag("C")) // and the screen shows the server's list
+
+        api.serverConfig = api.serverConfig.copy(tags = listOf("B", "C", "D"))
+        tap(AdminSettingsTags.tagUp("C"))
+        waitFor { api.tagsPut.size == 2 }
+        assertEquals(listOf("C", "B", "D"), api.tagsPut.last())
+        waitForTag(AdminSettingsTags.tag("D"))
+    }
+
+    @Test fun afterRenameShowsServerList() { // R8
+        api.serverConfig = DEFAULT_CONFIG.copy(tags = listOf("A", "B"))
+        compose.setContent { Host { AdminSettingsScreen(api, kept = { DEFAULT_CONFIG }, onSaved = {}, onBack = {}) } }
+        waitForTag(AdminSettingsTags.tag("B"))
+        api.serverConfig = api.serverConfig.copy(tags = listOf("A", "B", "C"))
+
+        tap(AdminSettingsTags.tagRename("A"))
+        waitForTag(AdminSettingsTags.TAG_NAME)
+        compose.onNodeWithTag(AdminSettingsTags.TAG_NAME).performTextReplacement("Z")
+        tap(AdminSettingsTags.TAG_SAVE)
+        waitFor { api.tagRenames.toList() == listOf("A" to "Z") }
+        waitForTag(AdminSettingsTags.tag("C"))
+        assertTrue(exists(AdminSettingsTags.tag("Z")))
+        assertFalse(exists(AdminSettingsTags.tag("A")))
+        assertTrue(top(AdminSettingsTags.tag("Z")) < top(AdminSettingsTags.tag("B")) && top(AdminSettingsTags.tag("B")) < top(AdminSettingsTags.tag("C")))
+    }
+
     @Test fun exportPoleDataSavesOrShares() {
         val downloads = Robolectric.setupContentProvider(Gallery::class.java, MediaStore.AUTHORITY)
         val csv = "Point,Original lat,Original lon\nPOLE 1,39.636130,-119.691104\n".toByteArray()

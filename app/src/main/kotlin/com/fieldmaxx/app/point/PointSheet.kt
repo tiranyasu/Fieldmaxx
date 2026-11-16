@@ -83,6 +83,8 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -212,6 +214,7 @@ internal class PointEditor(private val pointId: String) {
     private var comment: String? = null // guarded by lock
     private val ops = ArrayDeque<Op>() // guarded by lock
     private val wake = Channel<Unit>(Channel.CONFLATED)
+    private val writing = Mutex()
 
     val poleWaiting: Boolean get() = synchronized(lock) { pole != null }
     val commentWaiting: Boolean get() = synchronized(lock) { comment != null }
@@ -246,8 +249,16 @@ internal class PointEditor(private val pointId: String) {
 
     private fun opsWaiting(): Boolean = synchronized(lock) { ops.isNotEmpty() }
 
-    /** Each write completes, even when the sheet goes while it is under way. */
-    private suspend fun writeAll(enqueue: suspend (Op) -> Unit) {
+    /**
+     * R9: writes whatever waits now, without the quiet time, and returns once it is written, a write already under way
+     * included. Before a photo is taken or picked, so its stamp reads the point with every edit the preview showed.
+     */
+    suspend fun flush(enqueue: suspend (Op) -> Unit) = writeAll(enqueue)
+
+    /** Each write completes, even when the sheet goes while it is under way. One writer at a time. */
+    private suspend fun writeAll(enqueue: suspend (Op) -> Unit) = writing.withLock(null) { drain(enqueue) }
+
+    private suspend fun drain(enqueue: suspend (Op) -> Unit) {
         while (true) {
             val (update, next) = synchronized(lock) {
                 val u = if (pole != null || comment != null) Op.PointUpdate(newOpId(), pointId, pole, comment) else null
@@ -447,10 +458,21 @@ private fun OpenSheet(
 
             StampPreview(jobName, point.label, fix, heading, pointStampExtra(point.type, pole, comment))
             if (onTakePhoto != null || onPickFromGallery != null) {
+                // R9: the edits still waiting are written first, so the photo's stamp has what the preview shows.
+                val afterEdits: (() -> Unit) -> Unit = { then ->
+                    scope.launch(Dispatchers.Main.immediate) {
+                        editor.flush(deps::enqueue)
+                        then()
+                    }
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    onTakePhoto?.let { take -> Button(onClick = { take(point) }, modifier = Modifier.testTag(PointTags.TAKE_PHOTO)) { Text("Take photo") } }
+                    onTakePhoto?.let { take ->
+                        Button(onClick = { afterEdits { take(point) } }, modifier = Modifier.testTag(PointTags.TAKE_PHOTO)) { Text("Take photo") }
+                    }
                     onPickFromGallery?.let { pick ->
-                        OutlinedButton(onClick = { pick(point) }, modifier = Modifier.testTag(PointTags.PICK_GALLERY)) { Text("Pick from gallery") }
+                        OutlinedButton(onClick = { afterEdits { pick(point) } }, modifier = Modifier.testTag(PointTags.PICK_GALLERY)) {
+                            Text("Pick from gallery")
+                        }
                     }
                 }
             }

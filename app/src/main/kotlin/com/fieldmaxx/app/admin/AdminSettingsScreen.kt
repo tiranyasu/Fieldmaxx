@@ -150,15 +150,26 @@ fun AdminSettingsScreen(api: Api, kept: suspend () -> AppConfig, onSaved: () -> 
         warning = isWarning
     }
 
-    /** Sends [call]; once the server has it, the list shows [after] and the phone's settings follow. */
-    fun changeTags(after: List<String>, done: String, call: suspend () -> Unit) {
+    /**
+     * Makes one tag change ([change], which returns the list it expects the server to hold, or null when there was nothing
+     * to send), then shows the list the server holds, read back (R8), and the phone's settings follow.
+     */
+    fun changeTags(done: String, change: suspend () -> List<String>?) {
         tagBusy = true
         scope.launch(Dispatchers.Main.immediate) {
             try {
-                call()
-                tags = after
-                onSaved()
-                say(done, isWarning = false)
+                val expected = change()
+                if (expected != null) {
+                    onSaved()
+                    say(done, isWarning = false)
+                }
+                tags = try {
+                    api.config().tags
+                } catch (e: IOException) {
+                    expected ?: tags
+                } catch (e: ApiException) {
+                    expected ?: tags
+                }
             } catch (e: IOException) {
                 say(ADMIN_NEEDS_SIGNAL, isWarning = true)
             } catch (e: ApiException) {
@@ -167,6 +178,22 @@ fun AdminSettingsScreen(api: Api, kept: suspend () -> AppConfig, onSaved: () -> 
                 tagBusy = false
             }
         }
+    }
+
+    /**
+     * R8: a delete or a move is made to the server's list as it is now, not as it was when the screen opened, so tags the
+     * crew added meanwhile stay. [edit] gets that list and returns the one to send (null: nothing to change).
+     */
+    fun editTags(done: String, edit: (List<String>) -> List<String>?) = changeTags(done) {
+        val fresh = api.config().tags
+        edit(fresh)?.takeIf { it != fresh }?.also { api.putTags(it) }
+    }
+
+    /** [t] moved [by] places in [list]; null when it isn't listed any more or can't move further. */
+    fun movedTag(list: List<String>, t: String, by: Int): List<String>? {
+        val i = list.indexOf(t)
+        val j = i + by
+        return if (i < 0 || j !in list.indices) null else moved(list, i, j)
     }
 
     AdminScaffold("Admin settings", onBack) { padding ->
@@ -252,8 +279,8 @@ fun AdminSettingsScreen(api: Api, kept: suspend () -> AppConfig, onSaved: () -> 
                     canUp = i > 0,
                     canDown = i < tags.lastIndex,
                     enabled = !tagBusy,
-                    onUp = { moved(tags, i, i - 1).let { after -> changeTags(after, "Tags saved") { api.putTags(after) } } },
-                    onDown = { moved(tags, i, i + 1).let { after -> changeTags(after, "Tags saved") { api.putTags(after) } } },
+                    onUp = { editTags("Tags saved") { fresh -> movedTag(fresh, t, -1) } },
+                    onDown = { editTags("Tags saved") { fresh -> movedTag(fresh, t, +1) } },
                     onRename = { renamingTag = t },
                     onDelete = { deletingTag = t },
                 )
@@ -267,7 +294,10 @@ fun AdminSettingsScreen(api: Api, kept: suspend () -> AppConfig, onSaved: () -> 
             onDismiss = { renamingTag = null },
             onSave = { to ->
                 renamingTag = null
-                changeTags(tags.map { if (it == from) to else it }, "Renamed \u201c$from\u201d to \u201c$to\u201d") { api.renameTag(from, to) }
+                changeTags("Renamed \u201c$from\u201d to \u201c$to\u201d") {
+                    api.renameTag(from, to)
+                    tags.map { if (it == from) to else it }
+                }
             },
         )
     }
@@ -279,8 +309,7 @@ fun AdminSettingsScreen(api: Api, kept: suspend () -> AppConfig, onSaved: () -> 
                 TextButton(
                     onClick = {
                         deletingTag = null
-                        val after = tags - t
-                        changeTags(after, "Deleted \u201c$t\u201d") { api.putTags(after) }
+                        editTags("Deleted \u201c$t\u201d") { fresh -> fresh - t }
                     },
                     modifier = Modifier.testTag(AdminSettingsTags.TAG_DELETE_CONFIRM),
                 ) { Text("Delete") }
