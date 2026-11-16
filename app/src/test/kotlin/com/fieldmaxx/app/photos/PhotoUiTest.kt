@@ -340,6 +340,11 @@ class PhotoUiTest {
 
     private fun exists(tag: String) = compose.onAllNodesWithTag(tag).fetchSemanticsNodes().isNotEmpty()
     private fun waitForTag(tag: String) = waitFor { exists(tag) }
+    /** Nearby lists points first; opens [pointId]'s photos. */
+    private fun openNearbyPoint(pointId: String) {
+        waitForTag(ReuseTags.nearbyPoint(pointId))
+        press(ReuseTags.nearbyPoint(pointId))
+    }
     private fun hasTextNode(text: String) = compose.onAllNodesWithText(text).fetchSemanticsNodes().isNotEmpty()
     private fun waitForText(text: String) = waitFor { hasTextNode(text) }
     /** [unmerged]: a tag inside a row that reads as one (a list row merges its texts for TalkBack). */
@@ -536,12 +541,17 @@ class PhotoUiTest {
             }
         }
 
-        // Nearby: photos within 150 m of this point, from any job, newest first (R87), each with its distance.
-        waitForTag(ReuseTags.candidate("phx"))
+        // Nearby: the points within 150 m, nearest first; a point's photos on a tap, each with its distance.
+        waitForTag(ReuseTags.nearbyPoint("px"))
         assertEquals(listOf(Triple(query43.lat, query43.lon, "q43")), reuse.nearbyAsked.toList(), "this point's own photos left out")
-        assertTrue(top(ReuseTags.candidate("ph5")) < top(ReuseTags.candidate("phx")), "newest first, not nearest first")
+        assertTrue(top(ReuseTags.nearbyPoint("px")) < top(ReuseTags.nearbyPoint("p5")), "nearest first")
+        openNearbyPoint("p5")
+        waitForTag(ReuseTags.candidate("ph5"))
         assertEquals("POLE 5 · A05J9XE · 11/05/26", textOf(ReuseTags.line("ph5"), unmerged = true))
         assertEquals("80 m", textOf(ReuseTags.distance("ph5"), unmerged = true))
+        press(ReuseTags.NEARBY_BACK)
+        openNearbyPoint("px")
+        waitForTag(ReuseTags.candidate("phx"))
         assertEquals("40 m", textOf(ReuseTags.distance("phx"), unmerged = true))
 
         // This job: all its photos, grouped by point, newest first; the query point's own photo isn't offered.
@@ -577,6 +587,7 @@ class PhotoUiTest {
         var done = false
         compose.setContent { FieldmaxxTheme { ReusePicker("j1", "q43", reuse, onDone = { done = true }) } }
 
+        openNearbyPoint("p5")
         waitForTag(ReuseTags.candidate("ph5"))
         press(ReuseTags.candidate("ph5"))
         press(ReuseTags.THIS_JOB)
@@ -872,8 +883,8 @@ class PhotoUiTest {
         reuse.nearbyReply = { listOf(ReuseCandidate(gone, "POLE 19", "A05J9XE", 30.0), ReuseCandidate(ph5, "POLE 5", "A05J9XE", 80.0)) }
         reuse.jobReply = { listOf(ReuseCandidate(gone, "POLE 19", "A05J9XE", null)) }
         compose.setContent { FieldmaxxTheme { ReusePicker("j1", "q43", reuse, onDone = {}) } }
-        waitForTag(ReuseTags.candidate("ph5"))
-        assertFalse(exists(ReuseTags.candidate("gone")), "Nearby")
+        waitForTag(ReuseTags.nearbyPoint("p5"))
+        assertFalse(exists(ReuseTags.nearbyPoint("p19")), "Nearby")
         press(ReuseTags.THIS_JOB)
         waitForTag(ReuseTags.candidate("ph5"))
         assertFalse(exists(ReuseTags.candidate("gone")), "This job")
@@ -900,7 +911,7 @@ class PhotoUiTest {
         press(ReuseTags.NEARBY)
         waitForTag(ReuseTags.TRY_AGAIN)
         press(ReuseTags.TRY_AGAIN)
-        waitForTag(ReuseTags.candidate("ph5"))
+        waitForTag(ReuseTags.nearbyPoint("p5"))
         assertFalse(hasTextNode(NEARBY_NEEDS_SIGNAL))
     }
 
@@ -910,6 +921,7 @@ class PhotoUiTest {
         reuse.nearbyReply = { listOf(ReuseCandidate(older, "POLE 5", "A04X1Y", 121.0)) }
         var done = false
         compose.setContent { FieldmaxxTheme { ReusePicker("j1", "q43", reuse, onDone = { done = true }) } }
+        openNearbyPoint("px")
         waitForTag(ReuseTags.candidate("phx"))
         press(ReuseTags.candidate("phx"))
         press(ReuseTags.USE)

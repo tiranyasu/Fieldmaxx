@@ -62,18 +62,13 @@ import org.maplibre.android.maps.MapLibreMapOptions
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
 import org.maplibre.android.offline.OfflineManager
-import org.maplibre.android.style.expressions.Expression
-import org.maplibre.android.style.expressions.Expression.all
-import org.maplibre.android.style.expressions.Expression.concat
 import org.maplibre.android.style.expressions.Expression.eq
 import org.maplibre.android.style.expressions.Expression.exponential
 import org.maplibre.android.style.expressions.Expression.get
 import org.maplibre.android.style.expressions.Expression.has
 import org.maplibre.android.style.expressions.Expression.interpolate
 import org.maplibre.android.style.expressions.Expression.literal
-import org.maplibre.android.style.expressions.Expression.not
 import org.maplibre.android.style.expressions.Expression.product
-import org.maplibre.android.style.expressions.Expression.step
 import org.maplibre.android.style.expressions.Expression.stop
 import org.maplibre.android.style.expressions.Expression.switchCase
 import org.maplibre.android.style.expressions.Expression.toColor
@@ -98,7 +93,6 @@ import org.maplibre.android.style.layers.PropertyFactory.rasterOpacity
 import org.maplibre.android.style.layers.PropertyFactory.visibility
 import org.maplibre.android.style.layers.RasterLayer
 import org.maplibre.android.style.layers.SymbolLayer
-import org.maplibre.android.style.sources.GeoJsonOptions
 import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.android.style.sources.RasterSource
 import org.maplibre.android.style.sources.TileSet
@@ -117,8 +111,6 @@ private const val L_HOUSES = "houses"
 private const val SRC_ME = "me"
 private const val L_ME_ACCURACY = "me-accuracy"
 private const val SRC_POINTS = "points"
-private const val L_CLUSTERS = "clusters"
-private const val L_CLUSTER_COUNTS = "cluster-counts"
 private const val L_POINTS = "points"
 private const val L_CODES = "codes"
 private const val L_BADGES = "badges"
@@ -143,12 +135,10 @@ private const val P_STATE = "state"
 private const val P_ACCURACY = "accuracy"
 private const val P_HEADING = "heading"
 private const val P_BEAM = "beam"
-private const val CLUSTER_COUNT = "point_count"
 
-// Images, drawn on first use. A code, count or label image's id ends with its text.
+// Images, drawn on first use. A code or label image's id ends with its text.
 private const val IMG_CODE = "fmx-code:"
 private const val IMG_SHOT = "fmx-shot:"
-private const val IMG_COUNT = "fmx-count:"
 private const val IMG_LABEL = "fmx-label:"
 private const val IMG_HOUSE = "fmx-house:"
 private const val IMG_BADGE = "fmx-badge"
@@ -162,7 +152,6 @@ private val SHOT_OPACITY = FmxColors.ShotMarker.alpha
 private const val CREW_COLOR = "#f8fafc"
 private const val LABELS_OPACITY = 0.9f
 private const val SOURCE_MAX_ZOOM = 19f // Esri's imagery stops around here; MapLibre over-zooms the last tiles beyond it
-private const val CLUSTER_MAX_ZOOM = 17
 private const val FIT_MAX_ZOOM = 18.0
 private const val MARKER_RADIUS = 12f
 private const val ANIMATE_MS = 400
@@ -182,13 +171,13 @@ private const val BASE_STYLE =
 /**
  * [MapController] on MapLibre Native, built by [rememberMapLibreController] and shown with [View]:
  * - the server's raster imagery, with the street-name overlay at 90% opacity above it;
- * - the points as one GeoJSON source, clustered up to zoom 17: circles in the type's colour (grey at 55% once shot,
+ * - the points as one GeoJSON source, never clustered, so no marker is hidden at low zoom: circles in the type's colour (grey at 55% once shot,
  *   [FmxColors.ShotMarker]), the type's code on each (struck through once shot), and a badge on points with photos not in
  *   OneDrive yet;
  * - the crew as their own source, your position as a pulsing blue dot with its accuracy and heading.
  * Tiles once viewed stay in MapLibre's ambient cache, so viewed areas show without signal (spec §6.8).
  *
- * The camera moves only through [moveTo], [fitAll], a cluster tap (zooms into it) and the user's gestures (R38).
+ * The camera moves only through [moveTo], [fitAll] and the user's gestures (R38).
  * [camera] comes from a [CameraTracker] fed by MapLibre's camera listeners and each move's end; it is null until the
  * first move asked for is carried out, so the map's starting view (and gestures on it) never count (R61).
  */
@@ -250,7 +239,7 @@ class MapLibreController(context: Context) : MapController {
             .maxZoomPreference(MAX_ZOOM)
         mapView = MapView(context, options)
         mapView.addOnStyleImageMissingListener { id -> drawImage(id)?.let { style?.addImage(id, it) } }
-        mapView.addOnCanRemoveUnusedStyleImageListener { id -> id.startsWith(IMG_LABEL) || id.startsWith(IMG_COUNT) || id.startsWith(IMG_HOUSE) }
+        mapView.addOnCanRemoveUnusedStyleImageListener { id -> id.startsWith(IMG_LABEL) || id.startsWith(IMG_HOUSE) }
         mapView.setOnTouchListener { _, e -> onTouch(e) }
         mapView.getMapAsync(::onMapReady)
     }
@@ -424,11 +413,10 @@ class MapLibreController(context: Context) : MapController {
     }
 
     private fun addSourcesAndLayers(s: Style) {
-        val notCluster = not(has(CLUSTER_COUNT))
         val shotFade = get(P_OPACITY)
         s.addSource(GeoJsonSource(SRC_HOUSES))
         s.addSource(GeoJsonSource(SRC_ME))
-        s.addSource(GeoJsonSource(SRC_POINTS, GeoJsonOptions().withCluster(true).withClusterMaxZoom(CLUSTER_MAX_ZOOM)))
+        s.addSource(GeoJsonSource(SRC_POINTS))
         s.addSource(GeoJsonSource(SRC_DRAG))
         s.addSource(GeoJsonSource(SRC_CREW))
 
@@ -445,23 +433,7 @@ class MapLibreController(context: Context) : MapController {
             ),
         )
         s.addLayer(
-            CircleLayer(L_CLUSTERS, SRC_POINTS).withFilter(has(CLUSTER_COUNT)).withProperties(
-                circleColor(ACCENT),
-                circleOpacity(0.9f),
-                circleRadius(step(get(CLUSTER_COUNT), literal(16), stop(10, 20), stop(50, 24), stop(200, 28))),
-                circleStrokeColor("#ffffff"),
-                circleStrokeWidth(2f),
-            ),
-        )
-        s.addLayer(
-            SymbolLayer(L_CLUSTER_COUNTS, SRC_POINTS).withFilter(has(CLUSTER_COUNT)).withProperties(
-                iconImage(concat(literal(IMG_COUNT), Expression.toString(get(CLUSTER_COUNT)))),
-                iconAllowOverlap(true),
-                iconIgnorePlacement(true),
-            ),
-        )
-        s.addLayer(
-            CircleLayer(L_POINTS, SRC_POINTS).withFilter(notCluster).withProperties(
+            CircleLayer(L_POINTS, SRC_POINTS).withProperties(
                 circleColor(toColor(get(P_COLOR))),
                 circleOpacity(shotFade),
                 circleRadius(MARKER_RADIUS),
@@ -471,14 +443,14 @@ class MapLibreController(context: Context) : MapController {
             ),
         )
         s.addLayer(
-            SymbolLayer(L_CODES, SRC_POINTS).withFilter(notCluster).withProperties(
+            SymbolLayer(L_CODES, SRC_POINTS).withProperties(
                 iconImage(get(P_ICON)),
                 iconAllowOverlap(true),
                 iconIgnorePlacement(true),
             ),
         )
         s.addLayer(
-            SymbolLayer(L_BADGES, SRC_POINTS).withFilter(all(notCluster, eq(get(P_PENDING), literal(true)))).withProperties(
+            SymbolLayer(L_BADGES, SRC_POINTS).withFilter(eq(get(P_PENDING), literal(true))).withProperties(
                 iconImage(IMG_BADGE),
                 iconOffset(arrayOf(MARKER_RADIUS * 0.75f, -MARKER_RADIUS * 0.75f)),
                 iconAllowOverlap(true),
@@ -649,24 +621,17 @@ class MapLibreController(context: Context) : MapController {
 
     // ---- touch ----
 
-    /** A marker tap reports its point; a cluster tap zooms in until it splits (the user's own move). */
+    /** A marker tap reports its point. */
     private fun onMapClick(at: LatLng): Boolean {
         val m = map ?: return false
         val screen = m.projection.toScreenLocation(at)
         val r = TAP_DP * density
-        val hits = m.queryRenderedFeatures(RectF(screen.x - r, screen.y - r, screen.x + r, screen.y + r), L_CODES, L_POINTS, L_CLUSTER_COUNTS, L_CLUSTERS)
+        val hits = m.queryRenderedFeatures(RectF(screen.x - r, screen.y - r, screen.x + r, screen.y + r), L_CODES, L_POINTS)
         hits.firstOrNull { it.hasProperty(P_ID) }?.let {
             taps.tryEmit(it.getStringProperty(P_ID))
             return true
         }
-        val cluster = hits.firstOrNull { it.hasProperty(CLUSTER_COUNT) } ?: return false
-        val source = style?.getSourceAs<GeoJsonSource>(SRC_POINTS) ?: return false
-        val center = (cluster.geometry() as? GeoPoint)?.let { LatLng(it.latitude(), it.longitude()) } ?: at
-        val zoom = source.getClusterExpansionZoom(cluster).toDouble()
-        val destination = CameraView(center.latitude, center.longitude, zoom)
-        tracker.asked(destination)
-        go(m, CameraUpdateFactory.newLatLngZoom(center, zoom), destination)
-        return true
+        return false
     }
 
     /** While a point is being moved, a touch on its marker drags it; anywhere else pans the map as usual. */
@@ -702,7 +667,6 @@ class MapLibreController(context: Context) : MapController {
     private fun drawImage(id: String): Bitmap? = when {
         id.startsWith(IMG_CODE) -> textImage(id.removePrefix(IMG_CODE), 11f, android.graphics.Color.WHITE, struck = false, halo = true)
         id.startsWith(IMG_SHOT) -> textImage(id.removePrefix(IMG_SHOT), 11f, 0xFFE5E7EB.toInt(), struck = true, halo = false)
-        id.startsWith(IMG_COUNT) -> textImage(id.removePrefix(IMG_COUNT), 12f, android.graphics.Color.WHITE, struck = false, halo = false)
         id.startsWith(IMG_LABEL) -> textImage(id.removePrefix(IMG_LABEL), 12f, android.graphics.Color.WHITE, struck = false, halo = true)
         id.startsWith(IMG_HOUSE) -> textImage(id.removePrefix(IMG_HOUSE), 10f, android.graphics.Color.WHITE, struck = false, halo = true)
         id == IMG_BADGE -> badgeImage()

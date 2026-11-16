@@ -1,6 +1,7 @@
 package com.fieldmaxx.app.photos
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -30,6 +31,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -99,6 +101,8 @@ object ReuseTags {
     fun line(photoId: String) = "reuse.line:$photoId"
     fun distance(photoId: String) = "reuse.distance:$photoId"
     fun group(pointId: String) = "reuse.group:$pointId"
+    fun nearbyPoint(pointId: String) = "reuse.nearbyPoint:$pointId"
+    const val NEARBY_BACK = "reuse.nearbyBack"
 }
 
 private enum class ReuseTab(val title: String, val tag: String) {
@@ -196,6 +200,19 @@ internal fun useText(n: Int): String = when (n) {
 /** A typed label finds a point however its label is written: "pole 5" finds "POLE 5" and "POLE_5". */
 internal fun labelMatches(label: String, query: String): Boolean = normalizeFolderName(label).contains(normalizeFolderName(query.trim()))
 
+/** One point on the Nearby tab: how far it is and its photos, newest first. */
+data class NearbyPoint(val pointId: String, val pointLabel: String, val jobName: String, val distanceM: Double?, val photos: List<ReuseCandidate>)
+
+/** Nearby's candidates grouped by point, nearest point first (no distance last, then by label); each point's photos newest first. */
+fun nearbyByPoint(candidates: List<ReuseCandidate>): List<NearbyPoint> =
+    candidates.groupBy { it.photo.pointId }.map { (pointId, group) ->
+        val first = group.first()
+        NearbyPoint(pointId, first.pointLabel, first.jobName, group.mapNotNull { it.distanceM }.minOrNull(), group.sortedByDescending { it.photo.takenAt })
+    }.sortedWith(compareBy<NearbyPoint, Double?>(nullsLast()) { it.distanceM }.thenBy { it.pointLabel })
+
+/** "POLE 5 · A05J9XE · 10 m": a Nearby point's row. */
+internal fun nearbyPointText(p: NearbyPoint): String = listOfNotNull(p.pointLabel, p.jobName.ifEmpty { null }, p.distanceM?.let(::distanceText)).joinToString(" · ")
+
 /**
  * "This job": the job's photos the server knows, from its list when it could be fetched and from this phone's copy of the
  * job in any case (R66), newest first; the point's own photos left out. A copy this phone made a moment ago has no name
@@ -244,8 +261,8 @@ private suspend fun fetch(call: suspend () -> List<ReuseCandidate>): Fetch = try
 
 /**
  * "Use existing photos" (spec §6.6.2) for one point, from its sheet: photos already taken, with thumbnail, point label,
- * job and date, to copy into this point's folder. **Nearby**: within 150 m of the point, from any job, newest first with
- * the distance (R87; this point's own left out); **This job**: all the job's photos, grouped by point, newest first;
+ * job and date, to copy into this point's folder. **Nearby**: the points within 150 m, from any job, nearest first with
+ * the distance (this point's own left out); a tap on a point lists its photos, newest first; **This job**: all the job's photos, grouped by point, newest first;
  * **Search**: by point label, over both. This job works without signal, from the phone's copy of the job; Nearby and searching other jobs
  * need it, and say so (R66). Each picked photo becomes one [Op.PhotoReuse]; [onDone] closes the picker.
  */
@@ -267,6 +284,7 @@ fun ReusePicker(jobId: String, pointId: String, deps: ReuseDeps, onDone: () -> U
 
     var tab by rememberSaveable { mutableStateOf(ReuseTab.NEARBY) }
     var query by rememberSaveable { mutableStateOf("") }
+    var openNearby by rememberSaveable { mutableStateOf<String?>(null) } // the Nearby point whose photos are listed
     val picked = remember { mutableStateListOf<ReuseCandidate>() }
     var attempt by remember { mutableIntStateOf(0) }
     var saving by remember { mutableStateOf(false) }
@@ -275,12 +293,11 @@ fun ReusePicker(jobId: String, pointId: String, deps: ReuseDeps, onDone: () -> U
     val zone = remember(deps) { deps.zone() }
     val server = remember(deps) { deps.server() }
 
-    // Asked once the point is known, and again on "Try again". Newest first like the rest of the picker (R87), not the
-    // server's nearest first; each shows its distance.
+    // Asked once the point is known, and again on "Try again". Grouped by point, nearest first, where it is shown.
     val nearby by produceState<Fetch>(Fetch.Loading, point?.lat, point?.lon, attempt) {
         val here = point ?: return@produceState
         value = Fetch.Loading
-        value = fetch { deps.nearby(here.lat, here.lon, here.id).sortedByDescending { it.photo.takenAt } }
+        value = fetch { deps.nearby(here.lat, here.lon, here.id) }
     }
     val fromServer by produceState<Fetch>(Fetch.Loading, jobId, attempt) { value = fetch { deps.serverJobPhotos(jobId) } }
 
@@ -291,6 +308,7 @@ fun ReusePicker(jobId: String, pointId: String, deps: ReuseDeps, onDone: () -> U
             .filter { it.photo.id !in deleted }
     }
     val nearbyPhotos = remember(nearby, deleted) { (nearby as? Fetch.Done)?.photos.orEmpty().filter { it.photo.id !in deleted } }
+    val nearbyPoints = remember(nearbyPhotos) { nearbyByPoint(nearbyPhotos) }
     val results = remember(query, nearbyPhotos, thisJob) { searchCandidates(query, nearbyPhotos + thisJob) }
     val choice = Choice(picked.mapTo(HashSet()) { it.photo.id }, reusedHere, server, zone, deps.imageLoader) { c ->
         val i = picked.indexOfFirst { it.photo.id == c.photo.id }
@@ -351,7 +369,20 @@ fun ReusePicker(jobId: String, pointId: String, deps: ReuseDeps, onDone: () -> U
                         Text(n.message, color = FmxColors.Warning)
                         OutlinedButton(onClick = { attempt++ }, modifier = Modifier.testTag(ReuseTags.TRY_AGAIN)) { Text("Try again") }
                     }
-                    is Fetch.Done -> if (nearbyPhotos.isEmpty()) Message(NO_NEARBY) else Candidates(nearbyPhotos, choice, grouped = false)
+                    is Fetch.Done -> {
+                        val open = nearbyPoints.firstOrNull { it.pointId == openNearby }
+                        when {
+                            nearbyPoints.isEmpty() -> Message(NO_NEARBY)
+                            open == null -> NearbyPoints(nearbyPoints) { openNearby = it }
+                            else -> Column {
+                                TextButton(onClick = { openNearby = null }, modifier = Modifier.padding(horizontal = 8.dp).testTag(ReuseTags.NEARBY_BACK)) {
+                                    Text("Back to points")
+                                }
+                                Text(nearbyPointText(open), style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(horizontal = 16.dp))
+                                Candidates(open.photos, choice, grouped = false)
+                            }
+                        }
+                    }
                 }
                 ReuseTab.THIS_JOB -> when {
                     thisJob.isNotEmpty() -> Candidates(thisJob, choice, grouped = true)
@@ -380,6 +411,21 @@ fun ReusePicker(jobId: String, pointId: String, deps: ReuseDeps, onDone: () -> U
                     }
                 }
             }
+        }
+    }
+}
+
+/** Nearby's points as rows, nearest first; a tap opens the point's photos. */
+@Composable
+private fun NearbyPoints(points: List<NearbyPoint>, open: (String) -> Unit) {
+    LazyColumn(Modifier.fillMaxSize()) {
+        items(points, key = { "point:${it.pointId}" }) { p ->
+            ListItem(
+                headlineContent = { Text(nearbyPointText(p)) },
+                supportingContent = { Text(if (p.photos.size == 1) "1 photo" else "${p.photos.size} photos") },
+                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                modifier = Modifier.fillMaxWidth().clickable { open(p.pointId) }.testTag(ReuseTags.nearbyPoint(p.pointId)),
+            )
         }
     }
 }
